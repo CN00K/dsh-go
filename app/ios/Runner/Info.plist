@@ -11,6 +11,19 @@
     <string>Take a photo to attach to a conversation or scan a connection code.</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Unlock DSH Go when you enable app lock.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>127.0.0.1</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+        </dict>
+    </dict>
     <key>NSSupportsLiveActivities</key><true/>
     <key>FlutterDeepLinkingEnabled</key><false/>
     <key>CFBundleURLTypes</key>

@@ -8885,6 +8885,69 @@ class L10nZh extends L10n {
   String get iosAuthUnavailable => '设备身份验证不可用，请先在系统设置中设置设备密码。';
 
   @override
+  String get iosBackgroundTitle => 'iOS 后台运行';
+
+  @override
+  String get iosBackgroundEnable => '允许用户任务续跑';
+
+  @override
+  String get iosBackgroundContinued => '任务续跑（iOS 26+）';
+
+  @override
+  String get iosBackgroundGrace => '短时间后台收尾：自动保存恢复信息';
+
+  @override
+  String get iosBackgroundLimits => '后台时间由系统决定，不保证永久运行。长任务建议保持前台或切换远程服务器。恢复信息不能恢复已终止的 Linux 内存任务。';
+
+  @override
+  String get iosBackgroundState => '后台执行状态';
+
+  @override
+  String get iosBackgroundRefresh => '刷新状态';
+
+  @override
+  String get iosBackgroundForeground => '前台';
+
+  @override
+  String get iosBackgroundResuming => '正在恢复，请等待会话重新同步';
+
+  @override
+  String get iosBackgroundGraceState => '正在保存恢复信息';
+
+  @override
+  String get iosBackgroundContinuedState => '后台续跑中（进度未知）';
+
+  @override
+  String get iosBackgroundUnknown => '等待恢复；无法确认后台任务仍在执行';
+
+  @override
+  String get iosBackgroundExpired => '后台授权结束';
+
+  @override
+  String get iosBackgroundFailed => '后台申请失败';
+
+  @override
+  String get iosBackgroundCompleted => '任务完成';
+
+  @override
+  String get iosBackgroundError => '任务异常或已取消';
+
+  @override
+  String get iosBackgroundUnsupported => '需要 iOS 26 或更高版本';
+
+  @override
+  String get iosBackgroundSystemMayDecline => '系统可能拒绝申请或提前结束授权';
+
+  @override
+  String get iosBackgroundRegistrationFailed => '系统任务注册失败，请使用前台或远程模式';
+
+  @override
+  String get iosBackgroundCancel => '停止续跑并请求取消当前任务';
+
+  @override
+  String get iosBackgroundUnavailable => '无法获取原生后台状态';
+
+  @override
   String get launchScreenTitle => '启动画面';
 
   @override

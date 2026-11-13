@@ -20,8 +20,8 @@ import UserNotifications
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshNotify") {
       NotifyPlugin.register(with: registrar)
     }
-    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshShellBox") {
-      ShellBoxPlugin.register(with: registrar)
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshNativeNode") {
+      NativeNodeRuntime.register(with: registrar)
     }
   }
 }

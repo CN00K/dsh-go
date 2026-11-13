@@ -9379,6 +9379,70 @@ class L10nEn extends L10n {
       'Device authentication is unavailable. Set a device passcode in Settings before enabling app lock.';
 
   @override
+  String get iosBackgroundTitle => 'iOS background execution';
+
+  @override
+  String get iosBackgroundEnable => 'Allow user tasks to continue';
+
+  @override
+  String get iosBackgroundContinued => 'Continued processing (iOS 26+)';
+
+  @override
+  String get iosBackgroundGrace => 'Short background cleanup: automatically save recovery metadata';
+
+  @override
+  String get iosBackgroundLimits =>
+      'The system controls background time; permanent execution is not guaranteed. Keep long tasks in the foreground or use a remote server. Recovery metadata cannot restore terminated Linux memory tasks.';
+
+  @override
+  String get iosBackgroundState => 'Background execution state';
+
+  @override
+  String get iosBackgroundRefresh => 'Refresh status';
+
+  @override
+  String get iosBackgroundForeground => 'Foreground';
+
+  @override
+  String get iosBackgroundResuming => 'Resuming; waiting for session synchronization';
+
+  @override
+  String get iosBackgroundGraceState => 'Saving recovery metadata';
+
+  @override
+  String get iosBackgroundContinuedState => 'Continuing in background (progress unknown)';
+
+  @override
+  String get iosBackgroundUnknown => 'Waiting to resume; task execution is unconfirmed';
+
+  @override
+  String get iosBackgroundExpired => 'Background authorization ended';
+
+  @override
+  String get iosBackgroundFailed => 'Background request failed';
+
+  @override
+  String get iosBackgroundCompleted => 'Task completed';
+
+  @override
+  String get iosBackgroundError => 'Task failed or canceled';
+
+  @override
+  String get iosBackgroundUnsupported => 'Requires iOS 26 or later';
+
+  @override
+  String get iosBackgroundSystemMayDecline => 'The system may decline a request or end authorization early';
+
+  @override
+  String get iosBackgroundRegistrationFailed => 'System task registration failed; use foreground or remote mode';
+
+  @override
+  String get iosBackgroundCancel => 'End continuation and request task cancellation';
+
+  @override
+  String get iosBackgroundUnavailable => 'Native background state unavailable';
+
+  @override
   String get launchScreenTitle => 'Launch screen';
 
   @override

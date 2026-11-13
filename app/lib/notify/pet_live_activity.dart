@@ -21,9 +21,12 @@ Map<String, Object?>? petLiveActivityPayload(LivePush push) {
     // This opaque target cannot be mistaken for a real chat host.
     return {
       'host': 'local-pet',
-      'sessionId': packId,
+      // One target for the whole selection: choosing another pet updates this
+      // activity instead of ending it and asking system for a new one.
+      'sessionId': 'local-pet',
       'packId': packId,
       'phase': 'idle',
+      'petState': 'idle',
       'label': appL10n.companionStatusIdle,
       'staleLabel': appL10n.mediaConfigKeyUnknown,
     };
@@ -38,11 +41,28 @@ Map<String, Object?>? petLiveActivityPayload(LivePush push) {
       _ => 'idle',
     },
   };
+  // Keep the app's exact running animation (juggling/sweeping/carrying), not
+  // just the six Live Activity phases; the widget uses it when its phase and
+  // pack contain that state.
+  final petState = switch (activity.kind) {
+    LiveKind.waiting => 'notification',
+    LiveKind.done => 'attention',
+    LiveKind.failed => 'error',
+    LiveKind.running => switch (activity.mood) {
+      PetStateName.thinking => 'thinking',
+      PetStateName.working ||
+      PetStateName.juggling ||
+      PetStateName.sweeping ||
+      PetStateName.carrying => activity.mood.name,
+      _ => 'idle',
+    },
+  };
   return {
     // Exclude the optional host display name from external presentation data.
     'host': jsonEncode({'kind': target.host.kind.name, 'id': target.host.id}),
     'sessionId': target.sessionId,
     'packId': ?packId,
+    if (packId != null) 'petState': petState,
     'phase': phase,
     'label': phase == 'idle' ? appL10n.companionStatusIdle : activity.chip,
     'staleLabel': appL10n.mediaConfigKeyUnknown,

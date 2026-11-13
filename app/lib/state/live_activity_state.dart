@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../notify/live_activity.dart';
+import '../notify/pet_art_stage.dart';
 import '../notify/pet_live_activity.dart';
 import '../pets/pet_overlay_actions.dart' show petActionHost;
 import '../pets/pet_signals.dart';
@@ -79,9 +80,26 @@ class PetLiveActivityStatus extends Notifier<AsyncValue<String?>> {
 
 final petLiveActivityChannelProvider = Provider<PetLiveActivityChannel>((ref) => PetLiveActivityChannel());
 
+/// The widget extension cannot read Flutter's asset bundle or the app's
+/// sandbox. Keep the selected pack's real sheets in the shared App Group
+/// before each Live Activity update so the island draws the same pet.
+final petArtStageProvider = Provider<PetArtStage>((ref) => PetArtStage(
+  channel: ref.watch(petLiveActivityChannelProvider).channel,
+  bundle: ref.watch(petAssetBundleProvider),
+));
+
 final iosPetLiveActivityBridgeProvider = Provider<void>((ref) {
   final bridge = ref.watch(petLiveActivityChannelProvider);
   Future<void> send(LivePush push) async {
+    final packId = push.packId;
+    if (push.enabled && packId != null) {
+      // Art staging is best-effort: a missing App Group keeps the old emoji
+      // fallback, but must never stop the status update itself.
+      await AsyncValue.guard(() async {
+        final pack = await ref.read(petPackProvider(packId).future);
+        await ref.read(petArtStageProvider).stage(pack);
+      });
+    }
     final status = await AsyncValue.guard(() => bridge.push(push));
     if (ref.mounted) ref.read(petLiveActivityStatusProvider.notifier).report(status);
   }

@@ -35,5 +35,12 @@ Future<void> _startApp() async {
   // through AnnotatedRegion(dshSystemOverlay(...)).
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   SystemChrome.setSystemUIOverlayStyle(dshSystemOverlay(PlatformDispatcher.instance.platformBrightness));
-  runApp(ProviderScope(overrides: [remoteTransferConsentProvider.overrideWithValue(confirmRemoteTransfer)], child: const DshApp()));
+  runApp(
+    ProviderScope(
+      overrides: [
+        remoteTransferConsentProvider.overrideWithValue(confirmRemoteTransfer),
+      ],
+      child: const DshApp(),
+    ),
+  );
 }

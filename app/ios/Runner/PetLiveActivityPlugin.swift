@@ -62,6 +62,7 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
       phase = "waitingRecovery"; key = "Waiting to resume"
     }
     return PetActivityAttributes.ContentState(packId: original.packId, phase: phase,
+      petState: nil,
       label: NSLocalizedString(key, comment: "Background task status"),
       staleLabel: NSLocalizedString("Waiting to resume", comment: "Background task status"))
   }
@@ -102,6 +103,22 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
       result(nil)
       return
     }
+    // Where the app leaves the chosen pet's art for the widget extension
+    // (PetArtStore); created here so Dart writes only files it owns.
+    if call.method == "artDirectory" {
+      guard let directory = PetArtStore.base() else {
+        result(FlutterError(code: "pet_art_unavailable",
+          message: "The shared pet art folder is unavailable.", details: nil))
+        return
+      }
+      do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        result(directory.path)
+      } catch {
+        result(FlutterError(code: "pet_art_unavailable", message: error.localizedDescription, details: nil))
+      }
+      return
+    }
     guard ["start", "update", "end"].contains(call.method) else {
       result(FlutterMethodNotImplemented)
       return
@@ -130,6 +147,12 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
           result(FlutterError(code: "pet_live_activity_invalid_arguments", message: "Expected host, sessionId, phase and short label/staleLabel strings.", details: nil))
           return
         }
+        let petState = (args["petState"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        guard petState == nil || ["idle", "thinking", "working", "juggling", "sweeping", "carrying",
+                                  "notification", "attention", "error", "sleeping", "waking"].contains(petState!) else {
+          result(FlutterError(code: "pet_live_activity_invalid_arguments", message: "Unknown pet state.", details: nil))
+          return
+        }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
           result(FlutterError(code: "pet_live_activity_disabled", message: "Live Activities are unavailable or disabled in system settings.", details: nil))
           return
@@ -141,7 +164,8 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
           await activity.end(nil, dismissalPolicy: .immediate)
         }
         let state = self.backgroundContent(host: host, session: session, original:
-          PetActivityAttributes.ContentState(packId: args["packId"] as? String, phase: phase, label: label, staleLabel: staleLabel))
+          PetActivityAttributes.ContentState(packId: args["packId"] as? String, phase: phase,
+            petState: petState, label: label, staleLabel: staleLabel))
         // A suspended Dart process cannot promise fresh status indefinitely.
         // A local idle pet has no session status that can become stale.
         let content = ActivityContent(state: state, staleDate: host == "local-pet" ? nil : Date().addingTimeInterval(300))

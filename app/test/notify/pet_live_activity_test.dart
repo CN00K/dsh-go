@@ -9,8 +9,13 @@ import 'package:dsh_app/state/hosts_state.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-LivePush push({LiveKind kind = LiveKind.running, PetStateName mood = PetStateName.thinking}) => LivePush(
+LivePush push({
+  LiveKind kind = LiveKind.running,
+  PetStateName mood = PetStateName.thinking,
+  String? packId,
+}) => LivePush(
   enabled: true,
+  packId: packId,
   activity: LiveActivity(
     kind: kind,
     mood: mood,
@@ -28,18 +33,29 @@ void main() {
 
   test('six presentation phases preserve reducer projection and privacy', () {
     final cases = [
-      (push(mood: PetStateName.idle), 'idle'),
-      (push(), 'thinking'),
-      (push(mood: PetStateName.working), 'working'),
-      (push(mood: PetStateName.juggling), 'working'),
-      (push(kind: LiveKind.waiting), 'waitingApproval'),
-      (push(kind: LiveKind.done), 'completed'),
-      (push(kind: LiveKind.failed), 'error'),
+      (push(packId: 'deepy-whale', mood: PetStateName.idle), 'idle', 'idle'),
+      (push(packId: 'deepy-whale'), 'thinking', 'thinking'),
+      (push(packId: 'deepy-whale', mood: PetStateName.working), 'working', 'working'),
+      (push(packId: 'deepy-whale', mood: PetStateName.juggling), 'working', 'juggling'),
+      (push(packId: 'deepy-whale', mood: PetStateName.sweeping), 'working', 'sweeping'),
+      (push(packId: 'deepy-whale', mood: PetStateName.carrying), 'working', 'carrying'),
+      (push(packId: 'deepy-whale', kind: LiveKind.waiting), 'waitingApproval', 'notification'),
+      (push(packId: 'deepy-whale', kind: LiveKind.done), 'completed', 'attention'),
+      (push(packId: 'deepy-whale', kind: LiveKind.failed), 'error', 'error'),
     ];
-    for (final (value, phase) in cases) {
+    for (final (value, phase, petState) in cases) {
       final payload = petLiveActivityPayload(value)!;
       expect(payload['phase'], phase);
-      expect(payload.keys.toSet(), {'host', 'sessionId', 'phase', 'label', 'staleLabel'});
+      expect(payload['petState'], petState);
+      expect(payload.keys.toSet(), {
+        'host',
+        'sessionId',
+        'packId',
+        'phase',
+        'petState',
+        'label',
+        'staleLabel',
+      });
       expect(jsonDecode(payload['host'] as String), {'kind': 'relay', 'id': 'host-id'});
       expect(payload['sessionId'], 'session / 中文');
       expect(jsonEncode(payload), isNot(contains('private')));
@@ -52,9 +68,10 @@ void main() {
     const idle = LivePush(enabled: true, packId: 'deepy-whale');
     final payload = petLiveActivityPayload(idle)!;
     expect(payload['host'], 'local-pet');
-    expect(payload['sessionId'], 'deepy-whale');
+    expect(payload['sessionId'], 'local-pet');
     expect(payload['packId'], 'deepy-whale');
     expect(payload['phase'], 'idle');
+    expect(payload['petState'], 'idle');
     expect(petLiveActivityPayload(idle), payload);
     expect(petLiveActivityPayload(const LivePush(enabled: true, packId: noPetId)), isNull);
     expect(petLiveActivityPayload(const LivePush(enabled: false, packId: 'deepy-whale')), isNull);
@@ -106,7 +123,10 @@ void main() {
     await bridge.push(idle);
     await bridge.push(const LivePush(enabled: true, packId: 'whale-girl'));
     await bridge.push(const LivePush(enabled: true, packId: noPetId));
-    expect(calls.map((c) => c.method), ['start', 'update', 'start', 'start', 'start', 'end']);
+    // A new pet is the same activity updated in place: switching one in the
+    // app changes the island at once, instead of ending it and asking the
+    // system for another (which the system may throttle).
+    expect(calls.map((c) => c.method), ['start', 'update', 'start', 'start', 'update', 'end']);
     expect((calls[3].arguments as Map)['phase'], 'idle');
     expect((calls[4].arguments as Map)['packId'], 'whale-girl');
   });

@@ -54,11 +54,12 @@ for target, expected in [(app,{'Runner/PetLiveActivityPlugin.swift','Shared/PetA
    assert settings['APPLICATION_EXTENSION_API_ONLY']=='YES'
    assert settings['CODE_SIGN_IDENTITY']==''
 for p in ios.rglob('*'):
+ if 'ephemeral' in p.parts:continue
  if p.suffix in ['.plist','.entitlements','.xcsettings']:plistlib.loads(p.read_bytes())
  elif p.suffix in ['.storyboard','.xcscheme','.xcworkspacedata']:ET.parse(p)
 info=plistlib.loads((ios/'Runner/Info.plist').read_bytes());assert info['NSSupportsLiveActivities']
 assert info['FlutterDeepLinkingEnabled'] is False
 assert info['CFBundleURLTypes'][0]['CFBundleURLSchemes']==['dshgo']
-for p in [*ios.rglob('*.swift'),root/'app/lib/notify/pet_live_activity.dart',root/'app/test/notify/pet_live_activity_test.dart',root/'app/lib/state/live_activity_state.dart']:
+for p in [*(p for p in ios.rglob('*.swift') if 'ephemeral' not in p.parts),root/'app/lib/notify/pet_art_stage.dart',root/'app/lib/notify/pet_live_activity.dart',root/'app/test/notify/pet_art_stage_test.dart',root/'app/test/notify/pet_live_activity_test.dart',root/'app/lib/state/live_activity_state.dart']:
  for n,line in enumerate(p.read_text().splitlines(),1): assert line==line.rstrip(),(p,n)
 print('PASS: OpenStep parse; PBX references, target dependency/embed, shared source membership, all configuration entitlements/version/deployment/signing settings, plist/XML, new-source whitespace')

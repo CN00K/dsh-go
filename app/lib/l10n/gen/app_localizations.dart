@@ -16388,6 +16388,132 @@ abstract class L10n {
   /// **'设备身份验证不可用，请先在系统设置中设置设备密码。'**
   String get iosAuthUnavailable;
 
+  /// No description provided for @iosBackgroundTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'iOS 后台运行'**
+  String get iosBackgroundTitle;
+
+  /// No description provided for @iosBackgroundEnable.
+  ///
+  /// In zh, this message translates to:
+  /// **'允许用户任务续跑'**
+  String get iosBackgroundEnable;
+
+  /// No description provided for @iosBackgroundContinued.
+  ///
+  /// In zh, this message translates to:
+  /// **'任务续跑（iOS 26+）'**
+  String get iosBackgroundContinued;
+
+  /// No description provided for @iosBackgroundGrace.
+  ///
+  /// In zh, this message translates to:
+  /// **'短时间后台收尾：自动保存恢复信息'**
+  String get iosBackgroundGrace;
+
+  /// No description provided for @iosBackgroundLimits.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台时间由系统决定，不保证永久运行。长任务建议保持前台或切换远程服务器。恢复信息不能恢复已终止的 Linux 内存任务。'**
+  String get iosBackgroundLimits;
+
+  /// No description provided for @iosBackgroundState.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台执行状态'**
+  String get iosBackgroundState;
+
+  /// No description provided for @iosBackgroundRefresh.
+  ///
+  /// In zh, this message translates to:
+  /// **'刷新状态'**
+  String get iosBackgroundRefresh;
+
+  /// No description provided for @iosBackgroundForeground.
+  ///
+  /// In zh, this message translates to:
+  /// **'前台'**
+  String get iosBackgroundForeground;
+
+  /// No description provided for @iosBackgroundResuming.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在恢复，请等待会话重新同步'**
+  String get iosBackgroundResuming;
+
+  /// No description provided for @iosBackgroundGraceState.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在保存恢复信息'**
+  String get iosBackgroundGraceState;
+
+  /// No description provided for @iosBackgroundContinuedState.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台续跑中（进度未知）'**
+  String get iosBackgroundContinuedState;
+
+  /// No description provided for @iosBackgroundUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'等待恢复；无法确认后台任务仍在执行'**
+  String get iosBackgroundUnknown;
+
+  /// No description provided for @iosBackgroundExpired.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台授权结束'**
+  String get iosBackgroundExpired;
+
+  /// No description provided for @iosBackgroundFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台申请失败'**
+  String get iosBackgroundFailed;
+
+  /// No description provided for @iosBackgroundCompleted.
+  ///
+  /// In zh, this message translates to:
+  /// **'任务完成'**
+  String get iosBackgroundCompleted;
+
+  /// No description provided for @iosBackgroundError.
+  ///
+  /// In zh, this message translates to:
+  /// **'任务异常或已取消'**
+  String get iosBackgroundError;
+
+  /// No description provided for @iosBackgroundUnsupported.
+  ///
+  /// In zh, this message translates to:
+  /// **'需要 iOS 26 或更高版本'**
+  String get iosBackgroundUnsupported;
+
+  /// No description provided for @iosBackgroundSystemMayDecline.
+  ///
+  /// In zh, this message translates to:
+  /// **'系统可能拒绝申请或提前结束授权'**
+  String get iosBackgroundSystemMayDecline;
+
+  /// No description provided for @iosBackgroundRegistrationFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'系统任务注册失败，请使用前台或远程模式'**
+  String get iosBackgroundRegistrationFailed;
+
+  /// No description provided for @iosBackgroundCancel.
+  ///
+  /// In zh, this message translates to:
+  /// **'停止续跑并请求取消当前任务'**
+  String get iosBackgroundCancel;
+
+  /// No description provided for @iosBackgroundUnavailable.
+  ///
+  /// In zh, this message translates to:
+  /// **'无法获取原生后台状态'**
+  String get iosBackgroundUnavailable;
+
   /// No description provided for @launchScreenTitle.
   ///
   /// In zh, this message translates to:
