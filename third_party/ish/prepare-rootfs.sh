@@ -308,10 +308,30 @@ create_zip_archive() {
 
     [ -f "$zip_file" ] || log_error "Failed to create ZIP archive"
     # Sanity: the zip must contain the fakefs markers the App will check.
-    unzip -l "$zip_file" | grep -q "alpine-rootfs/meta.db" \
-        || log_error "ZIP archive has no alpine-rootfs/meta.db — conversion is broken"
-    unzip -l "$zip_file" | grep -q "alpine-rootfs/data/bin/sh" \
-        || log_warning "ZIP archive has no alpine-rootfs/data/bin/sh — check the Alpine tarball contents"
+    # Verified with Python's zipfile (reads the central directory directly,
+    # platform-independent) instead of `unzip -l | grep`: the unzip-based
+    # check failed on the Codemagic Mac (build 3) even though a local repro
+    # with the real fakefsify output passes (zip exit 0, meta.db present,
+    # grep finds it) — the cause is environmental (unzip -l on macOS),
+    # not the zip itself. If this check fails, dump the listing for
+    # diagnosis before exiting.
+    if ! python3 - "$zip_file" << 'PYEOF'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+print(f"zip entries: {len(names)}")
+missing = [n for n in ("alpine-rootfs/meta.db", "alpine-rootfs/data/bin/sh") if n not in names]
+if missing:
+    print("MISSING: " + ", ".join(missing))
+    sys.exit(1)
+PYEOF
+    then
+        echo "--- zip listing (unzip -l, first 30 lines) ---" >&2
+        unzip -l "$zip_file" 2>&1 | head -30 >&2 || true
+        echo "--- zip file ---" >&2
+        ls -la "$zip_file" >&2
+        log_error "ZIP archive is missing alpine-rootfs/meta.db or alpine-rootfs/data/bin/sh — conversion is broken"
+    fi
 
     local zip_sha zip_bytes
     zip_sha="$(shasum -a 256 "$zip_file" | cut -d' ' -f1)"
