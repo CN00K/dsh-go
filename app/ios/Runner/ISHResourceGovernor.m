@@ -398,17 +398,38 @@ typedef struct {
 - (void)startMemoryTimerAndPressureSource {
     _memTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                        _governorQueue);
-    dispatch_source_set_timer(_memTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, 0),
-                              kMemGovernorIntervalNs,
-                              25 * NSEC_PER_MSEC); // 25 ms leeway
-    dispatch_source_set_event_handler(_memTimer, ^{
-        ish_dsh_memory_tick();
-    });
-    dispatch_resume(_memTimer);
+    if (!_memTimer) {
+        NSLog(@"ISHResourceGovernor: memory timer source creation failed — "
+              @"memory governor feed disabled");
+    } else {
+        dispatch_source_set_timer(_memTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  kMemGovernorIntervalNs,
+                                  25 * NSEC_PER_MSEC); // 25 ms leeway
+        dispatch_source_set_event_handler(_memTimer, ^{
+            ish_dsh_memory_tick();
+        });
+        dispatch_resume(_memTimer);
+    }
 
+    // Memory-pressure source: the mask selects the levels to monitor.
+    // mask=0 is rejected by dispatch_source_create on this iOS (it
+    // returns NULL and the following set_event_handler crashed at boot
+    // with EXC_BAD_ACCESS, build 19 crash log). Pass all three levels;
+    // the handler maps the data bits to 0/1/2. If creation still fails,
+    // the governor keeps working timer-only with pressure pinned NORMAL
+    // (the documented fallback — the 250 ms footprint feed is the
+    // primary mechanism, the pressure source only refines it).
     dispatch_source_t pressure = dispatch_source_create(
-        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, 0, _governorQueue);
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN |
+            DISPATCH_MEMORYPRESSURE_CRITICAL,
+        _governorQueue);
+    if (!pressure) {
+        NSLog(@"ISHResourceGovernor: memory pressure source unavailable — "
+              @"continuing timer-only (pressure NORMAL)");
+        return;
+    }
     _memPressureSource = pressure;
     dispatch_source_set_event_handler(pressure, ^{
         unsigned long data = dispatch_source_get_data(pressure);
@@ -492,6 +513,15 @@ typedef struct {
         ish_set_timer_tick_hook(ish_dsh_timer_tick_throttle);
         _cpuTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                            _governorQueue);
+        if (!_cpuTimer) {
+            // Same guard as the memory timer: never set a handler on a
+            // NULL source (would crash in _dispatch_source_set_handler).
+            _cpuRunning = NO;
+            ish_set_timer_tick_hook(NULL);
+            NSLog(@"ISHResourceGovernor: CPU timer source creation failed — "
+                  @"background CPU governor disabled");
+            return;
+        }
         dispatch_source_set_timer(_cpuTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, 0),
                                   (uint64_t)(kCpuSampleIntervalSec * NSEC_PER_SEC),
