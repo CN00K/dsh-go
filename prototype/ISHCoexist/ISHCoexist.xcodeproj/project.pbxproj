@@ -266,6 +266,12 @@
 					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
 					// to #include "emu/arch/x86/cpu.h" (build 7).
 					"GUEST_ARM64=1",
+					// Prototype is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (build 8: #error "for
+					// internal use only"). iSH .c files define it per-file;
+					// the Xcode target defines it project-wide instead.
+					"ISH_INTERNAL=1",
 				);
 				GCC_OPTIMIZATION_LEVEL = 0;
 				HEADER_SEARCH_PATHS = (
@@ -331,6 +337,12 @@
 					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
 					// to #include "emu/arch/x86/cpu.h" (build 7).
 					"GUEST_ARM64=1",
+					// Prototype is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (build 8: #error "for
+					// internal use only"). iSH .c files define it per-file;
+					// the Xcode target defines it project-wide instead.
+					"ISH_INTERNAL=1",
 				);
 				GCC_OPTIMIZATION_LEVEL = s;
 				HEADER_SEARCH_PATHS = (
