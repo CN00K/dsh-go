@@ -481,9 +481,9 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         if (err < 0) {
             NSLog(@"ISHKernel: do_execve failed: %d", err);
             dispatch_semaphore_signal(started);
-            // [FIX 1.4a] The child task was created by become_new_init_child
+            // [FIX 1.4a-rev] The child task was created by become_new_init_child
             // but exec failed, so it never ran task_start and never exited.
-            // Without this it stays in the pid table as a live task forever:
+            // Without cleanup it stays in the pid table as a live task forever:
             // no host thread runs its emulator loop, so stopGuest's SIGTERM /
             // SIGKILL can never be delivered (send_signal queues the signal
             // and pokes task->thread, which is not processing guest signals),
@@ -491,15 +491,25 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
             // Observed on device (build 13, test 1.4a): 1.3c's two
             // "/bin/apk" execs failed (ENOENT — apk lives at /sbin/apk),
             // leaking 2 live tasks; guestProcessCount stayed 3 after stop
-            // instead of dropping to 1 (only PID 1). Terminate the child
-            // like a normal failed exec (Unix child calls _exit when execve
-            // fails): do_exit marks it a zombie, invisible to pid_get_task,
-            // so guestProcessCount / stopGuest see it as gone. do_exit is
-            // noreturn (ends in pthread_exit); the semaphore above has
-            // already woken the waiting thread, so nothing is lost.
-            // (kernel/calls.h already declares do_exit; no new include.)
-            do_exit(127 << 8);
-            return; // unreachable; keeps the compiler quiet
+            // instead of dropping to 1 (only PID 1).
+            // Do NOT call do_exit here (fix10 did, and it crashed the app):
+            // do_exit ends in pthread_exit, which is illegal on this GCD
+            // workqueue thread — libpthread aborts with "BUG IN CLIENT OF
+            // LIBPTHREAD: pthread_exit() called from a thread not created by
+            // pthread_create()" (build 14 crash, thread "echo-10", 21:00:56).
+            // Normal guest tasks are safe because task_start spawns a REAL
+            // pthread (pthread_create) for them; this child never reached
+            // task_start, so no real pthread exists for it. Instead, mark
+            // it a zombie directly: pid_get_task returns NULL for zombies
+            // (kernel/task.c), so guestProcessCount / stopGuest ignore it.
+            // The task struct + its mm/files are not released — a small,
+            // bounded leak per failed exec (failed execs are rare). A full
+            // cleanup would need a real pthread to run do_exit on.
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            return;
         }
         NSLog(@"ISHKernel: started guest process PID %d", current->pid);
         startResult = 0;
