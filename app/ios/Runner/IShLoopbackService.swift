@@ -119,8 +119,10 @@ final class IShLoopbackService {
       if self.running { return }
       let token = Self.makeToken()
       let parameters = NWParameters.tcp
-      let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 0)
-      guard let listener = try? NWListener(using: parameters, on: endpoint) else {
+      // NWListener(using:on:) takes a Port, not an Endpoint (no endpoint
+      // overload in this SDK): bind an ephemeral port on all interfaces
+      // and enforce loopback-only in accept(_:) below.
+      guard let listener = try? NWListener(using: parameters, on: .any) else {
         NSLog("ish-loopback: NWListener creation failed")
         return
       }
@@ -218,6 +220,30 @@ final class IShLoopbackService {
   // MARK: - Accept
 
   private func accept(_ connection: NWConnection) {
+    // Loopback-only enforcement (see start(): the listener binds all
+    // interfaces because NWListener has no endpoint overload). Drop any
+    // remote that is not 127.0.0.1 / ::1 before any HTTP parsing;
+    // Bearer auth still applies on top of this.
+    guard case .hostPort(let host, _) = connection.endpoint else {
+      connection.cancel()
+      return
+    }
+    let isLoopback: Bool
+    switch host {
+    case .ipv4(let address):
+      isLoopback = address == IPv4Address("127.0.0.1")
+    case .ipv6(let address):
+      isLoopback = address == IPv6Address("::1")
+    case .name(let name, _):
+      isLoopback = (name == "localhost" || name == "127.0.0.1" || name == "::1")
+    @unknown default:
+      isLoopback = false
+    }
+    guard isLoopback else {
+      NSLog("ish-loopback: rejecting non-loopback connection")
+      connection.cancel()
+      return
+    }
     let conn = HTTPConnection(connection: connection, service: self)
     connections[ObjectIdentifier(conn)] = conn
     conn.start()
@@ -669,7 +695,7 @@ private final class ExecSession {
     // Send the chunked headers first, then stream.
     connection?.sendChunkedHeaders()
     let started = Date()
-    execution = ISHShellExecutor.shared.executeCommand(
+    execution = ISHShellExecutor.shared().executeCommand(
       command, stdinData: stdinData, fsContext: fsContext, timeout: timeout,
       outputHandler: { [weak self] isStderr, chunk in
         self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
@@ -846,7 +872,7 @@ private final class WSConnection {
     guard let service, service.registerPTYSession(session) else {
       // Another PTY session is already active (single shared
       // _consoleTTY). Kill the shell we just spawned and refuse.
-      ISHShellExecutor.shared.killProcessGroup(pid)
+      ISHShellExecutor.shared().killProcessGroup(pid)
       close(code: 1008, reason: "another pty session is active")
       return
     }
@@ -1041,7 +1067,7 @@ private final class PTYSession {
     // When the shell exits on its own (e.g. the user typed `exit`),
     // close the WebSocket so the client knows the shell is gone.
     exitObserver = NotificationCenter.default.addObserver(
-      forName: ISHGuestExitedNotification, object: nil, queue: .main
+      forName: NSNotification.Name.ISHGuestExited, object: nil, queue: .main
     ) { [weak self] note in
       guard let self else { return }
       guard let pid = note.userInfo?["pid"] as? NSNumber,
@@ -1074,7 +1100,7 @@ private final class PTYSession {
       NotificationCenter.default.removeObserver(observer)
       exitObserver = nil
     }
-    ISHShellExecutor.shared.killProcessGroup(Int32(guestPid))
+    ISHShellExecutor.shared().killProcessGroup(Int32(guestPid))
     service?.clearPTYSession(self)
     NSLog("ish-loopback: pty session closed (guest pid \(guestPid)): \(reason)")
   }

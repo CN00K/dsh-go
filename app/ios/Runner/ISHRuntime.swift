@@ -307,7 +307,7 @@ import Foundation
     }
 
     DispatchQueue.main.async { [weak self] in self?.setPhase("booting") }
-    let rc = kernel.bootWithRootPath(RootfsManager.rootfsURL.path)
+    let rc = kernel.boot(withRootPath: RootfsManager.rootfsURL.path)
     guard rc == 0 else {
       let (code, message): (String, String) = switch rc {
       case -1: ("ish_boot_no_data", "rootfs 缺失 data/，无法 boot")
