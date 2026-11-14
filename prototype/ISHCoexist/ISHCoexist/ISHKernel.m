@@ -481,7 +481,25 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         if (err < 0) {
             NSLog(@"ISHKernel: do_execve failed: %d", err);
             dispatch_semaphore_signal(started);
-            return;
+            // [FIX 1.4a] The child task was created by become_new_init_child
+            // but exec failed, so it never ran task_start and never exited.
+            // Without this it stays in the pid table as a live task forever:
+            // no host thread runs its emulator loop, so stopGuest's SIGTERM /
+            // SIGKILL can never be delivered (send_signal queues the signal
+            // and pokes task->thread, which is not processing guest signals),
+            // and pid_get_task keeps returning it (it is not a zombie).
+            // Observed on device (build 13, test 1.4a): 1.3c's two
+            // "/bin/apk" execs failed (ENOENT — apk lives at /sbin/apk),
+            // leaking 2 live tasks; guestProcessCount stayed 3 after stop
+            // instead of dropping to 1 (only PID 1). Terminate the child
+            // like a normal failed exec (Unix child calls _exit when execve
+            // fails): do_exit marks it a zombie, invisible to pid_get_task,
+            // so guestProcessCount / stopGuest see it as gone. do_exit is
+            // noreturn (ends in pthread_exit); the semaphore above has
+            // already woken the waiting thread, so nothing is lost.
+            // (kernel/calls.h already declares do_exit; no new include.)
+            do_exit(127 << 8);
+            return; // unreachable; keeps the compiler quiet
         }
         NSLog(@"ISHKernel: started guest process PID %d", current->pid);
         startResult = 0;
