@@ -1,7 +1,9 @@
 #!/bin/sh
 # Vendored from OpenMinis (GPLv3): deps/aot/workloads/pcre_train.sh
-# (https://github.com/OpenMinis/OpenMinis). Copied unchanged except this
-# header. dsh-go is AGPL-3.0; GPLv3 code may be included in an AGPLv3
+# (https://github.com/OpenMinis/OpenMinis). Copied with one dsh-go change:
+# `git config --global --add safe.directory` before the first git use, because
+# the recording guest's git refuses the repo as "dubious ownership".
+# dsh-go is AGPL-3.0; GPLv3 code may be included in an AGPLv3
 # work with attribution — see design §5 / THIRD_PARTY_NOTICES.md.
 # Used by third_party/ish/record-aot.sh (the pcre2 training workload).
 # Workload for recording the PCRE2 AOT image: git grep -P, git log -P and
@@ -13,6 +15,11 @@
 # ten files, so `git log -P` has history to search.
 R=/tmp/pcre-repo
 rm -rf $R && mkdir -p $R && cd $R || { echo "FAIL pcre: no $R"; exit 1; }
+# The guest's git refuses to touch a repo whose owner differs from the
+# current user ("dubious ownership"); mark this throwaway training repo safe.
+# (dsh-go change: upstream OpenMinis does not need this; our recording
+# rootfs gives the extracted stdlib files an owner git does not trust.)
+git config --global --add safe.directory "$R" || { echo "FAIL pcre: safe.directory"; exit 1; }
 src=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
 ( cd "$src" && find . -name '*.py' ! -path './site-packages/*' ! -path './test/*' ! -path '*/tests/*' ! -path '*/__pycache__/*' |
     tar cf - -T - ) | tar xf -
