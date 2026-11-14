@@ -253,7 +253,9 @@ workflows:
           # -y stores symlinks as links (do not dereference them).
           zip -r -y -X dsh-go-unsigned.ipa Payload 2>&1 | tee build-logs/10-package-ipa.log
           ls -lh dsh-go-unsigned.ipa
-          unzip -l dsh-go-unsigned.ipa | head -20
+          # NB: `unzip -l | head` exits 141 (SIGPIPE) under `pipefail` when
+          # head closes early, which would fail the step after a good IPA.
+          unzip -l dsh-go-unsigned.ipa | head -n 20 || true
 
     artifacts:
       - dsh-go-unsigned.ipa
