@@ -157,7 +157,7 @@ final class ISHTestHarness {
         }
         // Snapshot BEFORE installing (whatever Node installed at startup).
         for sig in Self.crashSignals {
-            var d = ISHSignalDisposition()
+            var d = ISHSignalDisposition(handler: nil, flags: 0, isSiginfo: 0)
             ish_crash_handler_current_disposition(sig, &d)
             preInstallDispositions[sig] = d
         }
@@ -169,8 +169,8 @@ final class ISHTestHarness {
             var lines: [String] = []
             var ok = true
             for sig in Self.crashSignals {
-                var cur = ISHSignalDisposition()
-                var prev = ISHSignalDisposition()
+                var cur = ISHSignalDisposition(handler: nil, flags: 0, isSiginfo: 0)
+                var prev = ISHSignalDisposition(handler: nil, flags: 0, isSiginfo: 0)
                 ish_crash_handler_current_disposition(sig, &cur)
                 ish_crash_handler_prev_disposition(sig, &prev)
                 let pre = self.preInstallDispositions[sig]
@@ -248,7 +248,7 @@ final class ISHTestHarness {
         // handler OVER ours? If so, our handler is no longer outermost.
         // (No separate row: folded into ① as an addendum.)
         do {
-            var cur = ISHSignalDisposition()
+            var cur = ISHSignalDisposition(handler: nil, flags: 0, isSiginfo: 0)
             ish_crash_handler_current_disposition(SIGSEGV, &cur)
             let stillOutermost = cur.handler == ish_crash_handler_function()
             appendDetail(id: "1.2-1",

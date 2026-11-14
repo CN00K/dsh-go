@@ -26,7 +26,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// `isSiginfo` says whether SA_SIGINFO was set (i.e. whether `handler`
 /// must be read as sa_sigaction rather than sa_handler).
 typedef struct {
-    void *handler;
+    // _Nullable: NULL == SIG_DFL (see doc above). Without this, Swift
+    // imports handler as non-Optional UnsafeMutableRawPointer, which breaks
+    // both zero-initialisation (no-arg init missing) and `guard let h`
+    // (conditional binding needs Optional). C side is unaffected: this is
+    // only a nullability annotation, the type stays `void *`.
+    void * _Nullable handler;
     unsigned int flags;
     int isSiginfo;
 } ISHSignalDisposition;
