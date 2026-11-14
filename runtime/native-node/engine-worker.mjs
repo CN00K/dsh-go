@@ -28,6 +28,13 @@ if (existsSync(pnpmDist)) {
     distPath: pnpmDist, workerPath: new URL('./pnpm-worker.mjs', import.meta.url),
   }), args: [], env: {}};
 }
+// iSH Linux sandbox (Stage 3): forward shell execution to the guest.
+// Same place and technique as the pnpm in-process shim above: install
+// before DSH starts, so the childProcess.spawn patch and the dsh.go.direct
+// hook are in place when the engine loads. installIshBridge never throws;
+// when the loopback service is not up yet, the shims fail closed per call.
+const {installIshBridge} = await import(new URL('./ish-bridge.mjs', import.meta.url));
+installIshBridge();
 parentPort.postMessage({phase: 'starting', nodeVersion: process.versions.node});
 const {runCli} = await import(entry);
 await runCli(packageManager === undefined ? {} : {packageManager});

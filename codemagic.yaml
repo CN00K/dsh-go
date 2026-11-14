@@ -5,7 +5,7 @@
 #
 # What it does:
 #   1. flutter pub get + analyze
-#   2. Rebuilds the DSH engine tree from npm (locked) + applies the 136
+#   2. Rebuilds the DSH engine tree from npm (locked) + applies the 137
 #      hash-pinned patches (runtime/patches) — this replaces the 218 MB
 #      payload archive that prepare-ios.sh would otherwise require.
 #   3. Assembles app/ios/NativeNodeArtifacts/ (NodeMobile.xcframework +
@@ -131,7 +131,7 @@ workflows:
           sys.exit(0 if ok else 1)
           PYEOF
 
-      - name: Apply DSH patches (136, hash-pinned)
+      - name: Apply DSH patches (137, hash-pinned)
         script: |
           set -euo pipefail
           python3 -I runtime/lib/rtbuild.py patch-dsh \
@@ -139,7 +139,16 @@ workflows:
             --dsh-version 0.2.2-rc.1 \
             --patches runtime/patches \
             --out engine-build/dsh-patches.json 2>&1 | tee build-logs/05-patch-dsh.log
-          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==136, len(a)"
+          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==137, len(a)"
+
+      - name: iSH bridge unit tests (ish-bridge.mjs)
+        script: |
+          set -euo pipefail
+          # Stage 3: the Node forwarding layer (spawn shim + PTY WS + exec
+          # HTTP). Pure unit tests against mock loopback servers; no device
+          # needed. Fails fast before the long Xcode build.
+          node --check runtime/native-node/ish-bridge.mjs
+          node --test runtime/native-node/ish-bridge.test.mjs 2>&1 | tee build-logs/05b-ish-bridge-test.log
 
       - name: Stage iOS engine (opt/dsh + vendor/pnpm, prune, shim)
         script: |
@@ -246,13 +255,14 @@ workflows:
           rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
           rsync -a --delete "$stage/opt/dsh/" "$output/engine/"
           cp "$stage/NodeMobile-LICENSE.txt" "$output/engine/"
-          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker}.mjs "$output/engine/"
+          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge}.mjs "$output/engine/"
           # Verify exactly what runtime/native-node/embed-ios.sh will require.
           test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
           test -f "$output/engine/node_modules/@deepseek-ai/dsh/lib/bin.js"
           test -f "$output/engine/vendor/pnpm/dist/pnpm.mjs"
           test -f "$output/engine/supervisor.mjs"
           test -f "$output/engine/engine-worker.mjs"
+          test -f "$output/engine/ish-bridge.mjs"
           echo "NativeNodeArtifacts OK:"
           du -sh "$output"
           find "$output/engine" -maxdepth 2 | head -20
@@ -380,7 +390,7 @@ workflows:
           sys.exit(0 if ok else 1)
           PYEOF
 
-      - name: Apply DSH patches (136, hash-pinned)
+      - name: Apply DSH patches (137, hash-pinned)
         script: |
           set -euo pipefail
           python3 -I runtime/lib/rtbuild.py patch-dsh \
@@ -388,7 +398,16 @@ workflows:
             --dsh-version 0.2.2-rc.1 \
             --patches runtime/patches \
             --out engine-build/dsh-patches.json 2>&1 | tee build-logs/05-patch-dsh.log
-          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==136, len(a)"
+          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==137, len(a)"
+
+      - name: iSH bridge unit tests (ish-bridge.mjs)
+        script: |
+          set -euo pipefail
+          # Stage 3: the Node forwarding layer (spawn shim + PTY WS + exec
+          # HTTP). Pure unit tests against mock loopback servers; no device
+          # needed. Fails fast before the long Xcode build.
+          node --check runtime/native-node/ish-bridge.mjs
+          node --test runtime/native-node/ish-bridge.test.mjs 2>&1 | tee build-logs/05b-ish-bridge-test.log
 
       - name: Stage iOS engine (opt/dsh + vendor/pnpm, prune, shim)
         script: |
@@ -495,13 +514,14 @@ workflows:
           rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
           rsync -a --delete "$stage/opt/dsh/" "$output/engine/"
           cp "$stage/NodeMobile-LICENSE.txt" "$output/engine/"
-          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker}.mjs "$output/engine/"
+          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge}.mjs "$output/engine/"
           # Verify exactly what runtime/native-node/embed-ios.sh will require.
           test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
           test -f "$output/engine/node_modules/@deepseek-ai/dsh/lib/bin.js"
           test -f "$output/engine/vendor/pnpm/dist/pnpm.mjs"
           test -f "$output/engine/supervisor.mjs"
           test -f "$output/engine/engine-worker.mjs"
+          test -f "$output/engine/ish-bridge.mjs"
           echo "NativeNodeArtifacts OK:"
           du -sh "$output"
           find "$output/engine" -maxdepth 2 | head -20

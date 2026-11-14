@@ -1,0 +1,86 @@
+--- a/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml
++++ b/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml
+@@ -237,5 +237,21 @@
+     # Every shipped CLI mode starts with the same file-effect boundary.
+     # The environment remains an explicit deployment override; otherwise fresh
+     # sessions pin workspace-write + ask through the permission service below.
+     - id: sandbox
+       name: '@deepseek-ai/dsh-sandbox-local'
++      config:
++        # iSH Linux sandbox (Stage 3, dsh-go): the confined argv is not
++        # executed by a host runner -- iOS forbids fork()/exec(), so there
++        # is no host process to spawn. "/ish-runner" is a sentinel
++        # intercepted in-process by runtime/native-node/ish-bridge.mjs
++        # (the childProcess.spawn patch), which forwards the command to
++        # the iSH guest over the Swift loopback service. The bwrap
++        # profile args confine() appends after the runner are skipped by
++        # the bridge (it splits at the first bare "--").
++        runnerCommand: ['/ish-runner']
++        # If the bridge cannot reach the guest it prints one of these on
++        # stderr and exits non-zero, and the bash tool reports
++        # SANDBOX_UNAVAILABLE (fail closed, never a bare host run).
++        runnerFailureSignatures:
++          - 'ish bridge unavailable'
++          - 'ish_not_booted'
+--- a/node_modules/@deepseek-ai/dsh-subprocess-local/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-subprocess-local/lib/index.js
+@@ -1441,3 +1441,22 @@
+ */
+ const requireNodePty = createLazyRequire("node-pty", import.meta.url);
++/**
++ * iSH Linux sandbox (Stage 3, dsh-go): stub process inspector for guest
++ * terminals. The guest shell is not a host process, and /bin/ps does not
++ * exist in the app sandbox, so the host inspector would throw on every
++ * snapshot() (terminal create/close would fail). The stub reports an
++ * empty, complete snapshot: foreground resolution yields undefined
++ * (readiness settles via the idle path; Ctrl+C still works because it
++ * travels as a 0x03 byte through the PTY, not through signalForeground),
++ * and cleanup finds no survivors to signal (the PTY shim kills the
++ * guest process group on close).
++ */
++const ishProcessInspector = {
++	snapshot: () => ({complete: true, tree: () => [], session: () => [], alive: () => false}),
++	foregroundPgid: () => void 0,
++	isStdinWaiting: () => false,
++	signalGroup: () => {},
++	signalProcess: () => {},
++	isAlive: () => false
++};
+ /**
+@@ -1523,3 +1523,9 @@
+ 	async resolveExecutable(command, env, signal) {
+ 		command = globalThis[Symbol.for("dsh.go.direct")]?.executable(command) ?? command;
++		// iSH Linux sandbox (Stage 3, dsh-go): the guest shell is not a
++		// host file (iOS has no /bin/sh in the app sandbox). The direct
++		// hook rewrites "/bin/sh" to this sentinel; accept it here so
++		// terminal shell resolution succeeds. The guest shell itself is
++		// verified by the loopback service when the PTY opens.
++		if (command === "/ish-pty") return command;
+ 		if (command.length === 0) throw new Error("subprocess-local: executable must be non-empty");
+@@ -1621,3 +1621,10 @@
+ 		if (file === void 0 || file.length === 0) throw new Error("subprocess-local: terminal argv must contain a program");
+ 		spec.signal?.throwIfAborted();
+-		const inspector = this.terminalInspector ?? createProcessInspector();
++		// iSH Linux sandbox (Stage 3, dsh-go): a terminal whose argv
++		// starts with a sentinel runs in the guest, not as a host
++		// process. /bin/ps does not exist in the app sandbox, so the
++		// host inspector would throw on snapshot() and terminal create
++		// would fail. Use the stub inspector (see ishProcessInspector);
++		// the guest process group is killed by the PTY shim on close.
++		const ishTerminal = file === "/ish-pty" || file === "/ish-runner";
++		const inspector = ishTerminal ? ishProcessInspector : this.terminalInspector ?? createProcessInspector();
+@@ -1657,2 +1657,13 @@
+ 			const direct = globalThis[Symbol.for("dsh.go.direct")]?.command(scope?.command ?? file, scope?.args ?? [...launch.argv.slice(1)], options);
+-			terminal = requireNodePty().spawn(direct?.file ?? scope?.command ?? file, direct?.args ?? scope?.args ?? [...launch.argv.slice(1)], direct?.options ?? options);
++			const ishPty = globalThis[Symbol.for("dsh.ish.pty")];
++			// iSH Linux sandbox (Stage 3, dsh-go): node-pty is a native
++			// addon and is pruned from the iOS bundle, so requireNodePty()
++			// throws. The guest PTY is driven over WS /ish/pty by the
++			// shim installed by ish-bridge.mjs (see Symbol.for("dsh.ish.pty")).
++			// The direct hook may have rewritten the target already; the
++			// shim ignores the host argv (the service always spawns /bin/sh)
++			// and uses only cols/rows/cwd/env from options.
++			if (ishTerminal && ishPty === void 0) throw new Error("subprocess-local: iSH terminal requested but the ish-bridge PTY shim is not installed (engine-worker did not load ish-bridge.mjs)");
++			terminal = ishTerminal && ishPty !== void 0
++				? ishPty.spawn(direct?.file ?? scope?.command ?? file, direct?.args ?? scope?.args ?? [...launch.argv.slice(1)], direct?.options ?? options)
++				: requireNodePty().spawn(direct?.file ?? scope?.command ?? file, direct?.args ?? scope?.args ?? [...launch.argv.slice(1)], direct?.options ?? options);

@@ -1769,6 +1769,18 @@
           "before": "a1ad048cbbb7caefe5471c583f076aa8e393f534efbc5b11b625308096efdace"
         }
       }
+    },
+    "ish-sandbox-backend.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-base/cordis.patch.yml": {
+          "after": "6216a72b13100af03f9d55173f164e80158d8fe64f928cf3e7119846f29cbf9f",
+          "before": "b65a86e55f02d863286bb6faac8ae292c18fffca3c8aa4491b600fa4dd6b48d0"
+        },
+        "node_modules/@deepseek-ai/dsh-subprocess-local/lib/index.js": {
+          "after": "0665a14e2dcefd3f596a589a77c1ea42e16466159ca89c36c92508409c66dca3",
+          "before": "4784084d8dd7abf217b75fe546dec6c87975a167e1a20ed035e220d279080d1c"
+        }
+      }
     }
   },
   "schema": 1
