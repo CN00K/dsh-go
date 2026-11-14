@@ -54,7 +54,7 @@
 #     images still match the app, which is built from the same commit);
 #   * the bundled package versions are the expected ones (musl 1.2.5-r8,
 #     busybox 1.37.0-r8, zlib 1.3.1-r2, libcrypto3/libssl3 3.3.2-r4,
-#     pcre2 10.43-r0) — a different version means the image name would be
+#     pcre2 10.43-r1) — a different version means the image name would be
 #     wrong, so fail loudly and update the EXPECTED_* below;
 #   * NEVER install the openssl CLI in the guest: it upgrades libcrypto3
 #     away from 3.3.2-r4 (the localhost certificates are made on the host
@@ -107,7 +107,7 @@ EXPECTED_MUSL="1.2.5-r8"
 EXPECTED_BUSYBOX="1.37.0-r8"
 EXPECTED_ZLIB="1.3.1-r2"
 EXPECTED_OPENSSL="3.3.2-r4"
-EXPECTED_PCRE2="10.43-r0"
+EXPECTED_PCRE2="10.43-r1"
 
 # --- Per-module settings: file | record substring | floor | workload | ok markers
 # Floors are ~80% of OpenMinis's 2026-10-05 recording at abi 1f3bb5a0
@@ -120,7 +120,7 @@ spec() {
         zlib)      echo "aot_zlib_1.3.1-r2.S|libz.so|200|/tmp/aojit/zlib/zlib_train.sh|zlib-train-ok" ;;
         libcrypto) echo "aot_libcrypto_3.3.2-r4.S|libcrypto.so|15000|/tmp/aojit/net/tls_train.sh|agent-cold-ok tls-train-ok" ;;
         libssl)    echo "aot_libssl_3.3.2-r4.S|libssl.so|5800|/tmp/aojit/net/tls_train.sh|agent-cold-ok tls-train-ok" ;;
-        pcre2)     echo "aot_pcre2_10.43-r0.S|libpcre2-8.so|4100|/tmp/aojit/minis/pcre_train.sh|pcre-train-ok" ;;
+        pcre2)     echo "aot_pcre2_10.43-r1.S|libpcre2-8.so|4100|/tmp/aojit/minis/pcre_train.sh|pcre-train-ok" ;;
         *) return 1 ;;
     esac
 }
