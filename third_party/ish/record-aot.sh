@@ -256,18 +256,23 @@ log_success "rootfs A ready: $DATA ($(find "$DATA" -type l | wc -l | tr -d ' ') 
 # /dev device nodes: the Alpine minirootfs ships NO /dev entries, and ish
 # only creates the essential nodes when it runs under fakefs — in -r
 # (realfs) mode it skips them (xX_main_Xx.h: "only works with fakefs"), so
-# the guest has no /dev/urandom. git needs random bytes for temp files, and
-# without it `git add` dies with "unable to get random bytes for temporary
-# file: No such file or directory" (build 6af8b645, pcre2 dry run). Link the
-# well-known devices to the HOST's (macOS has all four); in -r mode the
-# guest's open() resolves through the host, so reads return real random
-# bytes. This only touches the throwaway recording tree, never the app's
-# shipped rootfs.
+# the guest had no /dev/urandom and git add died with "unable to get random
+# bytes for temporary file" (build 6af8b645, pcre2 dry run). The fix MUST be
+# placeholder FILES, not symlinks: an absolute symlink /dev/null -> /dev/null
+# resolves guest-side back into the guest's own /dev and loops ("Symbolic
+# link loop", build 6af8bada, attempt 10 — my fix-8 mistake). ish is designed
+# for placeholder files in -r mode: realfs_stat() overrides mode/rdev to
+# S_IFCHR + the device number for well-known /dev paths *when the file
+# exists* (fs/real.c: "backed by placeholder files"), and generic_openat()
+# then routes the open to the emulated device via dev_open() (fs/generic.c)
+# — reads go through mem_dev/random_dev, never through the file, so the
+# file's content is irrelevant and an empty file is correct. This only
+# touches the throwaway recording tree, never the app's shipped rootfs.
 mkdir -p "$DATA/dev" || fail "could not create $DATA/dev"
-for d in null zero random urandom; do
-    [ -e "$DATA/dev/$d" ] || ln -s "/dev/$d" "$DATA/dev/$d" || fail "could not link $DATA/dev/$d -> /dev/$d"
+for d in null zero full random urandom; do
+    [ -e "$DATA/dev/$d" ] || : > "$DATA/dev/$d" || fail "could not create placeholder $DATA/dev/$d"
 done
-log_success "/dev wired to host (null zero random urandom)"
+log_success "/dev placeholders ready (null zero full random urandom)"
 
 # -r takes the rootfs tree root (the AOJIT suite's mode; see the header
 # note). DATA is a real extracted Alpine tree, NOT the fakefs data/ dir:
