@@ -189,11 +189,15 @@ final class ISHTestHarness {
             do {
                 let r = try RootfsInstaller.ensureInstalled()
                 let rc = self.kernel.boot(withRootPath: RootfsInstaller.rootfsURL.path)
+                // Nested string literals inside \(...) interpolation do not
+                // compile here (Xcode 26.6: unterminated string literal), so
+                // resolve the label first and interpolate only the variable.
+                let rootfsLabel = r == .installed ? "本次解压" : "已安装"
                 guard rc == 0 else {
-                    return (.fail, "boot rc=\(rc)（rootfs：\(r == .installed ? "本次解压" : "已安装"）)")
+                    return (.fail, "boot rc=\(rc)（rootfs：\(rootfsLabel)）")
                 }
                 self.ishBooted = true
-                return (.pass, "boot 成功（rootfs：\(r == .installed ? "本次解压" : "已安装"）；PID 1 supervisor 已挂起）")
+                return (.pass, "boot 成功（rootfs：\(rootfsLabel)）；PID 1 supervisor 已挂起）")
             } catch {
                 return (.fail, "boot 前置失败：\(error.localizedDescription)")
             }
