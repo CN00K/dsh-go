@@ -253,6 +253,21 @@ case "$SH_LINK" in
 esac
 [ -x "$SH_TARGET" ] || fail "rootfs A has no working /bin/sh: $DATA/bin/sh -> $SH_LINK, target $SH_TARGET is not executable"
 log_success "rootfs A ready: $DATA ($(find "$DATA" -type l | wc -l | tr -d ' ') symlinks)"
+# /dev device nodes: the Alpine minirootfs ships NO /dev entries, and ish
+# only creates the essential nodes when it runs under fakefs — in -r
+# (realfs) mode it skips them (xX_main_Xx.h: "only works with fakefs"), so
+# the guest has no /dev/urandom. git needs random bytes for temp files, and
+# without it `git add` dies with "unable to get random bytes for temporary
+# file: No such file or directory" (build 6af8b645, pcre2 dry run). Link the
+# well-known devices to the HOST's (macOS has all four); in -r mode the
+# guest's open() resolves through the host, so reads return real random
+# bytes. This only touches the throwaway recording tree, never the app's
+# shipped rootfs.
+mkdir -p "$DATA/dev" || fail "could not create $DATA/dev"
+for d in null zero random urandom; do
+    [ -e "$DATA/dev/$d" ] || ln -s "/dev/$d" "$DATA/dev/$d" || fail "could not link $DATA/dev/$d -> /dev/$d"
+done
+log_success "/dev wired to host (null zero random urandom)"
 
 # -r takes the rootfs tree root (the AOJIT suite's mode; see the header
 # note). DATA is a real extracted Alpine tree, NOT the fakefs data/ dir:
