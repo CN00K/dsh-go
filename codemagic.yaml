@@ -304,15 +304,12 @@ workflows:
             flutter --version
             node --version
             python3 --version
-            echo "== iSH build tools (brew) =="
-            for t in meson ninja; do
-              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
-            done
-            # VDSO toolchain: brew llvm clang + ld.lld. build-ish.sh
-            # re-checks these and fails fast if the cross link cannot work.
-            for f in /opt/homebrew/opt/llvm/bin/clang /opt/homebrew/opt/llvm/bin/ld.lld; do
-              [ -x "$f" ] || { echo "MISSING: $f (brew install llvm)"; exit 1; }
-            done
+            # NOTE: meson / ninja / brew llvm (clang + ld.lld) / libarchive
+            # are NOT checked here on purpose. They are usually absent from
+            # a fresh Codemagic mac_mini_m2 image, and build-ish.sh installs
+            # any missing ones via brew and verifies them (including a VDSO
+            # cross-link pre-check) before meson setup. Failing here would
+            # only duplicate that logic and block the install step.
             echo "== required tools =="
             for t in rsync unzip zip tar curl shasum file ditto; do
               command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
