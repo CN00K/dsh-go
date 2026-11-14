@@ -102,6 +102,12 @@ static const size_t kISHExecEnvpCapacity = 8192;
 @interface ISHExecRecord : NSObject
 @property (nonatomic, strong) NSString *token;
 @property (nonatomic, copy, nullable) void (^completion)(ISHShellExecutionResult *result);
+/// Streaming output sink (stage 2.4 loopback /ish/exec). Invoked on an
+/// arbitrary queue with (isStderr, chunk) as each pipe read returns;
+/// chunks are raw bytes in arrival order per stream. Nil = non-streaming
+/// (output only visible in the final result). Set once at start; never
+/// changed afterwards, so no lock is needed to read it.
+@property (nonatomic, copy, nullable) void (^outputHandler)(BOOL isStderr, NSData *chunk);
 @property (nonatomic, strong) NSMutableData *stdoutData;
 @property (nonatomic, strong) NSMutableData *stderrData;
 @property (nonatomic, strong) NSLock *outputLock;
@@ -205,12 +211,14 @@ static void ish_executor_close_fd(int fd) {
                                     stdinData:(nullable NSData *)stdinData
                                     fsContext:(uint64_t)fsContext
                                       timeout:(NSTimeInterval)timeout
+                                outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                                    completion:(void (^)(ISHShellExecutionResult *result))completion;
 - (void)runRecord:(ISHExecRecord *)record
              argv:(NSArray<NSString *> *)argv
         stdinData:(nullable NSData *)stdinData
         fsContext:(uint64_t)fsContext;
-- (void)readPipeFd:(int)fd into:(NSMutableData *)buffer lock:(NSLock *)lock;
+- (void)readPipeFd:(int)fd into:(NSMutableData *)buffer lock:(NSLock *)lock
+            record:(ISHExecRecord *)record isStderr:(BOOL)isStderr;
 - (void)writeStdinData:(nullable NSData *)data
                   toFd:(int)fd
                 record:(ISHExecRecord *)record;
@@ -313,6 +321,7 @@ static void ish_executor_close_fd(int fd) {
                               stdinData:stdinData
                               fsContext:fsContext
                                 timeout:timeout
+                          outputHandler:nil
                              completion:completion];
 }
 
@@ -321,10 +330,25 @@ static void ish_executor_close_fd(int fd) {
                             fsContext:(uint64_t)fsContext
                               timeout:(NSTimeInterval)timeout
                            completion:(void (^)(ISHShellExecutionResult *result))completion {
+    return [self executeCommand:command stdinData:stdinData fsContext:fsContext
+                        timeout:timeout outputHandler:nil completion:completion];
+}
+
+/// Streaming variant (stage 2.4 loopback /ish/exec): stdout/stderr
+/// chunks are delivered to `outputHandler` as they arrive (arbitrary
+/// queue, raw bytes, per-stream arrival order). The completion still
+/// fires at the end with the full result.
+- (ISHShellExecution *)executeCommand:(NSString *)command
+                            stdinData:(nullable NSData *)stdinData
+                            fsContext:(uint64_t)fsContext
+                              timeout:(NSTimeInterval)timeout
+                        outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                           completion:(void (^)(ISHShellExecutionResult *result))completion {
     return [self startExecutionWithArgv:@[@"/bin/sh", @"-c", command ?: @""]
                               stdinData:stdinData
                               fsContext:fsContext
                                 timeout:timeout
+                          outputHandler:outputHandler
                              completion:completion];
 }
 
@@ -332,9 +356,11 @@ static void ish_executor_close_fd(int fd) {
                                     stdinData:(nullable NSData *)stdinData
                                     fsContext:(uint64_t)fsContext
                                       timeout:(NSTimeInterval)timeout
+                                outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                                    completion:(void (^)(ISHShellExecutionResult *result))completion {
     ISHExecRecord *record = [[ISHExecRecord alloc] init];
     record.completion = completion;
+    record.outputHandler = outputHandler;
     record.timeout = (timeout > 0 ? timeout : kISHExecDefaultTimeout);
     ISHShellExecution *handle = [[ISHShellExecution alloc] initWithRecord:record];
     // Register synchronously so the handle is usable immediately.
@@ -381,14 +407,14 @@ static void ish_executor_close_fd(int fd) {
     dispatch_group_enter(record.pipeGroup);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         [self readPipeFd:stdoutPipe[0] into:record.stdoutData
-                    lock:record.outputLock];
+                    lock:record.outputLock record:record isStderr:NO];
         close(stdoutPipe[0]);
         dispatch_group_leave(record.pipeGroup);
     });
     dispatch_group_enter(record.pipeGroup);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         [self readPipeFd:stderrPipe[0] into:record.stderrData
-                    lock:record.outputLock];
+                    lock:record.outputLock record:record isStderr:YES];
         close(stderrPipe[0]);
         dispatch_group_leave(record.pipeGroup);
     });
@@ -557,14 +583,22 @@ static void ish_executor_close_fd(int fd) {
 // Blocking read loop: appends to `buffer` under `lock` until EOF (all
 // write ends closed) or a non-EINTR error. Runs on a global-queue
 // thread; the caller closes `fd` when this returns.
-- (void)readPipeFd:(int)fd into:(NSMutableData *)buffer lock:(NSLock *)lock {
+- (void)readPipeFd:(int)fd into:(NSMutableData *)buffer lock:(NSLock *)lock
+            record:(ISHExecRecord *)record isStderr:(BOOL)isStderr {
     uint8_t chunk[8192];
     for (;;) {
         ssize_t n = read(fd, chunk, sizeof(chunk));
         if (n > 0) {
+            NSData *data = [NSData dataWithBytes:chunk length:(NSUInteger)n];
             [lock lock];
             [buffer appendBytes:chunk length:(NSUInteger)n];
             [lock unlock];
+            // Stream the chunk out (stage 2.4). Called AFTER releasing
+            // the lock: the handler may call back into the executor and
+            // must never deadlock on outputLock. The handler is set once
+            // at start and never changed, so no lock is needed to read it.
+            void (^handler)(BOOL, NSData *) = record.outputHandler;
+            if (handler) handler(isStderr, data);
         } else if (n == 0) {
             break; // EOF
         } else {

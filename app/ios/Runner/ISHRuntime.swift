@@ -60,6 +60,15 @@ import Foundation
       .appendingPathComponent("NativeNode/home/workspace", isDirectory: true)
   }
 
+  /// Raw PTY byte sink for the loopback service (stage 2.4 /ish/pty).
+  /// The log ring still receives the same bytes (line-split); the sink
+  /// receives the raw burst bytes, unmodified, so the WebSocket forwards
+  /// a proper byte stream (no line-splitting, no data loss — the 2.3
+  /// log ring's trailing-partial-line split does not apply here).
+  /// Set by IShLoopbackService on start, cleared on stop. Called on the
+  /// main queue (the outputCallback is main-queue batched).
+  static var ptyOutputSink: ((Data) -> Void)?
+
   private let files = FileManager.default
   private let kernel = ISHKernel.shared
 
@@ -83,6 +92,12 @@ import Foundation
     kernel.outputCallback = { [weak self] data in
       DispatchQueue.main.async {
         guard let self else { return }
+        // Raw bytes to the loopback PTY sink first (proper byte stream
+        // for /ish/pty); the log ring below still gets its line-split
+        // copy. Both see the same burst — nothing is consumed twice:
+        // outputCallback receives the drained batch, and the sink just
+        // forwards it.
+        Self.ptyOutputSink?(data)
         let text = String(decoding: data, as: UTF8.self)
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
           self.log(String(line), stream: "stdout")
@@ -327,6 +342,11 @@ import Foundation
       self?.setPhase("running")
       self?.log("iSH 已 boot（PID 1 supervisor 已挂起）")
     }
+    // Start the loopback service (stage 2.4) so Node's ish-bridge can
+    // reach the guest (pty/exec). Non-fatal if it fails to bind — the
+    // dsh/ish channel still works; ish-bridge reports backend
+    // unavailable until the service is up.
+    IShLoopbackService.shared.start()
     finish(result, nil)
   }
 
@@ -399,6 +419,10 @@ import Foundation
 
   private func performReset(keepUserData: Bool, result: @escaping FlutterResult) {
     if kernel.isBooted {
+      // The loopback service dies with the reset (the token file is
+      // removed; a relaunch regenerates it). Stop it before the kernel
+      // reset so no client keeps talking to a dead guest.
+      IShLoopbackService.shared.stop()
       // Booted kernel: back up Guest /root first when asked, then the
       // reset-while-booted path (sets didResetWhileBooted, deletes the
       // rootfs; the terminal refuses new shells until relaunch).

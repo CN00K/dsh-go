@@ -129,6 +129,18 @@ typedef NS_ENUM(NSInteger, ISHShellExecutionError) {
                               timeout:(NSTimeInterval)timeout
                            completion:(void (^)(ISHShellExecutionResult *result))completion;
 
+/// Streaming variant (stage 2.4 loopback /ish/exec): stdout/stderr
+/// chunks are delivered to `outputHandler` as they arrive (arbitrary
+/// queue, raw bytes, per-stream arrival order). The completion still
+/// fires at the end with the full result. Pass nil for outputHandler to
+/// get the non-streaming behaviour.
+- (ISHShellExecution *)executeCommand:(NSString *)command
+                            stdinData:(nullable NSData *)stdinData
+                            fsContext:(uint64_t)fsContext
+                              timeout:(NSTimeInterval)timeout
+                        outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                           completion:(void (^)(ISHShellExecutionResult *result))completion;
+
 /// Synchronous one-shot, for agent preflight checks (e.g. `test -x
 /// /sbin/apk`). Blocks the calling thread until the result is ready.
 /// Never call on the main thread. Returns nil only if the async path
