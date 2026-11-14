@@ -263,6 +263,12 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"../../app/ios/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (build 6: fs/tty.h
+					// file not found).
+					"../../app/ios/IShArtifacts/include/ish",
 				);
 				INFOPLIST_FILE = "ISHCoexist/Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
@@ -314,6 +320,12 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"../../app/ios/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (build 6: fs/tty.h
+					// file not found).
+					"../../app/ios/IShArtifacts/include/ish",
 				);
 				INFOPLIST_FILE = "ISHCoexist/Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
