@@ -124,8 +124,15 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_sharedKernel = [[ISHKernel alloc] init];
-        g_guestExits = [NSMutableDictionary dictionary];
-        g_ptyOutput = [NSMutableData data];
+        // [FIX build 12 crash] These are long-lived statics. The
+        // convenience constructors return AUTORELEASED objects; this
+        // target has no CLANG_ENABLE_OBJC_ARC (defaults off), so the
+        // assignment did NOT retain and both dangled after the pool
+        // drained. drainOutput then sent setLength: to freed memory
+        // reused by an NSValue -> unrecognized selector -> abort.
+        // alloc/init returns +1 owned objects, safe with or without ARC.
+        g_guestExits = [[NSMutableDictionary alloc] init];
+        g_ptyOutput = [[NSMutableData alloc] init];
         g_ptyOutputLock = [[NSLock alloc] init];
     });
     return g_sharedKernel;
