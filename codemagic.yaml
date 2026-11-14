@@ -798,7 +798,11 @@ workflows:
           # NOTE: this step MUST run before "Check tools": meson/ninja are
           # not pre-installed on the Codemagic image, so checking first
           # fails with "MISSING: meson" (build 6af89d00, 2026-11-15).
-          for pkg in llvm lld ninja libarchive meson; do
+          # coreutils provides gtimeout, which record-aot.sh uses to bound
+          # each dry run (15 min) and recording (30 min) — attempt 11
+          # (build 6af8bd55) hung on the pcre2 dry run for ~79 min with no
+          # output and was cancelled at ~95 min to save quota.
+          for pkg in llvm lld ninja libarchive meson coreutils; do
             if brew list "$pkg" >/dev/null 2>&1; then
               echo "brew package present: $pkg"
             else
@@ -808,6 +812,7 @@ workflows:
           done
           command -v meson >/dev/null || { echo "meson not found after brew install"; exit 1; }
           command -v ninja >/dev/null || { echo "ninja not found after brew install"; exit 1; }
+          command -v gtimeout >/dev/null || { echo "gtimeout not found after brew install (coreutils)"; exit 1; }
 
       - name: Check tools
         script: |
