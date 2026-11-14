@@ -195,12 +195,20 @@ int ISHDecodeWaitStatus(int status);
 /// contract as the forward hook. Pass nil to uninstall.
 - (void)installPathReverseHandler:(nullable NSString * _Nullable (^)(NSString *hostPath))handler;
 
-/// Background CPU governor (stage 2.5): start/stop the 4 Hz sampler
-/// that throttles the iSH timer tick by duty cycle when the 60 s
-/// sliding window exceeds budget. STUB in stage 2.1 (logs and returns);
-/// implemented in step 2.5.
+/// Background CPU governor (stage 2.5, ISHResourceGovernor): start/stop
+/// the 4 Hz sampler that throttles the iSH timer tick by duty cycle when
+/// the 60 s sliding window exceeds budget (GREEN < 30 CPU-s, YELLOW
+/// 30–38 s, RED >= 38 s at 5% duty; design §2.7). Idempotent; normally
+/// driven by the app-lifecycle observers installed at boot, so manual
+/// calls are only needed for tests or an explicit Dart trigger.
 - (void)beginBackgroundCPUGovernor;
 - (void)endBackgroundCPUGovernor;
+
+/// Live resource-governor snapshot for the dsh/ish `status` payload
+/// (stage 2.5): memory governor state, fork-guard counters, fork-rate
+/// stats, background CPU governor state. JSON-safe nested dictionary;
+/// see ISHResourceGovernor.statusSnapshot for the shape.
+- (NSDictionary<NSString *, id> *)resourceGovernorStatus;
 
 /// Host footprint helpers for stage 1.3 sampling / governor input.
 - (uint64_t)hostPhysFootprintBytes;

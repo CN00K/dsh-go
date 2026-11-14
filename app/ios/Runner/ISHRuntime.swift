@@ -13,7 +13,10 @@
 //  Methods (design §2.4(a)):
 //    status            -> {phase, booted, rootfsReady, rootfsVersion,
 //                        kernelVersion, guestMemoryBytes,
-//                        guestProcessCount, error?}
+//                        guestProcessCount, governors, error?}
+//                        (governors: stage 2.5 live snapshot — memory
+//                        governor state, fork-guard counters, fork-rate
+//                        stats, background CPU governor state)
 //    boot / stop / restart -> null (async; idempotent)
 //    reset {keepUserData}  -> null (async)
 //    getLogs / logs / getLogSnapshot {lines} -> [String] / {entries, throughSeq}
@@ -141,6 +144,7 @@ import Foundation
       "kernelVersion": Self.kernelVersion,
       "guestMemoryBytes": n >= 0 ? Int(anon) : 0,
       "guestProcessCount": Int(n),
+      "governors": kernel.resourceGovernorStatus(),
     ]
     if let hash = RootfsManager.installedHash() { value["rootfsVersion"] = hash }
     if let error = lastError { value["error"] = error }

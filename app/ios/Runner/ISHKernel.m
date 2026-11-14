@@ -25,6 +25,7 @@
 #import "ISHKernel.h"
 #import "ISHCrashHandler.h"
 #import "ISHFakefsMeta.h"
+#import "ISHResourceGovernor.h"
 
 #include "ish/kernel/init.h"
 #include "ish/kernel/task.h"
@@ -361,6 +362,16 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         }
     }
 
+    // Step 0.5 (continued): start the host-side guards (stage 2.5).
+    // The memory feed is primed BEFORE the guest boots: the first
+    // allocations happen during exec of init, long before a 250 ms
+    // tick would land — until the feed exists the kernel is still on
+    // the legacy ledger cap (same reason as main.c
+    // ish_cli_memory_governor_start). The fork guard is inert until
+    // the first fork (no guest task exists before PID 1), so installing
+    // it here rather than at OpenMinis's boot step 6.5 is equivalent.
+    [[ISHResourceGovernor shared] startBootGovernors];
+
     // Step 1: mount rootfs. die() must not abort the app.
     extern void (*die_handler)(const char *msg);
     die_handler = ish_proto_embedded_die_handler;
@@ -414,8 +425,9 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
     }
 
     // [DSH-DELTA-K4] No native offload registration (OpenMinis step 9,
-    // 28 handlers) — v1 scope excludes offloads. No memory/CPU/fork
-    // governors either (stage 2.5 work); only the anon cap above is set.
+    // 28 handlers) — v1 scope excludes offloads. The memory/fork
+    // governors start in boot step 0.5 (stage 2.5, ISHResourceGovernor);
+    // the background CPU governor starts when the app backgrounds.
     NSLog(@"ISHKernel: kernel initialized successfully");
     return 0;
 }
@@ -866,17 +878,20 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
     }
 }
 
-// --- Background CPU governor (stage 2.5 stub) --------------------------------
+// --- Background CPU governor (stage 2.5, ISHResourceGovernor) ------------
 
 - (void)beginBackgroundCPUGovernor {
-    // STUB (stage 2.5): 4 Hz sampler + 60 s sliding window, GREEN /
-    // YELLOW / RED duty-cycle throttling of the iSH timer tick (design
-    // §2.7). Not implemented in step 2.1; calling it is a no-op.
-    NSLog(@"ISHKernel: beginBackgroundCPUGovernor not implemented (stage 2.5)");
+    [[ISHResourceGovernor shared] beginBackgroundCPUGovernor];
 }
 
 - (void)endBackgroundCPUGovernor {
-    NSLog(@"ISHKernel: endBackgroundCPUGovernor not implemented (stage 2.5)");
+    [[ISHResourceGovernor shared] endBackgroundCPUGovernor];
+}
+
+// --- Resource governor status ----------------------------------------------
+
+- (NSDictionary<NSString *, id> *)resourceGovernorStatus {
+    return [[ISHResourceGovernor shared] statusSnapshot];
 }
 
 @end

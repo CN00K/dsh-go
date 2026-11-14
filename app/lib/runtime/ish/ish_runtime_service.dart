@@ -24,6 +24,63 @@ enum IshPhase {
       IshPhase.values.firstWhere((p) => p.name == wire, orElse: () => IshPhase.error);
 }
 
+/// Resource-governor snapshot (stage 2.5), as reported by `dsh/ish`
+/// status under the `governors` key. Best-effort diagnostics: a missing
+/// or malformed map falls back to defaults, never to an invented state.
+class IshGovernors {
+  const IshGovernors({
+    this.memoryState = 'off',
+    this.memoryBraked = false,
+    this.cpuState = 'off',
+    this.cpuDuty = 1.0,
+    this.windowCpuSeconds = 0,
+    this.forkStalls = 0,
+    this.forkRateThrottled = 0,
+  });
+
+  factory IshGovernors.fromMap(Object? wire) {
+    if (wire is! Map) return const IshGovernors();
+    final memory = wire['memoryGovernor'];
+    final cpu = wire['cpuGovernor'];
+    final forkGuard = wire['forkGuard'];
+    final forkRate = wire['forkRate'];
+    return IshGovernors(
+      memoryState: memory is Map ? (memory['state'] as String? ?? 'off') : 'off',
+      memoryBraked: memory is Map ? memory['state'] == 'brake' : false,
+      cpuState: cpu is Map ? (cpu['state'] as String? ?? 'off') : 'off',
+      cpuDuty: cpu is Map ? (cpu['duty'] as num?)?.toDouble() ?? 1.0 : 1.0,
+      windowCpuSeconds:
+          cpu is Map ? (cpu['windowCpuSeconds'] as num?)?.toDouble() ?? 0 : 0,
+      forkStalls:
+          forkGuard is Map ? (forkGuard['stalls'] as num?)?.toInt() ?? 0 : 0,
+      forkRateThrottled:
+          forkRate is Map ? (forkRate['throttled'] as num?)?.toInt() ?? 0 : 0,
+    );
+  }
+
+  /// Memory governor state: "off" (not started), "ok", or "brake".
+  final String memoryState;
+
+  /// True when the kernel is refusing new anonymous commitments
+  /// (headroom < 10%, OS pressure critical, or a stale feed).
+  final bool memoryBraked;
+
+  /// Background CPU governor state: "off", "green", "yellow", "red".
+  final String cpuState;
+
+  /// Current guest throttle duty, 0.05–1.0 (1.0 = full speed).
+  final double cpuDuty;
+
+  /// Whole-process CPU seconds in the last 60 s sliding window.
+  final double windowCpuSeconds;
+
+  /// Fork-guard stalls so far (forking threads held for memory pressure).
+  final int forkStalls;
+
+  /// Forks delayed by the fork-rate token bucket so far.
+  final int forkRateThrottled;
+}
+
 /// Snapshot of the iSH Linux guest (design §2.4(a) `status` shape).
 class IshStatus {
   const IshStatus({
@@ -34,6 +91,7 @@ class IshStatus {
     this.kernelVersion,
     this.guestMemoryBytes = 0,
     this.guestProcessCount = 0,
+    this.governors = const IshGovernors(),
     this.error,
   });
 
@@ -47,6 +105,7 @@ class IshStatus {
     kernelVersion: map['kernelVersion'] as String?,
     guestMemoryBytes: (map['guestMemoryBytes'] as num?)?.toInt() ?? 0,
     guestProcessCount: (map['guestProcessCount'] as num?)?.toInt() ?? 0,
+    governors: IshGovernors.fromMap(map['governors']),
     error: switch (map['error']) {
       final Map value => '${value['code']}: ${value['message']}',
       final String message => message,
@@ -74,6 +133,10 @@ class IshStatus {
 
   /// Live guest tasks (pid 1 + children; zombies are not counted).
   final int guestProcessCount;
+
+  /// Resource-governor snapshot (stage 2.5). Defaults to "off"
+  /// when the native side has not started the governors yet.
+  final IshGovernors governors;
 
   final String? error;
 
