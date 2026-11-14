@@ -8,6 +8,7 @@ import '../state/read_list_epoch.dart';
 import '../state/settings_state.dart';
 import 'runtime_bridge.dart';
 import 'ish/ish_runtime_bridge.dart';
+import 'ish/ish_runtime_service.dart';
 import 'native_node/native_node_runtime_bridge.dart';
 
 final runtimeBridgeProvider = Provider<RuntimeBridge>((ref) => Platform.isIOS ? NativeNodeRuntimeBridge() : RuntimeBridge());
