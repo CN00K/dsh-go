@@ -37,6 +37,7 @@ class LiveActivity {
     this.since,
     this.target,
     this.eventId,
+    this.tier = 0,
   });
 
   final LiveKind kind;
@@ -63,6 +64,10 @@ class LiveActivity {
   /// The request it waits on.
   final String? eventId;
 
+  /// The pet's busy tier (pet_state.dart): 0 when not tiered. The island picks
+  /// the same animation the app plays (typing / music / building).
+  final int tier;
+
   Map<String, Object?> toMap() => {
     'kind': kind.name,
     'title': title,
@@ -73,6 +78,7 @@ class LiveActivity {
     'sinceMs': ?since?.millisecondsSinceEpoch,
     if (target case final target?) ...target.toMap(),
     'eventId': ?eventId,
+    'tier': tier,
   };
 
   @override
@@ -86,10 +92,22 @@ class LiveActivity {
       other.mood == mood &&
       other.since == since &&
       other.target == target &&
-      other.eventId == eventId;
+      other.eventId == eventId &&
+      other.tier == tier;
 
   @override
-  int get hashCode => Object.hash(kind, title, text, chip, publicText, mood, since, target, eventId);
+  int get hashCode => Object.hash(
+    kind,
+    title,
+    text,
+    chip,
+    publicText,
+    mood,
+    since,
+    target,
+    eventId,
+    tier,
+  );
 
   @override
   String toString() => 'LiveActivity(${kind.name} "$title" · $text)';
@@ -129,36 +147,52 @@ LiveActivity? liveActivityOf({
   var title = titles[target];
   for (final r in runs) {
     final t = r.title;
-    if (r.host == target.host && r.root == target.sessionId && t != null && t.trim().isNotEmpty) {
+    if (r.host == target.host &&
+        r.root == target.sessionId &&
+        t != null &&
+        t.trim().isNotEmpty) {
       title = t;
       break;
     }
   }
   // The open chat already follows title changes that an older list misses.
   final focusedTitle = focus?.title;
-  if (focus?.target == target && focusedTitle != null && focusedTitle.trim().isNotEmpty) {
+  if (focus?.target == target &&
+      focusedTitle != null &&
+      focusedTitle.trim().isNotEmpty) {
     title = focusedTitle;
   }
 
   // More conversations than the one it names: 「· 3 个对话在跑」.
-  String counted(String line) => roots.length > 1 ? '$line · ${l10n.liveRunsCount(roots.length)}' : line;
+  String counted(String line) =>
+      roots.length > 1 ? '$line · ${l10n.liveRunsCount(roots.length)}' : line;
 
-  LiveActivity make(LiveKind kind, String text, String chip, String publicText, {String? eventId}) => LiveActivity(
+  LiveActivity make(
+    LiveKind kind,
+    String text,
+    String chip,
+    String publicText, {
+    String? eventId,
+  }) => LiveActivity(
     kind: kind,
     title: alertTitle(title),
     text: text,
     chip: chip,
     publicText: publicText,
     mood: pet.state,
-    since: kind == LiveKind.running || kind == LiveKind.waiting ? started(target) : null,
+    since: kind == LiveKind.running || kind == LiveKind.waiting
+        ? started(target)
+        : null,
     target: target,
     eventId: eventId,
+    tier: kind == LiveKind.running ? pet.tier : 0,
   );
 
   LiveActivity? runningAs(PetStateName state) {
     if (!running) return null;
     final (text, chip) = switch (state) {
-      PetStateName.working => (l10n.liveWorking, l10n.liveChipWorking),
+      PetStateName.working ||
+      PetStateName.carrying => (l10n.liveWorking, l10n.liveChipWorking),
       PetStateName.juggling => (l10n.liveJuggling, l10n.liveChipJuggling),
       PetStateName.sweeping => (l10n.liveSweeping, l10n.liveChipSweeping),
       _ => (l10n.liveThinking, l10n.liveChipThinking),
@@ -168,20 +202,41 @@ LiveActivity? liveActivityOf({
 
   switch (pet.state) {
     case PetStateName.notification:
-      final request = pending.where((p) => p.target == target).firstOrNull ?? pending.firstOrNull;
+      final request =
+          pending.where((p) => p.target == target).firstOrNull ??
+          pending.firstOrNull;
       final question = request?.question ?? false;
       return make(
         LiveKind.waiting,
-        counted(question ? l10n.commonWaitingAnswer : l10n.commonWaitingApproval),
+        counted(
+          question ? l10n.commonWaitingAnswer : l10n.commonWaitingApproval,
+        ),
         question ? l10n.liveChipQuestion : l10n.liveChipApproval,
         l10n.livePublicWaiting,
         eventId: request?.key,
       );
     case PetStateName.attention when !pet.foreground && showDone:
-      return make(LiveKind.done, l10n.statePetDone, l10n.liveChipDone, l10n.livePublicDone);
+      // The bubble's id stands for this one finished turn: the island picks
+      // its celebration from it, so a redraw does not change the pose.
+      return make(
+        LiveKind.done,
+        l10n.statePetDone,
+        l10n.liveChipDone,
+        l10n.livePublicDone,
+        eventId: pet.bubble?.id,
+      );
     case PetStateName.error when !pet.foreground && showFailed:
-      return make(LiveKind.failed, l10n.statePetFailed, l10n.liveChipFailed, l10n.livePublicFailed);
-    case PetStateName.thinking || PetStateName.working || PetStateName.juggling || PetStateName.sweeping:
+      return make(
+        LiveKind.failed,
+        l10n.statePetFailed,
+        l10n.liveChipFailed,
+        l10n.livePublicFailed,
+      );
+    case PetStateName.thinking ||
+        PetStateName.working ||
+        PetStateName.juggling ||
+        PetStateName.sweeping ||
+        PetStateName.carrying:
       return runningAs(pet.state);
     default:
       return runningAs(PetStateName.thinking);
@@ -190,7 +245,12 @@ LiveActivity? liveActivityOf({
 
 /// Remembers titles from [runs] and then the current [focus], newest last,
 /// keeping at most [max].
-void learnLiveTitles(Map<PetTarget, String> titles, List<PetRun> runs, {PetFocus? focus, int max = 32}) {
+void learnLiveTitles(
+  Map<PetTarget, String> titles,
+  List<PetRun> runs, {
+  PetFocus? focus,
+  int max = 32,
+}) {
   for (final r in runs) {
     final title = r.title;
     if (title == null || title.trim().isEmpty) continue;

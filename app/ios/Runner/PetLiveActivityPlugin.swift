@@ -8,6 +8,8 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
   private let channel: FlutterMethodChannel
   private var ready = false
   private var background: [String: Any]?
+  /// Bumped by every newer truth (a background snapshot, a foreground push).
+  /// A task from an older truth stops before it writes a stale pose.
   private var backgroundVersion = 0
 
   @objc private func backgroundChanged(_ notification: Notification) {
@@ -19,25 +21,33 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
       for activity in Activity<PetActivityAttributes>.activities {
         guard version == self.backgroundVersion else { return }
         let old = activity.content.state
-        let next = self.backgroundContent(host: activity.attributes.host,
-          session: activity.attributes.sessionId, original: old)
-        if next != old {
-          await activity.update(ActivityContent(state: next, staleDate: Date().addingTimeInterval(300)))
-        }
+        guard let next = self.backgroundState(host: activity.attributes.host,
+          session: activity.attributes.sessionId, original: old) else { continue }
+        guard version == self.backgroundVersion else { return }
+        await activity.update(ActivityContent(state: next,
+          staleDate: Date().addingTimeInterval(300)))
       }
     }
   }
 
+  /// The state a background snapshot implies for one activity; nil when the
+  /// snapshot says nothing new about it. The snapshot may only refine the
+  /// pose: it keeps the activity's `packId`, its exact running animation and
+  /// its tier, and it never claims a run stopped (or failed) that it cannot
+  /// confirm — an ended background grant reads as 「无法确认」, not as sleep.
   @available(iOS 16.2, *)
-  private func backgroundContent(host: String, session: String,
-    original: PetActivityAttributes.ContentState) -> PetActivityAttributes.ContentState {
+  private func backgroundState(host: String, session: String,
+    original: PetActivityAttributes.ContentState) -> PetActivityAttributes.ContentState? {
     guard let snapshot = background,
       let data = host.data(using: .utf8),
       let reference = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-      reference["kind"] as? String == "local" else { return original }
-    if let observed = snapshot["sessionId"] as? String, observed != session { return original }
-    if snapshot["sessionId"] as? String == nil && ["idle", "completed", "error"].contains(original.phase) {
-      return original
+      reference["kind"] as? String == "local" else { return nil }
+    if let observed = snapshot["sessionId"] as? String {
+      guard observed == session else { return nil }
+    } else if ["idle", "completed", "error", "waitingApproval"].contains(original.phase) {
+      // Nothing runs, or the turn already ended: a host-wide snapshot cannot
+      // know better than the app's own reducer.
+      return nil
     }
     let task = snapshot["taskState"] as? String
     let state = snapshot["state"] as? String
@@ -61,10 +71,38 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
     } else {
       phase = "waitingRecovery"; key = "Waiting to resume"
     }
-    return PetActivityAttributes.ContentState(packId: original.packId, phase: phase,
-      petState: nil,
+    // Keep what the app knew when the pose still holds; replace only where the
+    // snapshot actually changes it. `authorizationEnded` / `waitingRecovery`
+    // mean 「无法确认是否还在跑」, so the pet stays awake and idle-looking
+    // rather than pretending to sleep or to have failed.
+    let petState: String?
+    let tier: Int?
+    switch phase {
+    case "continuedProcessing", "working":
+      petState = Self.runningPetState(original.petState) ?? "working"
+      tier = phase == "continuedProcessing" ? original.tier : nil
+    case "waitingApproval":
+      petState = "notification"; tier = nil
+    case "completed":
+      petState = "attention"; tier = nil
+    case "error":
+      petState = "error"; tier = nil
+    default:
+      petState = "idle"; tier = nil
+    }
+    let staleKey = ["completed", "error", "waitingApproval"].contains(phase) ? key : "Waiting to resume"
+    let next = PetActivityAttributes.ContentState(packId: original.packId, phase: phase,
+      petState: petState, tier: tier, detail: nil, completionSeed: nil, since: nil,
       label: NSLocalizedString(key, comment: "Background task status"),
-      staleLabel: NSLocalizedString("Waiting to resume", comment: "Background task status"))
+      staleLabel: NSLocalizedString(staleKey, comment: "Background task status"))
+    return next == original ? nil : next
+  }
+
+  /// An exact animation the app sent, when the background pose can keep it.
+  private static func runningPetState(_ petState: String?) -> String? {
+    guard let petState else { return nil }
+    return ["thinking", "working", "juggling", "sweeping", "carrying"].contains(petState)
+      ? petState : nil
   }
 
   deinit { NotificationCenter.default.removeObserver(self) }
@@ -141,7 +179,8 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
               let host = args["host"] as? String, !host.isEmpty,
               let session = args["sessionId"] as? String, !session.isEmpty,
               let phase = args["phase"] as? String,
-              ["idle", "thinking", "working", "waitingApproval", "completed", "error"].contains(phase),
+              ["idle", "thinking", "working", "waitingApproval", "completed", "error",
+               "continuedProcessing", "authorizationEnded", "waitingRecovery"].contains(phase),
               let label = args["label"] as? String, label.count <= 120,
               let staleLabel = args["staleLabel"] as? String, staleLabel.count <= 120 else {
           result(FlutterError(code: "pet_live_activity_invalid_arguments", message: "Expected host, sessionId, phase and short label/staleLabel strings.", details: nil))
@@ -163,9 +202,20 @@ final class PetLiveActivityPlugin: NSObject, FlutterPlugin {
         for activity in activities where activity.id != current?.id {
           await activity.end(nil, dismissalPolicy: .immediate)
         }
-        let state = self.backgroundContent(host: host, session: session, original:
-          PetActivityAttributes.ContentState(packId: args["packId"] as? String, phase: phase,
-            petState: petState, label: label, staleLabel: staleLabel))
+        // A foreground push is the newest truth: the reducer already decided
+        // this pose, so no background snapshot may rewrite it.
+        backgroundVersion += 1
+        let tier = (args["tier"] as? NSNumber).map { max(0, min($0.intValue, 3)) }
+        let detail = (args["detail"] as? String).flatMap {
+          $0.isEmpty || $0.count > 120 ? nil : $0
+        }
+        let seed = (args["completionSeed"] as? String).flatMap {
+          $0.count == 8 ? $0 : nil
+        }
+        let since = (args["since"] as? NSNumber).map { $0.intValue }
+        let state = PetActivityAttributes.ContentState(packId: args["packId"] as? String,
+          phase: phase, petState: petState, tier: tier, detail: detail,
+          completionSeed: seed, since: since, label: label, staleLabel: staleLabel)
         // A suspended Dart process cannot promise fresh status indefinitely.
         // A local idle pet has no session status that can become stale.
         let content = ActivityContent(state: state, staleDate: host == "local-pet" ? nil : Date().addingTimeInterval(300))

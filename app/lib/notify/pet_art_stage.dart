@@ -8,6 +8,7 @@
 
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../pets/pet_pack.dart';
@@ -23,37 +24,67 @@ class PetArtStage {
   /// keeps its emoji).
   Future<String?>? _base;
 
+  /// Why the last copy could not be made, as a fixed code (`app_group_unavailable`,
+  /// `plugin_unavailable`, `asset_missing`, `write_failed`); null after a copy
+  /// that worked. Codes only: no paths, no pet or conversation names.
+  String? get failure => _failure;
+  String? _failure;
+
   /// pack id → the stamp last written, so an unchanged pet writes nothing.
   final Map<String, String> _written = {};
 
   Future<void> stage(PetPack pack) async {
     final base = await (_base ??= _directory());
     if (base == null) return;
-    final files = await _files(pack);
+    final List<_ArtFile> files;
+    try {
+      files = await _files(pack);
+    } catch (error) {
+      _failure = 'asset_missing';
+      debugPrint('pet art: ${pack.id} sheets unreadable ($error)');
+      return;
+    }
     final stamp = _stamp(pack, files);
-    if (_written[pack.id] == stamp) return;
+    if (_written[pack.id] == stamp) {
+      _failure = null;
+      return;
+    }
     final directory = Directory('$base/${pack.id}');
     final stampFile = File('${directory.path}/stamp');
     if (stampFile.existsSync() && await stampFile.readAsString() == stamp) {
       _written[pack.id] = stamp;
+      _failure = null;
       return;
     }
-    await directory.create(recursive: true);
-    for (final file in files) {
-      await File('${directory.path}/${file.name}').writeAsBytes(file.bytes);
+    try {
+      await directory.create(recursive: true);
+      for (final file in files) {
+        await File('${directory.path}/${file.name}').writeAsBytes(file.bytes);
+      }
+      // Written last: a stamp without its files never claims to be complete.
+      await stampFile.writeAsString(stamp);
+    } catch (error) {
+      _failure = 'write_failed';
+      debugPrint('pet art: ${pack.id} copy failed ($error)');
+      return;
     }
-    // Written last: a stamp without its files never claims to be complete.
-    await stampFile.writeAsString(stamp);
     _written[pack.id] = stamp;
+    _failure = null;
   }
 
   Future<String?> _directory() async {
     try {
       final path = await channel.invokeMethod<String>('artDirectory');
-      return path == null || path.isEmpty ? null : path;
+      if (path == null || path.isEmpty) {
+        _failure = 'app_group_unavailable';
+        return null;
+      }
+      return path;
     } on MissingPluginException {
+      _failure = 'plugin_unavailable';
       return null;
     } on PlatformException {
+      _failure = 'app_group_unavailable';
       return null;
     }
   }

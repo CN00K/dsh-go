@@ -9,6 +9,18 @@ struct PetActivityAttributes: ActivityAttributes {
     /// The app's exact pet state (`juggling`, `sweeping`, ...); nil when only
     /// the Live Activity phase is known (background updates, older activities).
     var petState: String?
+    /// The pet's busy tier (`working` 1–3, `juggling` 1–2); nil for none, and
+    /// for activities written before the field existed.
+    var tier: Int?
+    /// One short line under the headline; already masked by the app. nil when
+    /// there is nothing more to say (idle, background updates).
+    var detail: String?
+    /// A stable, meaningless digest of the finished turn: the island picks the
+    /// celebration from it, so a redraw keeps the same pose.
+    var completionSeed: String?
+    /// When the run started (epoch ms), for the chip's own timer; nil when the
+    /// phase has nothing to count.
+    var since: Int?
     var label: String
     var staleLabel: String
   }

@@ -83,13 +83,18 @@ final petLiveActivityChannelProvider = Provider<PetLiveActivityChannel>((ref) =>
 /// The widget extension cannot read Flutter's asset bundle or the app's
 /// sandbox. Keep the selected pack's real sheets in the shared App Group
 /// before each Live Activity update so the island draws the same pet.
-final petArtStageProvider = Provider<PetArtStage>((ref) => PetArtStage(
-  channel: ref.watch(petLiveActivityChannelProvider).channel,
-  bundle: ref.watch(petAssetBundleProvider),
-));
+final petArtStageProvider = Provider<PetArtStage>(
+  (ref) => PetArtStage(
+    channel: ref.watch(petLiveActivityChannelProvider).channel,
+    bundle: ref.watch(petAssetBundleProvider),
+  ),
+);
 
 final iosPetLiveActivityBridgeProvider = Provider<void>((ref) {
   final bridge = ref.watch(petLiveActivityChannelProvider);
+  // The last art-copy failure said out loud, so a broken App Group or a bad
+  // pack is a diagnosis instead of a pet that quietly stays an emoji.
+  String? stagedFailure;
   Future<void> send(LivePush push) async {
     final packId = push.packId;
     if (push.enabled && packId != null) {
@@ -97,7 +102,16 @@ final iosPetLiveActivityBridgeProvider = Provider<void>((ref) {
       // fallback, but must never stop the status update itself.
       await AsyncValue.guard(() async {
         final pack = await ref.read(petPackProvider(packId).future);
-        await ref.read(petArtStageProvider).stage(pack);
+        final stage = ref.read(petArtStageProvider);
+        await stage.stage(pack);
+        if (stage.failure != stagedFailure) {
+          stagedFailure = stage.failure;
+          debugPrint(
+            stage.failure == null
+                ? 'pet art: $packId staged for the island'
+                : 'pet art: $packId not staged (${stage.failure}); the island draws a placeholder',
+          );
+        }
       });
     }
     final status = await AsyncValue.guard(() => bridge.push(push));

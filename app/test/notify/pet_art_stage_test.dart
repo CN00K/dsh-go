@@ -67,5 +67,79 @@ void main() {
     final stage = PetArtStage(channel: channel);
     await stage.stage(_diskPack('deepy-whale'));
     expect(group.listSync(), isEmpty);
+    // Not a silent emoji forever: the reason is a code the app can log.
+    expect(stage.failure, 'app_group_unavailable');
+  });
+
+  test('a working copy clears the failure; a missing plugin names itself', () async {
+    final stage = PetArtStage(channel: channel);
+    await stage.stage(_diskPack('deepy-whale'));
+    expect(stage.failure, isNull);
+    messenger.setMockMethodCallHandler(channel, (call) async => null);
+    final missing = PetArtStage(channel: MethodChannel('test/pet_art_absent'));
+    await missing.stage(_diskPack('deepy-whale'));
+    expect(missing.failure, 'plugin_unavailable');
+  });
+
+  test('every pack names a representative frame its animation really plays', () {
+    for (final id in ['deepy-whale', 'whale-girl']) {
+      final pack = _diskPack(id);
+      for (final anim in pack.animations.values) {
+        final cells = {for (final frame in anim.frames) frame.i};
+        final still = anim.stillIndex;
+        expect(cells, contains(still), reason: '${pack.id}/${anim.name}');
+        if (anim.preview case final preview?) {
+          expect(preview, still, reason: '${pack.id}/${anim.name} kept its own frame');
+        }
+      }
+      // The one still per state reads from the state's own animation.
+      for (final state in [
+        'idle',
+        'thinking',
+        'typing',
+        'music',
+        'building',
+        'conducting',
+        'notification',
+        'happy',
+        'error',
+        'compacting',
+        'carrying',
+        'sleeping',
+      ]) {
+        expect(pack.animations[state]?.preview, isNotNull, reason: '${pack.id}/$state');
+      }
+      final attention = pack.states['attention']!.first;
+      expect(pack.animations[attention]?.preview, isNotNull);
+    }
+  });
+
+  test('every state crops a window that keeps the whole body in frame', () {
+    for (final id in ['deepy-whale', 'whale-girl']) {
+      final pack = _diskPack(id);
+      final body = pack.contentBox;
+      for (final anim in pack.animations.values) {
+        final reason = '${pack.id}/${anim.name}';
+        expect(anim.box.width, greaterThan(0), reason: reason);
+        expect(anim.box.height, greaterThan(0), reason: reason);
+        // The widget frames this window — the body plus whatever props the
+        // animation itself adds (keyboard, helmet, thought cloud) — so the pet
+        // keeps its size instead of shrinking into a shared canvas.
+        final window = anim.box.expandToInclude(body);
+        final keepsBody =
+            window.left <= body.left &&
+            window.top <= body.top &&
+            window.right >= body.right &&
+            window.bottom >= body.bottom;
+        expect(keepsBody, isTrue, reason: '$reason window misses the body');
+        // Nothing the sheet can hold is cropped away: stay on the canvas.
+        final onCanvas =
+            window.left >= 0 &&
+            window.top >= 0 &&
+            window.right <= pack.canvas.width &&
+            window.bottom <= pack.canvas.height;
+        expect(onCanvas, isTrue, reason: '$reason window runs off the canvas');
+      }
+    }
   });
 }

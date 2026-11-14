@@ -33,6 +33,7 @@ class PetAnimation {
     required this.box,
     required this.frames,
     this.loop = true,
+    this.preview,
   });
 
   final String name;
@@ -49,6 +50,20 @@ class PetAnimation {
   final Rect box;
   final List<PetFrame> frames;
   final bool loop;
+
+  /// The cell that stands for this animation in a still (a notification icon,
+  /// the Live Activity): the one pass whose pose reads best on its own.
+  /// Null: the pack leaves the choice to the still's fallback.
+  final int? preview;
+
+  /// The cell a still shows: [preview] when it names a cell this animation
+  /// actually plays, else the middle of the sequence (never a transition at
+  /// the very start or end).
+  int get stillIndex {
+    final frames = this.frames;
+    if (preview case final cell? when frames.any((f) => f.i == cell)) return cell;
+    return frames[(frames.length - 1) ~/ 2].i;
+  }
 
   /// One pass, in milliseconds.
   int get durationMs => frames.fold(0, (sum, f) => sum + f.ms);
@@ -290,6 +305,7 @@ class PetPack {
         box: box,
         frames: frames,
         loop: a['loop'] != false,
+        preview: _num(a['preview'])?.round(),
       );
     }
     if (animations.isEmpty) throw const FormatException('pack.json: animations');
@@ -403,6 +419,7 @@ class PetPack {
     if (!number.isFinite) throw const FormatException('pack.json: non-finite number');
     return number;
   }
+
   static Map<String, Object?> _map(Object? v) =>
       v is Map ? {for (final MapEntry(:key, :value) in v.entries) '$key': value} : const {};
   static List<Object?> _list(Object? v) => v is List ? v : const [];

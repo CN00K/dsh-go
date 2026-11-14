@@ -12,24 +12,45 @@ const _local = HostRef.local;
 const _ssh = HostRef.ssh('lab');
 final _t0 = DateTime(2026, 11, 1, 9);
 
-PetRun _run(String id, {HostRef host = _local, String? root, bool subagent = false, int at = 0, String? title}) =>
-    PetRun(
-      host,
-      id,
-      root: root,
-      subagent: subagent,
-      since: _t0.add(Duration(seconds: at)),
-      title: title,
-    );
+PetRun _run(
+  String id, {
+  HostRef host = _local,
+  String? root,
+  bool subagent = false,
+  int at = 0,
+  String? title,
+}) => PetRun(
+  host,
+  id,
+  root: root,
+  subagent: subagent,
+  since: _t0.add(Duration(seconds: at)),
+  title: title,
+);
 
-PetState _pet(PetStateName state, {PetTarget? target, bool foreground = false}) =>
-    PetState(state: state, target: target, foreground: foreground, packId: 'deepy');
+PetState _pet(
+  PetStateName state, {
+  PetTarget? target,
+  bool foreground = false,
+}) => PetState(
+  state: state,
+  target: target,
+  foreground: foreground,
+  packId: 'deepy',
+);
 
 void main() {
   const a = PetTarget(_local, 'a');
 
   test('nothing runs and nothing waits: nothing to show', () {
-    expect(liveActivityOf(pet: _pet(PetStateName.idle), runs: const [], pending: const []), isNull);
+    expect(
+      liveActivityOf(
+        pet: _pet(PetStateName.idle),
+        runs: const [],
+        pending: const [],
+      ),
+      isNull,
+    );
     expect(
       liveActivityOf(
         pet: _pet(PetStateName.sleeping, target: a),
@@ -73,6 +94,18 @@ void main() {
     expect(live.text, '正在思考 · 3 个对话在跑');
   });
 
+  test('carrying is running work, not a second thinking state', () {
+    final live = liveActivityOf(
+      pet: _pet(PetStateName.carrying, target: a),
+      runs: [_run('a', title: 'A')],
+      pending: const [],
+    )!;
+    expect(live.kind, LiveKind.running);
+    expect(live.mood, PetStateName.carrying);
+    expect(live.text, '正在干活');
+    expect(live.chip, '干活中');
+  });
+
   test('titles are masked, and an untitled one says so', () {
     final secret = liveActivityOf(
       pet: _pet(PetStateName.working, target: a),
@@ -103,7 +136,14 @@ void main() {
     final question = liveActivityOf(
       pet: _pet(PetStateName.notification, target: a),
       runs: [_run('a', title: 'A')],
-      pending: [const PetPending(host: _local, sessionId: 'a', key: 'q1', question: true)],
+      pending: [
+        const PetPending(
+          host: _local,
+          sessionId: 'a',
+          key: 'q1',
+          question: true,
+        ),
+      ],
     )!;
     expect(question.chip, '待回答');
     expect(question.eventId, 'q1');
@@ -158,29 +198,42 @@ void main() {
 
   test('titles are remembered from runs, newest kept', () {
     final titles = <PetTarget, String>{};
-    learnLiveTitles(titles, [_run('a', title: 'A'), _run('sub', root: 'a', subagent: true, title: 'A'), _run('b')]);
+    learnLiveTitles(titles, [
+      _run('a', title: 'A'),
+      _run('sub', root: 'a', subagent: true, title: 'A'),
+      _run('b'),
+    ]);
     expect(titles, {a: 'A'});
-    learnLiveTitles(titles, [for (var i = 0; i < 40; i++) _run('s$i', title: 'S$i')], max: 32);
+    learnLiveTitles(titles, [
+      for (var i = 0; i < 40; i++) _run('s$i', title: 'S$i'),
+    ], max: 32);
     expect(titles.length, 32);
     expect(titles.containsKey(a), isFalse);
     expect(titles[const PetTarget(_local, 's39')], 'S39');
   });
 
-  test('the push carries the pet and the conversation the way native reads it', () {
-    final live = liveActivityOf(
-      pet: _pet(PetStateName.working, target: a),
-      runs: [_run('a', title: 'A')],
-      pending: const [],
-    )!;
-    final map = LivePush(enabled: true, packId: 'deepy', activity: live).toMap();
-    expect(map['enabled'], true);
-    expect(map['packId'], 'deepy');
-    final activity = map['activity']! as Map<String, Object?>;
-    expect(activity['kind'], 'running');
-    expect(activity['mood'], 'working');
-    expect(activity['sessionId'], 'a');
-    expect(activity['host'], _local.encode());
-    expect(activity['sinceMs'], _t0.millisecondsSinceEpoch);
-    expect(const LivePush(enabled: false).toMap(), {'enabled': false});
-  });
+  test(
+    'the push carries the pet and the conversation the way native reads it',
+    () {
+      final live = liveActivityOf(
+        pet: _pet(PetStateName.working, target: a),
+        runs: [_run('a', title: 'A')],
+        pending: const [],
+      )!;
+      final map = LivePush(
+        enabled: true,
+        packId: 'deepy',
+        activity: live,
+      ).toMap();
+      expect(map['enabled'], true);
+      expect(map['packId'], 'deepy');
+      final activity = map['activity']! as Map<String, Object?>;
+      expect(activity['kind'], 'running');
+      expect(activity['mood'], 'working');
+      expect(activity['sessionId'], 'a');
+      expect(activity['host'], _local.encode());
+      expect(activity['sinceMs'], _t0.millisecondsSinceEpoch);
+      expect(const LivePush(enabled: false).toMap(), {'enabled': false});
+    },
+  );
 }

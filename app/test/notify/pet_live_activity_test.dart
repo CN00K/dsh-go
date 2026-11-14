@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:dsh_app/notify/live_activity.dart';
 import 'package:dsh_app/notify/notify_channel.dart';
 import 'package:dsh_app/notify/pet_live_activity.dart';
+import 'package:dsh_app/pets/pet_pack.dart';
 import 'package:dsh_app/pets/pet_state.dart';
 import 'package:dsh_app/state/hosts_state.dart';
 import 'package:flutter/services.dart';
@@ -13,6 +15,8 @@ LivePush push({
   LiveKind kind = LiveKind.running,
   PetStateName mood = PetStateName.thinking,
   String? packId,
+  int tier = 0,
+  String? eventId = 'private request',
 }) => LivePush(
   enabled: true,
   packId: packId,
@@ -24,7 +28,8 @@ LivePush push({
     chip: 'Status',
     publicText: 'Public status',
     target: const PetTarget(HostRef.relay('host-id', name: 'private host name'), 'session / 中文'),
-    eventId: 'private request',
+    eventId: eventId,
+    tier: tier,
   ),
 );
 
@@ -53,8 +58,11 @@ void main() {
         'packId',
         'phase',
         'petState',
+        'detail',
         'label',
         'staleLabel',
+        if (value.activity!.tier > 0) 'tier',
+        if (value.activity!.kind == LiveKind.done) 'completionSeed',
       });
       expect(jsonDecode(payload['host'] as String), {'kind': 'relay', 'id': 'host-id'});
       expect(payload['sessionId'], 'session / 中文');
@@ -62,6 +70,78 @@ void main() {
     }
     expect(petLiveActivityPayload(const LivePush(enabled: false)), isNull);
     expect(petLiveActivityPayload(const LivePush(enabled: true)), isNull);
+  });
+
+  test('the busy tier reaches the island, so it can play typing, music or building', () {
+    for (final (mood, tier, petState) in [
+      (PetStateName.working, 1, 'working'),
+      (PetStateName.working, 2, 'working'),
+      (PetStateName.working, 3, 'working'),
+      (PetStateName.juggling, 1, 'juggling'),
+      (PetStateName.juggling, 2, 'juggling'),
+    ]) {
+      final payload = petLiveActivityPayload(push(packId: 'deepy-whale', mood: mood, tier: tier))!;
+      expect(payload['phase'], 'working');
+      expect(payload['petState'], petState);
+      expect(payload['tier'], tier);
+    }
+    // No tier: the payload keeps the field out entirely, so an older widget and
+    // an idle pet read the same shape.
+    final untiered = petLiveActivityPayload(push(packId: 'deepy-whale', mood: PetStateName.working))!;
+    expect(untiered.containsKey('tier'), isFalse);
+    expect(
+      petLiveActivityPayload(push(packId: 'deepy-whale', kind: LiveKind.done, tier: 3))!.containsKey('tier'),
+      isFalse,
+    );
+    // The island's own table: the same pack answers the same animations.
+    final pack = PetPack.parse(
+      jsonDecode(File('assets/pets/deepy-whale/pack.json').readAsStringSync()) as Map<String, Object?>,
+    );
+    expect(pack.animFor(PetStateName.working, tier: 1).name, 'typing');
+    expect(pack.animFor(PetStateName.working, tier: 2).name, 'music');
+    expect(pack.animFor(PetStateName.working, tier: 3).name, 'building');
+    expect(pack.animFor(PetStateName.juggling, tier: 1).name, 'music');
+    expect(pack.animFor(PetStateName.juggling, tier: 2).name, 'conducting');
+    expect(pack.animFor(PetStateName.working).name, 'typing');
+  });
+
+  test('a request waiting on the person wins over the pose around it', () {
+    final waiting = petLiveActivityPayload(
+      push(packId: 'deepy-whale', kind: LiveKind.waiting, mood: PetStateName.attention, tier: 3),
+    )!;
+    expect(waiting['phase'], 'waitingApproval');
+    expect(waiting['petState'], 'notification');
+    expect(waiting['tier'], isNull);
+  });
+
+  test('a finished turn keeps one celebration, chosen from its own turn', () {
+    String seedFor(String? eventId) =>
+        petLiveActivityPayload(push(packId: 'whale-girl', kind: LiveKind.done, eventId: eventId))!['completionSeed']!
+            as String;
+
+    final first = seedFor('event-a');
+    expect(first, seedFor('event-a'));
+    expect(first, matches(RegExp(r'^[0-9a-f]{8}$')));
+    expect(first, isNot(seedFor('event-b')));
+    // The opaque id itself never reaches the notification payload.
+    expect(first, isNot(contains('event-a')));
+    final payload = petLiveActivityPayload(push(packId: 'whale-girl', kind: LiveKind.done))!;
+    expect(payload.containsKey('completionSeed'), isTrue);
+  });
+
+  test('the run start rides along so the chip can count', () {
+    final activity = LiveActivity(
+      kind: LiveKind.running,
+      mood: PetStateName.working,
+      title: 'private title',
+      text: 'private text',
+      chip: 'Status',
+      publicText: 'Public status',
+      target: const PetTarget(HostRef.relay('host-id'), 'session'),
+      since: DateTime.fromMillisecondsSinceEpoch(1700000000000),
+    );
+    final payload = petLiveActivityPayload(LivePush(enabled: true, packId: 'deepy-whale', activity: activity))!;
+    expect(payload['since'], 1700000000000);
   });
 
   test('selected pet idle fallback respects selection and enabled switch', () {
