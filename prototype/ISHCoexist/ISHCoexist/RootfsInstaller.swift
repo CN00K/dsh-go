@@ -184,10 +184,19 @@ struct RootfsInstaller {
 
     private static func commonPrefix(of names: [String]) -> String {
         let parts = names.filter { !$0.isEmpty }.map { $0.split(separator: "/") }
-        guard let first = parts.first, first.count > 1 else { return "" }
-        let candidate = String(first[0]) + "/"
-        guard parts.allSatisfy({ $0.first.map(String.init) == String(first[0]) }) else { return "" }
-        return candidate
+        // Ignore bare single-component entries (e.g. the top-level dir
+        // "alpine-rootfs/" itself, which splits to ["alpine-rootfs"]):
+        // they must not veto the prefix. Only entries with a real path
+        // below the top level vote. (Build 10/1.1b: the first central-dir
+        // entry is the bare top-level dir, so the old guard
+        // `first.count > 1` returned "" and nothing was stripped —
+        // data/ landed at alpine-rootfs/data/ and the post-extract
+        // check failed.)
+        let multi = parts.filter { $0.count > 1 }
+        guard let first = multi.first else { return "" }
+        let candidate = String(first[0])
+        guard multi.allSatisfy({ $0.first.map(String.init) == candidate }) else { return "" }
+        return candidate + "/"
     }
 
     private static func inflate(_ comp: Data, expectedSize: Int) throws -> Data {
