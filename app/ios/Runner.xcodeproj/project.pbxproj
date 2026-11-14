@@ -136,6 +136,7 @@
 		D5E100000000000000000016 /* libish.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000017 /* libish_emu.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_emu.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000018 /* libfakefs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libfakefs.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000022 /* libish_aot.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_aot.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000019 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = "usr/lib/libsqlite3.tbd"; sourceTree = SDKROOT; };
 		D5E100000000000000000020 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = "usr/lib/libz.tbd"; sourceTree = SDKROOT; };
 		D5E100000000000000000021 /* alpine-rootfs.zip */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = "IShArtifacts/alpine-rootfs.zip"; sourceTree = SOURCE_ROOT; };
@@ -303,6 +304,7 @@
 				D5E100000000000000000016 /* libish.a */,
 				D5E100000000000000000017 /* libish_emu.a */,
 				D5E100000000000000000018 /* libfakefs.a */,
+				D5E100000000000000000022 /* libish_aot.a */,
 				D5E100000000000000000019 /* libsqlite3.tbd */,
 				D5E100000000000000000020 /* libz.tbd */,
 				D5E100000000000000000021 /* alpine-rootfs.zip */,
@@ -764,6 +766,13 @@
 					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
 					// (libresolv); stage 1 build 9 failed to link without it.
 					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1046,6 +1055,13 @@
 					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
 					// (libresolv); stage 1 build 9 failed to link without it.
 					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1111,6 +1127,13 @@
 					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
 					// (libresolv); stage 1 build 9 failed to link without it.
 					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";

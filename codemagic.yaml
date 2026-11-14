@@ -27,6 +27,16 @@
 #                           Alpine rootfs in one process. See
 #                           third_party/ish/build-ish.sh and
 #                           third_party/ish/prepare-rootfs.sh.
+#   ios-aot-record        — stage-4 AOT recording: builds the CLI recorder
+#                           from the pinned ish commit and records the
+#                           minimal AOT set (musl, busybox, zlib, libcrypto,
+#                           libssl, pcre2) on the app's own rootfs, then
+#                           assembles libish_aot.a. macOS arm64 only.
+#                           Artifacts: libish_aot.a + aot-manifest.json +
+#                           the .S files. See third_party/ish/record-aot.sh.
+#                           Upload the .a to the GitHub release
+#                           aot-minimal-<abi> and commit the manifest before
+#                           app builds can download it.
 #
 # Free-minutes note (Codemagic free tier: 500 min/month, partly used):
 #   The iSH build (Meson + ninja) and the rootfs conversion (fakefsify) are
@@ -567,6 +577,19 @@ workflows:
           python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/rootfs-manifest.json')); print('rootfs zip SHA256:', m['rootfs_zip_sha256'])"
           python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/ish-manifest.json')); print('ish commit:', m['ish_commit'], '| vdso SHA256:', m['vdso']['sha256'])"
 
+      - name: Stage AOT image (stub or recorded)
+        script: |
+          set -euo pipefail
+          # build-aot.sh stages libish_aot.a into app/ios/IShArtifacts/lib/
+          # for the Runner target (-force_load). Three modes, in order:
+          # local .S (recorded) -> download (aot-manifest.json, SHA256-pinned)
+          # -> empty stub (v1: pure gadget interpreter, no images yet).
+          # The stub must always exist at link time, or the build fails.
+          bash third_party/ish/build-aot.sh 2>&1 | tee build-logs/07c-build-aot.log
+          test -f app/ios/IShArtifacts/lib/libish_aot.a
+          test -f app/ios/IShArtifacts/aot-manifest.json
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/aot-manifest.json')); print('AOT mode:', m['mode'], '| images:', len(m.get('images', [])), '| libish_aot.a SHA256:', m['libish_aot_a']['sha256'][:12])"
+
       - name: Pod install and build iOS (no codesign)
         script: |
           set -euo pipefail
@@ -748,3 +771,78 @@ workflows:
     artifacts:
       - prototype-ish-coexist-unsigned.ipa
       - build-logs-ish/*.log
+
+  ios-aot-record:
+    name: iOS AOT record (minimal set, unsigned)
+    instance_type: mac_mini_m2
+    # 120 is provisional: the recorder build + six recording runs + gen.py +
+    # assembling have never been timed on Codemagic. Measure the first run
+    # and tighten it after. The recording is only re-run when the images
+    # need updating (new rootfs, new Alpine release, ish abi change).
+    # Free-minutes note: this workflow burns real minutes (~30-60 expected).
+    # Check the remaining free minutes before triggering it.
+    max_build_duration: 120
+    environment:
+      flutter: 3.47.7
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Check tools
+        script: |
+          set -euo pipefail
+          mkdir -p build-logs
+          {
+            echo "== versions =="
+            xcodebuild -version
+            python3 --version
+            echo "== required tools =="
+            for t in rsync unzip tar curl shasum zip ditto meson ninja openssl; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            python3 -c "import tqdm" 2>/dev/null || pip3 install tqdm
+            echo "== disk =="
+            df -h "$PWD" | tail -1
+          } 2>&1 | tee build-logs/00-tools.log
+
+      - name: Install recording deps
+        script: |
+          set -euo pipefail
+          # Same brew set as the iSH lib build (llvm/ninja/libarchive/meson).
+          # The recorder is a macOS CLI (host build); llvm is needed for the
+          # VDSO check inside build-ish.sh's prerequisites, which
+          # record-aot.sh does not call — but prepare-rootfs.sh needs
+          # fakefsify, built from the ish source with the host meson build.
+          for pkg in llvm lld ninja libarchive meson; do
+            if brew list "$pkg" >/dev/null 2>&1; then
+              echo "brew package present: $pkg"
+            else
+              echo "Installing brew package: $pkg ..."
+              brew install "$pkg"
+            fi
+          done
+          command -v meson >/dev/null || { echo "meson not found after brew install"; exit 1; }
+          command -v ninja >/dev/null || { echo "ninja not found after brew install"; exit 1; }
+
+      - name: Record minimal AOT set
+        script: |
+          set -euo pipefail
+          # Records musl, busybox, zlib, libcrypto, libssl, pcre2 on the
+          # app's own rootfs, then assembles libish_aot.a via build-aot.sh.
+          # macOS arm64 only (the JIT emits host-native code; the script
+          # refuses to run on x86_64). All six modules must pass their
+          # gates (dry run markers, translation floors); any failure stops
+          # the workflow — a silent partial recording is how coverage gets
+          # lost. See third_party/ish/record-aot.sh for the gates.
+          bash third_party/ish/record-aot.sh 2>&1 | tee build-logs/01-record-aot.log
+          echo "== recorded images =="
+          ls -lh third_party/ish/aot/
+          python3 third_party/ish/aot-tools/image_info.py third_party/ish/aot/
+          echo "== staged archive =="
+          ls -lh app/ios/IShArtifacts/lib/libish_aot.a
+          cat app/ios/IShArtifacts/aot-manifest.json
+
+    artifacts:
+      - app/ios/IShArtifacts/lib/libish_aot.a
+      - app/ios/IShArtifacts/aot-manifest.json
+      - third_party/ish/aot/*.S
+      - build-logs/*.log
