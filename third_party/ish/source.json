@@ -1,0 +1,7 @@
+{
+  "url": "https://github.com/OpenMinis/ish-arm64",
+  "commit": "0fd17a135e78b7a0cf08a4f5831217bbb76ed22f",
+  "checkout_path": "third_party/ish-src",
+  "integration": "manifest-only; iSH fork pinned to 0fd17a13 (2026-10-09), same as OpenMinis .gitmodules",
+  "license": "GPL-3.0; some contributions additionally GPL-2.0; LICENSE.IOS applies"
+}
