@@ -19,6 +19,9 @@
 # Workflows:
 #   ios-unsigned          — the production unsigned IPA (engine rebuilt from
 #                           source). Unchanged since the dsh-go build.
+#   ios-stage2-verify     — stage-2 bridge verification: ios-unsigned plus
+#                           the iSH lib build + rootfs staging steps, so the
+#                           Runner target (now wired for iSH) can compile.
 #   prototype-ish-coexist — stage-1 prototype App (prototype/ISHCoexist/,
 #                           scheme ISHCoexist): NodeMobile + iSH libs +
 #                           Alpine rootfs in one process. See
@@ -253,6 +256,296 @@ workflows:
           echo "NativeNodeArtifacts OK:"
           du -sh "$output"
           find "$output/engine" -maxdepth 2 | head -20
+
+      - name: Pod install and build iOS (no codesign)
+        script: |
+          set -euo pipefail
+          cd app
+          (cd ios && pod install) 2>&1 | tee ../build-logs/08-pod-install.log
+          flutter build ios --no-codesign 2>&1 | tee ../build-logs/09-flutter-build-ios.log
+          test -d build/ios/iphoneos/Runner.app
+          du -sh build/ios/iphoneos/Runner.app
+
+      - name: Package unsigned IPA
+        script: |
+          set -euo pipefail
+          rm -rf Payload dsh-go-unsigned.ipa
+          mkdir -p Payload
+          # ditto preserves the framework symlinks (needed for re-signing).
+          ditto app/build/ios/iphoneos/Runner.app Payload/Runner.app
+          find Payload -name .DS_Store -delete || true
+          # -y stores symlinks as links (do not dereference them).
+          zip -r -y -X dsh-go-unsigned.ipa Payload 2>&1 | tee build-logs/10-package-ipa.log
+          ls -lh dsh-go-unsigned.ipa
+          # NB: `unzip -l | head` exits 141 (SIGPIPE) under `pipefail` when
+          # head closes early, which would fail the step after a good IPA.
+          unzip -l dsh-go-unsigned.ipa | head -n 20 || true
+
+    artifacts:
+      - dsh-go-unsigned.ipa
+      - build-logs/*.log
+
+
+  ios-stage2-verify:
+    name: iOS stage 2 verify (iSH bridge, unsigned)
+    instance_type: mac_mini_m2
+    # 120 is provisional: the iSH Meson build + rootfs conversion have
+    # never been timed on Codemagic. Measure the first run and tighten
+    # it after.
+    max_build_duration: 120
+    environment:
+      flutter: 3.47.7
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Check tools
+        script: |
+          set -euo pipefail
+          mkdir -p build-logs
+          {
+            echo "== versions =="
+            xcodebuild -version
+            flutter --version
+            node --version
+            npm --version
+            python3 --version
+            echo "== required tools =="
+            for t in rsync unzip tar curl shasum pod zip ditto; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            echo "== disk =="
+            df -h "$PWD" | tail -1
+          } 2>&1 | tee build-logs/00-tools.log
+
+      - name: Flutter pub get and analyze
+        script: |
+          set -euo pipefail
+          cd app
+          flutter pub get 2>&1 | tee ../build-logs/01-flutter-pub-get.log
+          # Non-blocking: lint findings must not block the IPA.
+          flutter analyze 2>&1 | tee ../build-logs/02-flutter-analyze.log \
+            || echo "flutter analyze reported issues (non-blocking)"
+
+      - name: Install DSH engine tree (npm ci)
+        script: |
+          set -euo pipefail
+          # Same flags as runtime/build-runtime.sh install_dsh(): the tree is
+          # installed for linux/arm64/glibc, no scripts, npmmirror registry.
+          mkdir -p engine-build/dsh-prefix engine-build/npm-cache
+          : > engine-build/empty-user-npmrc
+          : > engine-build/empty-global-npmrc
+          cp runtime/locks/dsh-0.2.2-rc.1/package.json \
+             runtime/locks/dsh-0.2.2-rc.1/package-lock.json \
+             engine-build/dsh-prefix/
+          npm ci \
+            --prefix engine-build/dsh-prefix \
+            --cpu=arm64 --os=linux --libc=glibc \
+            --registry=https://registry.npmmirror.com \
+            --cache "$PWD/engine-build/npm-cache" \
+            --userconfig "$PWD/engine-build/empty-user-npmrc" \
+            --globalconfig "$PWD/engine-build/empty-global-npmrc" \
+            --ignore-scripts --no-audit --no-fund \
+            --update-notifier=false --loglevel=warn \
+            2>&1 | tee build-logs/03-npm-ci-dsh.log
+          python3 -c "import json; v=json.load(open('engine-build/dsh-prefix/node_modules/@deepseek-ai/dsh/package.json'))['version']; assert v=='0.2.2-rc.1', v; print('dsh version OK:', v)"
+
+      - name: Install pnpm tree (npm ci)
+        script: |
+          set -euo pipefail
+          mkdir -p engine-build/pnpm-prefix
+          cp runtime/locks/pnpm-11.28.5/package.json \
+             runtime/locks/pnpm-11.28.5/package-lock.json \
+             engine-build/pnpm-prefix/
+          npm ci \
+            --prefix engine-build/pnpm-prefix \
+            --cpu=arm64 --os=linux --libc=glibc \
+            --registry=https://registry.npmmirror.com \
+            --cache "$PWD/engine-build/npm-cache" \
+            --userconfig "$PWD/engine-build/empty-user-npmrc" \
+            --globalconfig "$PWD/engine-build/empty-global-npmrc" \
+            --ignore-scripts --no-audit --no-fund \
+            --update-notifier=false --loglevel=warn \
+            2>&1 | tee build-logs/04-npm-ci-pnpm.log
+          # Integrity check from runtime/build-runtime.sh install_pnpm().
+          python3 - engine-build/pnpm-prefix 11.28.5 sha512-SEVj0wtMKtJ8tIqpT/KzAtvOvI/2vyiBbCWJiG4UbOf3bzVPO8GkOOb16XaMMCqgpvet2CMpA81M+BQmy8FNng== <<'PYEOF'
+          import json, os, sys
+          prefix, version, integrity = sys.argv[1:4]
+          lock = json.load(open(os.path.join(prefix, "package-lock.json")))
+          pkgs = lock["packages"]
+          entry = pkgs.get("node_modules/pnpm", {})
+          others = sorted(k for k in pkgs if k not in ("", "node_modules/pnpm"))
+          got = json.load(open(os.path.join(prefix, "node_modules/pnpm/package.json")))["version"]
+          ok = entry.get("version") == version and entry.get("integrity") == integrity and got == version and not others
+          print("pnpm lock: version=%s installed=%s extra=%s -> %s" % (entry.get("version"), got, others, "ok" if ok else "MISMATCH"), file=sys.stderr)
+          sys.exit(0 if ok else 1)
+          PYEOF
+
+      - name: Apply DSH patches (136, hash-pinned)
+        script: |
+          set -euo pipefail
+          python3 -I runtime/lib/rtbuild.py patch-dsh \
+            --prefix engine-build/dsh-prefix \
+            --dsh-version 0.2.2-rc.1 \
+            --patches runtime/patches \
+            --out engine-build/dsh-patches.json 2>&1 | tee build-logs/05-patch-dsh.log
+          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==136, len(a)"
+
+      - name: Stage iOS engine (opt/dsh + vendor/pnpm, prune, shim)
+        script: |
+          set -euo pipefail
+          # Replicates runtime/lib/rtbuild.py assemble's add_tree() for the two
+          # npm trees (with dsh_drop_reason / pnpm_drop_reason, arm64-v8a,
+          # prune-dev-metadata) and then prepare-ios.sh's binary prune + shim.
+          python3 - <<'PYEOF' 2>&1 | tee build-logs/06-stage-engine.log
+          import os, pathlib, shutil, stat, sys
+          sys.path.insert(0, 'runtime/lib')
+          import rtbuild
+
+          SRC_DSH = 'engine-build/dsh-prefix'
+          SRC_PNPM = 'engine-build/pnpm-prefix/node_modules/pnpm'
+          STAGE = 'engine-build/stage/opt/dsh'
+
+          def copy_tree(src, dest_root, drop_fn):
+              src = os.path.abspath(src)
+              for dirpath, dirnames, filenames in os.walk(src):
+                  dirnames.sort()
+                  rel_dir = os.path.relpath(dirpath, src)
+                  rel_dir = '' if rel_dir == '.' else rel_dir.replace(os.sep, '/')
+                  dest_dir = dest_root + ('/' + rel_dir if rel_dir else '')
+                  os.makedirs(dest_dir, exist_ok=True)
+                  for name in list(dirnames):
+                      full = os.path.join(dirpath, name)
+                      if os.path.islink(full):
+                          dirnames.remove(name)
+                          filenames.append(name)
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      rel = (rel_dir + '/' if rel_dir else '') + name
+                      dest = dest_root + '/' + rel
+                      if os.path.islink(full):
+                          target = os.readlink(full)
+                          if os.path.isabs(target):
+                              target = os.path.relpath(target, os.path.dirname(full))
+                          if os.path.lexists(dest):
+                              os.unlink(dest)
+                          os.symlink(target, dest)
+                          continue
+                      st = os.lstat(full)
+                      if not stat.S_ISREG(st.st_mode):
+                          continue
+                      if drop_fn(rel, 'arm64-v8a', True):
+                          continue
+                      os.makedirs(os.path.dirname(dest), exist_ok=True)
+                      shutil.copy2(full, dest)
+                      os.chmod(dest, 0o755 if st.st_mode & 0o111 else 0o644)
+
+          copy_tree(SRC_DSH, STAGE, rtbuild.dsh_drop_reason)
+          copy_tree(SRC_PNPM, STAGE + '/vendor/pnpm', rtbuild.pnpm_drop_reason)
+
+          # prepare-ios.sh prune: drop symlinks escaping the tree; drop native
+          # binaries (.node/.so/.dylib/.dll/.exe/.a) and any ELF file.
+          root = pathlib.Path(STAGE).resolve()
+          pruned = 0
+          for item in root.rglob('*'):
+              if item.is_symlink():
+                  if not item.resolve().is_relative_to(root):
+                      item.unlink(); pruned += 1
+                  continue
+              if item.is_file():
+                  with item.open('rb') as f:
+                      magic = f.read(4)
+                  if item.suffix in {'.node', '.so', '.dylib', '.dll', '.exe', '.a'} or magic == b'\x7fELF':
+                      item.unlink(); pruned += 1
+          print('pruned native/escaping entries:', pruned)
+
+          # node-addon-require-builtin shim (same text as prepare-ios.sh).
+          shim_dir = root / 'node_modules' / 'node-addon-require-builtin' / 'lib'
+          shim_dir.mkdir(parents=True, exist_ok=True)
+          (shim_dir / 'index.js').write_text(
+              "// NodeMobile is started with --expose-internals. Use its own loader.\n"
+              "exports.requireBuiltin = name => require(name);\n")
+          print('staged engine at', STAGE)
+          PYEOF
+          # Sanity: the two entry points the iOS worker needs must exist.
+          test -f engine-build/stage/opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
+          test -f engine-build/stage/opt/dsh/vendor/pnpm/dist/pnpm.mjs
+          test -d engine-build/stage/opt/dsh/node_modules/@deepseek-ai/node-addon-system/lib
+          echo "engine stage OK"
+
+      - name: Assemble NativeNodeArtifacts (NodeMobile + engine)
+        script: |
+          set -euo pipefail
+          # Same pinned NodeMobile inputs as runtime/native-node/prepare-ios.sh,
+          # but the payload archive (and its SHA256 check) is skipped: the
+          # engine tree was rebuilt from source in the previous steps.
+          version=24.20.0-0
+          stage=engine-build/stage
+          output=app/ios/NativeNodeArtifacts
+          mkdir -p "$stage"
+          curl --fail --location --retry 2 \
+            "https://github.com/digidem/nodejs-mobile/releases/download/v$version/nodejs-mobile-ios-$version.zip" \
+            -o "$stage/node-mobile.zip" 2>&1 | tee build-logs/07-nodemobile-download.log
+          printf '%s  %s\n' f97c5f368f5982fdc062b0f97d96d7696f94dbaf286fbd0d3c515b596088bca8 "$stage/node-mobile.zip" | shasum -a 256 -c -
+          curl --fail --location --retry 2 \
+            "https://raw.githubusercontent.com/digidem/nodejs-mobile/v$version/LICENSE" \
+            -o "$stage/NodeMobile-LICENSE.txt"
+          printf '%s  %s\n' c373dabed995013e091b1908996a69a1647ef19d400e6c1fd4b7fb06d8bc0f66 "$stage/NodeMobile-LICENSE.txt" | shasum -a 256 -c -
+          unzip -q "$stage/node-mobile.zip" 'NodeMobile.xcframework/*' -d "$stage"
+          mkdir -p "$output"
+          rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
+          rsync -a --delete "$stage/opt/dsh/" "$output/engine/"
+          cp "$stage/NodeMobile-LICENSE.txt" "$output/engine/"
+          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker}.mjs "$output/engine/"
+          # Verify exactly what runtime/native-node/embed-ios.sh will require.
+          test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
+          test -f "$output/engine/node_modules/@deepseek-ai/dsh/lib/bin.js"
+          test -f "$output/engine/vendor/pnpm/dist/pnpm.mjs"
+          test -f "$output/engine/supervisor.mjs"
+          test -f "$output/engine/engine-worker.mjs"
+          echo "NativeNodeArtifacts OK:"
+          du -sh "$output"
+          find "$output/engine" -maxdepth 2 | head -20
+
+      - name: Build iSH libs
+        script: |
+          set -euo pipefail
+          # Skip guard: rebuild only when the pinned iSH input changed.
+          # build-ish.sh itself is idempotent (cached tarball, incremental
+          # ninja), but this guard avoids even invoking it on re-runs.
+          manifest=app/ios/IShArtifacts/ish-manifest.json
+          pinned="$(python3 -c "import json; print(json.load(open('third_party/ish/source.json'))['commit'])")"
+          if [ -f "$manifest" ] \
+             && [ -f app/ios/IShArtifacts/lib/libish.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libish_emu.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libfakefs.a ] \
+             && [ -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf ] \
+             && python3 -c "import json,sys; sys.exit(0 if json.load(open('$manifest')).get('ish_commit')=='$pinned' else 1)"; then
+            echo "iSH libs already built for commit $pinned, skipping rebuild"
+            exit 0
+          fi
+          bash third_party/ish/build-ish.sh 2>&1 | tee build-logs/07a-build-ish.log
+          # The script asserts the VDSO itself; re-assert here so the log
+          # shows the check even on a skipped-then-rebuilt run.
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+
+      - name: Stage iSH artifacts (rootfs)
+        script: |
+          set -euo pipefail
+          # prepare-rootfs.sh has its own manifest skip guard; this step
+          # always runs it (cheap when skipped) and then verifies the
+          # contract the prototype App depends on.
+          bash third_party/ish/prepare-rootfs.sh 2>&1 | tee build-logs/07b-prepare-rootfs.log
+          test -f app/ios/IShArtifacts/alpine-rootfs.zip
+          test -f app/ios/IShArtifacts/rootfs-manifest.json
+          test -f app/ios/IShArtifacts/lib/libish.a
+          test -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+          echo "IShArtifacts OK:"
+          du -sh app/ios/IShArtifacts
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/rootfs-manifest.json')); print('rootfs zip SHA256:', m['rootfs_zip_sha256'])"
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/ish-manifest.json')); print('ish commit:', m['ish_commit'], '| vdso SHA256:', m['vdso']['sha256'])"
 
       - name: Pod install and build iOS (no codesign)
         script: |

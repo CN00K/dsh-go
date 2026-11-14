@@ -26,6 +26,18 @@
 		D5B000000000000000000001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = D5B000000000000000000002 /* Localizable.strings */; };
 		D5B000000000000000000005 /* BackgroundTasks.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5B000000000000000000006 /* BackgroundTasks.framework */; };
 		D5C100000000000000000001 /* NativeNodeRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5C100000000000000000002 /* NativeNodeRuntime.swift */; };
+		D5E200000000000000000001 /* ISHKernel.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000002 /* ISHKernel.m */; };
+		D5E200000000000000000002 /* ISHShellExecutor.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000004 /* ISHShellExecutor.m */; };
+		D5E200000000000000000003 /* ISHZip.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000006 /* ISHZip.m */; };
+		D5E200000000000000000004 /* ISHCrashHandler.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000008 /* ISHCrashHandler.m */; };
+		D5E200000000000000000005 /* ISHFakefsMeta.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000010 /* ISHFakefsMeta.m */; };
+		D5E200000000000000000006 /* ISHResourceGovernor.m in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000012 /* ISHResourceGovernor.m */; };
+		D5E200000000000000000007 /* RootfsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000013 /* RootfsManager.swift */; };
+		D5E200000000000000000008 /* ISHRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000014 /* ISHRuntime.swift */; };
+		D5E200000000000000000009 /* IShLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000015 /* IShLoopbackService.swift */; };
+		D5E200000000000000000010 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000019 /* libsqlite3.tbd */; };
+		D5E200000000000000000011 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000020 /* libz.tbd */; };
+		D5E200000000000000000012 /* alpine-rootfs.zip in Resources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000021 /* alpine-rootfs.zip */; };
 		E967A4B848916EAB074E8A27 /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5EBF11ED69F5D147BADA6782 /* Pods_RunnerTests.framework */; };
 /* End PBXBuildFile section */
 
@@ -106,6 +118,27 @@
 		D5B000000000000000000004 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		D5B000000000000000000006 /* BackgroundTasks.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = BackgroundTasks.framework; path = System/Library/Frameworks/BackgroundTasks.framework; sourceTree = SDKROOT; };
 		D5C100000000000000000002 /* NativeNodeRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNodeRuntime.swift; sourceTree = "<group>"; };
+		D5E100000000000000000001 /* ISHKernel.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHKernel.h; sourceTree = "<group>"; };
+		D5E100000000000000000002 /* ISHKernel.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHKernel.m; sourceTree = "<group>"; };
+		D5E100000000000000000003 /* ISHShellExecutor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHShellExecutor.h; sourceTree = "<group>"; };
+		D5E100000000000000000004 /* ISHShellExecutor.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHShellExecutor.m; sourceTree = "<group>"; };
+		D5E100000000000000000005 /* ISHZip.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHZip.h; sourceTree = "<group>"; };
+		D5E100000000000000000006 /* ISHZip.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHZip.m; sourceTree = "<group>"; };
+		D5E100000000000000000007 /* ISHCrashHandler.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHCrashHandler.h; sourceTree = "<group>"; };
+		D5E100000000000000000008 /* ISHCrashHandler.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHCrashHandler.m; sourceTree = "<group>"; };
+		D5E100000000000000000009 /* ISHFakefsMeta.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHFakefsMeta.h; sourceTree = "<group>"; };
+		D5E100000000000000000010 /* ISHFakefsMeta.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHFakefsMeta.m; sourceTree = "<group>"; };
+		D5E100000000000000000011 /* ISHResourceGovernor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHResourceGovernor.h; sourceTree = "<group>"; };
+		D5E100000000000000000012 /* ISHResourceGovernor.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHResourceGovernor.m; sourceTree = "<group>"; };
+		D5E100000000000000000013 /* RootfsManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RootfsManager.swift; sourceTree = "<group>"; };
+		D5E100000000000000000014 /* ISHRuntime.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ISHRuntime.swift; sourceTree = "<group>"; };
+		D5E100000000000000000015 /* IShLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IShLoopbackService.swift; sourceTree = "<group>"; };
+		D5E100000000000000000016 /* libish.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000017 /* libish_emu.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_emu.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000018 /* libfakefs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libfakefs.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000019 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = "usr/lib/libsqlite3.tbd"; sourceTree = SDKROOT; };
+		D5E100000000000000000020 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; path = "usr/lib/libz.tbd"; sourceTree = SDKROOT; };
+		D5E100000000000000000021 /* alpine-rootfs.zip */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = "IShArtifacts/alpine-rootfs.zip"; sourceTree = SOURCE_ROOT; };
 		D8430E14A5471280A0F2C1DD /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		FFE6541DEFF151A9C6BD9402 /* PetLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; path = PetLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -126,6 +159,8 @@
 				78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */,
 				D5B000000000000000000005 /* BackgroundTasks.framework in Frameworks */,
 				0D974B978381848384033794 /* Pods_Runner.framework in Frameworks */,
+				D5E200000000000000000010 /* libsqlite3.tbd in Frameworks */,
+				D5E200000000000000000011 /* libz.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -200,6 +235,7 @@
 				7FD0720C30A7374500EE3856 /* Recovered References */,
 				AEF8E8FB8C13535C656D5418 /* Pods */,
 				750CDFCDD70F70239116748C /* Frameworks */,
+				D5E300000000000000000001 /* IShArtifacts */,
 			);
 			sourceTree = "<group>";
 		};
@@ -228,6 +264,21 @@
 				D5B000000000000000000002 /* Localizable.strings */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
+				D5E100000000000000000001 /* ISHKernel.h */,
+				D5E100000000000000000002 /* ISHKernel.m */,
+				D5E100000000000000000003 /* ISHShellExecutor.h */,
+				D5E100000000000000000004 /* ISHShellExecutor.m */,
+				D5E100000000000000000005 /* ISHZip.h */,
+				D5E100000000000000000006 /* ISHZip.m */,
+				D5E100000000000000000007 /* ISHCrashHandler.h */,
+				D5E100000000000000000008 /* ISHCrashHandler.m */,
+				D5E100000000000000000009 /* ISHFakefsMeta.h */,
+				D5E100000000000000000010 /* ISHFakefsMeta.m */,
+				D5E100000000000000000011 /* ISHResourceGovernor.h */,
+				D5E100000000000000000012 /* ISHResourceGovernor.m */,
+				D5E100000000000000000013 /* RootfsManager.swift */,
+				D5E100000000000000000014 /* ISHRuntime.swift */,
+				D5E100000000000000000015 /* IShLoopbackService.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -244,6 +295,19 @@
 			);
 			name = Pods;
 			path = Pods;
+			sourceTree = "<group>";
+		};
+		D5E300000000000000000001 /* IShArtifacts */ = {
+			isa = PBXGroup;
+			children = (
+				D5E100000000000000000016 /* libish.a */,
+				D5E100000000000000000017 /* libish_emu.a */,
+				D5E100000000000000000018 /* libfakefs.a */,
+				D5E100000000000000000019 /* libsqlite3.tbd */,
+				D5E100000000000000000020 /* libz.tbd */,
+				D5E100000000000000000021 /* alpine-rootfs.zip */,
+			);
+			name = IShArtifacts;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -380,6 +444,7 @@
 				97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */,
 				D5B000000000000000000001 /* Localizable.strings in Resources */,
 				97C146FC1CF9000F007C117D /* Main.storyboard in Resources */,
+				D5E200000000000000000012 /* alpine-rootfs.zip in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -507,6 +572,15 @@
 				D5C100000000000000000001 /* NativeNodeRuntime.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
+				D5E200000000000000000001 /* ISHKernel.m in Sources */,
+				D5E200000000000000000002 /* ISHShellExecutor.m in Sources */,
+				D5E200000000000000000003 /* ISHZip.m in Sources */,
+				D5E200000000000000000004 /* ISHCrashHandler.m in Sources */,
+				D5E200000000000000000005 /* ISHFakefsMeta.m in Sources */,
+				D5E200000000000000000006 /* ISHResourceGovernor.m in Sources */,
+				D5E200000000000000000007 /* RootfsManager.swift in Sources */,
+				D5E200000000000000000008 /* ISHRuntime.swift in Sources */,
+				D5E200000000000000000009 /* IShLoopbackService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -642,14 +716,54 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -884,14 +998,54 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -909,14 +1063,54 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
