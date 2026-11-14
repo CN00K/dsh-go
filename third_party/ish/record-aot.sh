@@ -316,8 +316,16 @@ cp "$SCRIPT_DIR/aot-workloads/pcre_train.sh" "$S/minis/"
 for _cert in rsa.key rsa.crt ec.key ec.crt; do
     [ -f "$S/net/$_cert" ] || fail "host TLS certificate missing: $S/net/$_cert (openssl req failed — rerun with its stderr visible)"
 done
-cp "$S/net"/rsa.key "$S/net"/rsa.crt "$S/net"/ec.key "$S/net"/ec.crt "$DATA/tmp/aojit/net/"
-cp "$S/minis/pcre_train.sh" "$DATA/tmp/aojit/minis/"
+cp "$S/net"/rsa.key "$S/net"/rsa.crt "$S/net"/ec.key "$S/net"/ec.crt "$DATA/tmp/aojit/net/" \
+    || fail "could not copy TLS certificates into $DATA/tmp/aojit/net/"
+# minis/ is OURS, not the suite's: guest/ has no minis/ subdir, so install.sh
+# never creates /tmp/aojit/minis/ — make it here or the cp below dies with
+# "No such file or directory" (build 6af8a8b3, 2026-11-15). Both cp lines
+# carry || fail: without it set -e kills the script silently (same silent
+# death as build 6af8a072, new location).
+mkdir -p "$DATA/tmp/aojit/minis" || fail "could not create $DATA/tmp/aojit/minis"
+cp "$S/minis/pcre_train.sh" "$DATA/tmp/aojit/minis/" \
+    || fail "could not copy pcre_train.sh into $DATA/tmp/aojit/minis/"
 g 'cd /tmp/aojit/net && cat /etc/ssl/certs/ca-certificates.crt rsa.crt ec.crt > ca_bundle.pem && test -f ca_bundle.pem' \
     || fail "could not build ca_bundle.pem in the guest"
 log_success "Workloads staged (suite + certs + pcre_train.sh)"
