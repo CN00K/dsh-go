@@ -143,6 +143,13 @@ static const size_t kISHExecEnvpCapacity = 8192;
 
 @end
 
+// Forward declaration: ISHShellExecution.cancel (below) calls this, but
+// the full private interface (class extension) is declared further down.
+// Without it ARC rejects the call: no visible @interface declares it.
+@interface ISHShellExecutor (CancelForward)
+- (void)cancelRecord:(ISHExecRecord *)record;
+@end
+
 // --- ISHShellExecution (handle) ----------------------------------------------
 
 @interface ISHShellExecution ()
@@ -403,19 +410,23 @@ static void ish_executor_close_fd(int fd) {
         [self failRecord:record withCode:ISHShellExecutionErrorCreationFailed];
         return;
     }
+    // Blocks cannot capture C arrays: copy the fds they own into scalars.
+    int stdoutReadFd = stdoutPipe[0];
+    int stderrReadFd = stderrPipe[0];
+    int stdinWriteFd = stdinPipe[1];
     // Readers: start BEFORE task_start so no output is missed.
     dispatch_group_enter(record.pipeGroup);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-        [self readPipeFd:stdoutPipe[0] into:record.stdoutData
+        [self readPipeFd:stdoutReadFd into:record.stdoutData
                     lock:record.outputLock record:record isStderr:NO];
-        close(stdoutPipe[0]);
+        close(stdoutReadFd);
         dispatch_group_leave(record.pipeGroup);
     });
     dispatch_group_enter(record.pipeGroup);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-        [self readPipeFd:stderrPipe[0] into:record.stderrData
+        [self readPipeFd:stderrReadFd into:record.stderrData
                     lock:record.outputLock record:record isStderr:YES];
-        close(stderrPipe[0]);
+        close(stderrReadFd);
         dispatch_group_leave(record.pipeGroup);
     });
     // Pipes-done gate: when both readers hit EOF, mark pipesDone and try.
@@ -425,8 +436,8 @@ static void ish_executor_close_fd(int fd) {
     });
     // Stdin writer: feed stdinData, then close (EOF). Owns stdinPipe[1].
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-        [self writeStdinData:stdinData toFd:stdinPipe[1] record:record];
-        close(stdinPipe[1]);
+        [self writeStdinData:stdinData toFd:stdinWriteFd record:record];
+        close(stdinWriteFd);
     });
     // Cancelled before we even started? (cancel / cancelAll raced us.)
     if (record.cancelled) {
