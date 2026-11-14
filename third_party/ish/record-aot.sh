@@ -115,7 +115,7 @@ EXPECTED_PCRE2="10.43-r1"
 # zlib's count was not published; its floor is a smoke floor only.
 spec() {
     case "$1" in
-        musl)      echo "aot_musl_1.2.5-r8.S|ld-musl|3800|/tmp/aojit/shell/musl_train.sh|zlib-train-ok" ;;
+        musl)      echo "aot_musl_1.2.5-r8.S|ld-musl|3800|/tmp/aojit/shell/musl_train.sh|" ;;
         busybox)   echo "aot_busybox_1.37.0-r8.S|/bin/busybox|5200|/tmp/aojit/busybox/busybox_train.sh|" ;;
         zlib)      echo "aot_zlib_1.3.1-r2.S|libz.so|200|/tmp/aojit/zlib/zlib_train.sh|zlib-train-ok" ;;
         libcrypto) echo "aot_libcrypto_3.3.2-r4.S|libcrypto.so|15000|/tmp/aojit/net/tls_train.sh|agent-cold-ok tls-train-ok" ;;
