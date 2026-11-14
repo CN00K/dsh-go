@@ -229,7 +229,20 @@ printf '%s  %s\n' "$ALPINE_SHA256" "$tarball" | shasum -a 256 -c - >/dev/null 2>
 rm -rf "$WORK/rec-A"; mkdir -p "$WORK/rec-A"
 tar xzf "$tarball" -C "$WORK/rec-A" || fail "could not extract $tarball to $WORK/rec-A"
 DATA="$WORK/rec-A"
-[ -x "$DATA/bin/sh" ] || fail "rootfs A has no working /bin/sh: $DATA/bin/sh is not executable (symlinks must be real, not fakefs text files)"
+# /bin/sh is a symlink to /bin/busybox with an ABSOLUTE target: a host-side
+# [ -x ] follows it out of the tree to the host's /bin/busybox (which does
+# not exist on macOS or Linux), so it always fails even on a good tree
+# (build 6af8a38a, 2026-11-15 — verified locally: 335 real symlinks, the
+# tree is fine, the gate was the bug). Check the link itself, then resolve
+# its target INSIDE DATA (the guest resolves absolute links against its
+# own root, so the recorder is unaffected by the host-side path).
+[ -L "$DATA/bin/sh" ] || fail "rootfs A has no working /bin/sh: $DATA/bin/sh is not a symlink (fakefs text files are not symlinks)"
+SH_LINK=$(readlink "$DATA/bin/sh")
+case "$SH_LINK" in
+    /*) SH_TARGET="$DATA$SH_LINK" ;;
+    *)  SH_TARGET="$DATA/bin/$SH_LINK" ;;
+esac
+[ -x "$SH_TARGET" ] || fail "rootfs A has no working /bin/sh: $DATA/bin/sh -> $SH_LINK, target $SH_TARGET is not executable"
 log_success "rootfs A ready: $DATA ($(find "$DATA" -type l | wc -l | tr -d ' ') symlinks)"
 
 # -r takes the rootfs tree root (the AOJIT suite's mode; see the header
