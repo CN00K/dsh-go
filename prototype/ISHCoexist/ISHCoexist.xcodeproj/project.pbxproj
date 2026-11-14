@@ -259,6 +259,14 @@
 					"../../app/ios/NativeNodeArtifacts",
 				);
 				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (build 7).
+					"GUEST_ARM64=1",
+				);
 				GCC_OPTIMIZATION_LEVEL = 0;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -316,6 +324,14 @@
 					"../../app/ios/NativeNodeArtifacts",
 				);
 				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (build 7).
+					"GUEST_ARM64=1",
+				);
 				GCC_OPTIMIZATION_LEVEL = s;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
