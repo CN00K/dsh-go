@@ -23,5 +23,8 @@ import UserNotifications
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshNativeNode") {
       NativeNodeRuntime.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshIshRuntime") {
+      ISHRuntime.register(with: registrar)
+    }
   }
 }
