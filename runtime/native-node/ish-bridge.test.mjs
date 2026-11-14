@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {mkdtempSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {createServer} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -235,11 +235,25 @@ test('getServiceInfo waits for the file on first miss, then fails fast', async (
   const first = await getServiceInfo({serviceFile: missing});
   const firstMs = Date.now() - start;
   assert.equal(first, null);
-  assert.ok(firstMs >= 9000 && firstMs < 12000, `first wait should be ~10s, was ${firstMs}ms`);
+  assert.ok(firstMs >= 29000 && firstMs < 35000, `first wait should be ~30s, was ${firstMs}ms`);
   const secondStart = Date.now();
   const second = await getServiceInfo({serviceFile: missing});
   assert.equal(second, null);
   assert.ok(Date.now() - secondStart < 1000, 'second miss must fail fast');
+});
+
+test('bridge unavailable error names the missing service file', async () => {
+  invalidateServiceInfo();
+  // The one 30 s wait was already spent by the getServiceInfo test
+  // above, so this miss fails fast.
+  await assert.rejects(
+    ishExec({command: 'echo hi', serviceFile: join(fakeHome, 'ish-service-never.json')}),
+    (error) => {
+      assert.equal(error.code, 'ISH_BRIDGE_UNAVAILABLE');
+      assert.match(error.message, /ish-service\.json not found at /);
+      assert.ok(error.message.includes(join(fakeHome, 'ish-service-never.json')));
+      return true;
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -398,8 +412,12 @@ test('spawnIshExec returns a ChildProcess-shaped handle with streamed output', a
 
 test('spawnIshExec fails closed when the bridge is down', async () => {
   invalidateServiceInfo();
-  // The getServiceInfo test above already did the one ~10s wait for a
-  // missing file, so this miss fails fast.
+  // The getServiceInfo test above already did the one ~30s wait for a
+  // missing file, so this miss fails fast. Remove the canonical file
+  // first: the previous test installed a mock server's port there, and
+  // a stale-but-parseable file would fail with ECONNREFUSED instead of
+  // exercising the file-not-found path.
+  rmSync(canonicalServiceFile, {force: true});
   const child = spawnIshExec(
     [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'echo hi'],
     {cwd: join(fakeHome, 'workspace'), env: {}});
@@ -408,6 +426,9 @@ test('spawnIshExec fails closed when the bridge is down', async () => {
   const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
   assert.deepEqual(outcome, {code: 1, signal: null});
   assert.match(stderr, /ish bridge unavailable/);
+  // The runner-failure line still names the file that was checked, so a
+  // device log tells a missing boot from a wrong path.
+  assert.match(stderr, /ish-service\.json not found at /);
 });
 
 // ---------------------------------------------------------------------------

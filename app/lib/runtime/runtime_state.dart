@@ -294,6 +294,12 @@ class IshRuntimeController extends Notifier<IshRuntimeState> {
 
   /// One-shot background boot once Node is running. Never loops: a
   /// failed boot stays visible as an error phase until the user retries.
+  /// A failed boot resets [_autoBootTried] so a later trigger (Node
+  /// status change, or opening a terminal) can try again — without
+  /// this, one failed boot (e.g. a first-launch rootfs failure) made
+  /// every later open fail the same way with no retry (stage 3 device
+  /// test, build 21: restart + 60 s wait still failed). Still never
+  /// loops: _autoBoot only runs on a trigger, never on a timer.
   Future<void> _autoBoot() async {
     if (_autoBootTried) return;
     _autoBootTried = true;
@@ -307,8 +313,18 @@ class IshRuntimeController extends Notifier<IshRuntimeState> {
     } catch (_) {
       // Non-fatal (design §2.4(c)): the terminal shows "starting/failed"
       // and agent bash keeps reporting unavailable, i.e. today's behavior.
+      // But allow a later trigger to retry: a failed boot is not proof
+      // the next one fails (and the terminal pre-flight boots on demand).
+      _autoBootTried = false;
     }
     if (ref.mounted) await _refresh();
+  }
+
+  /// Re-reads the native status (the terminal pre-flight uses this
+  /// after a failed boot, so the diagnosis shows the fresh phase and
+  /// error code instead of the pre-boot state).
+  Future<void> refresh() async {
+    await _refresh();
   }
 
   Future<void> boot() async {

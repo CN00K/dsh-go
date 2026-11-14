@@ -103,12 +103,41 @@ export const ISH_NOT_BOOTED = 'ish_not_booted';
 
 /** Default /ish/exec timeoutMs. Matches the bash-sandbox config (60s). */
 export const DEFAULT_EXEC_TIMEOUT_MS = 60_000;
-/** First call waits this long for ish-service.json to appear (design §2.4(c)). */
-const SERVICE_FILE_WAIT_MS = 10_000;
+/**
+ * First call waits this long for ish-service.json to appear. 30 s, not
+ * 10 s: a first boot (rootfs install + kernel boot) routinely takes
+ * longer than 10 s, and a 10 s wait made the terminal fail on a healthy
+ * but slow first boot (stage 3 device test, build 21).
+ */
+const SERVICE_FILE_WAIT_MS = 30_000;
 /** Poll interval while waiting for the service file. */
 const SERVICE_FILE_POLL_MS = 250;
-/** Re-read the service file at most this often when it is missing. */
-const SERVICE_FILE_RETRY_MIN_MS = 30_000;
+/**
+ * Re-read the service file at most this often when it is missing.
+ * 5 s, not 30 s: after the one 30 s wait, a user who reopens the
+ * terminal a few seconds later must get a fresh check, not an instant
+ * fail-fast (stage 3 device test: reopening after 30 s still failed
+ * instantly because the 30 s window had not elapsed).
+ */
+const SERVICE_FILE_RETRY_MIN_MS = 5_000;
+
+/**
+ * The loopback service is down: ish-service.json is missing (iSH not
+ * booted, or the service failed to bind). The message names the file
+ * that was checked and whether HOME was even set, so the next device
+ * test can tell a missing boot from a wrong path without guessing.
+ * The `ISH_BRIDGE_UNAVAILABLE` code (and the `ish bridge unavailable`
+ * line the callers prefix) is unchanged, so the runner-failure
+ * signatures still classify this as SANDBOX_UNAVAILABLE.
+ */
+function bridgeUnavailableError(opts = {}) {
+  const roots = hostRoots();
+  const serviceFile = opts.serviceFile ?? roots?.serviceFile ?? null;
+  const detail = serviceFile != null
+    ? `ish-service.json not found at ${serviceFile}`
+    : 'HOME is not set (cannot locate ish-service.json)';
+  return Object.assign(new Error(detail), {code: 'ISH_BRIDGE_UNAVAILABLE'});
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -201,7 +230,7 @@ function readServiceFile(serviceFile) {
 }
 
 /**
- * Resolve the loopback service (lazy, cached). First call waits up to 10s
+ * Resolve the loopback service (lazy, cached). First call waits up to 30s
  * for the file to appear (iSH may still be booting); later calls fail fast
  * when it is missing, and re-read once after a connection failure.
  * @param opts.serviceFile override for tests.
@@ -215,7 +244,7 @@ export async function getServiceInfo(opts = {}) {
   const now = Date.now();
   let info = readServiceFile(serviceFile);
   if (!info && !waitedForServiceFile) {
-    // First miss: iSH may still be booting; wait up to 10s for the file.
+    // First miss: iSH may still be booting; wait up to 30s for the file.
     waitedForServiceFile = true;
     const deadline = Date.now() + SERVICE_FILE_WAIT_MS;
     while (!info && Date.now() < deadline) {
@@ -258,11 +287,7 @@ export function invalidateServiceInfo() {
  */
 export async function ishExec(opts) {
   const service = await getServiceInfo(opts);
-  if (!service) {
-    const error = new Error(ISH_BRIDGE_UNAVAILABLE);
-    error.code = 'ISH_BRIDGE_UNAVAILABLE';
-    throw error;
-  }
+  if (!service) throw bridgeUnavailableError(opts);
   const body = JSON.stringify({
     command: opts.command,
     ...(opts.cwd ? {cwd: opts.cwd} : {}),
@@ -423,7 +448,7 @@ export function ishWebSocket(opts) {
 
   const ready = (async () => {
     const service = await getServiceInfo(opts);
-    if (!service) throw Object.assign(new Error(ISH_BRIDGE_UNAVAILABLE), {code: 'ISH_BRIDGE_UNAVAILABLE'});
+    if (!service) throw bridgeUnavailableError(opts);
     const key = randomBytes(16).toString('base64');
     const expectedAccept = createHash('sha1').update(key + WS_GUID).digest('base64');
     socket = netConnect({host: service.host, port: service.port});

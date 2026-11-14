@@ -15,11 +15,14 @@ import 'dart:async' as dart_async show AsyncError; // Riverpod exports its own A
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart' show Terminal;
 
 import '../l10n/l10n.dart';
+import '../runtime/ish/ish_runtime_service.dart';
+import '../runtime/runtime_state.dart';
 import 'connection_state.dart';
 
 // ── Backend seam ─────────────────────────────────────────────────────────────
@@ -229,6 +232,44 @@ abstract final class TerminalCopy {
   static String get startFailed => appL10n.stateTerminalStartFailed;
   static String get disabledOnHost => appL10n.stateTerminalDisabledOnHost;
 
+  /// Diagnosis for a terminal that cannot start because the iSH guest
+  /// is down (stage 3 device test, build 21: the terminal died with
+  /// the bare `ish bridge unavailable` line and no hint why). The
+  /// error phase always carries the native error code ([IshStatus.error]
+  /// is already "code: message", e.g. `ish_boot_timeout: ...`), so the
+  /// next device test shows which step failed instead of guessing.
+  /// [bootError] is the boot() exception when the status has no error
+  /// of its own (e.g. the channel is not linked).
+  static String ishDiagnosis(IshStatus status, Object? bootError) {
+    switch (status.phase) {
+      case IshPhase.error:
+        final detail = status.error ?? _bootErrorText(bootError);
+        return detail == null ? 'iSH 启动失败（未知错误）' : 'iSH 启动失败：$detail';
+      case IshPhase.running:
+        return 'iSH 已启动，但回环服务不可用，请重试';
+      case IshPhase.booting:
+        return 'iSH 还在启动，稍后重试';
+      case IshPhase.installing:
+        return 'iSH 正在安装 rootfs，稍后重试';
+      case IshPhase.stopping:
+      case IshPhase.stopBlocked:
+        return 'iSH 正在停止，稍后再试';
+      case IshPhase.notInstalled:
+      case IshPhase.installed:
+      case IshPhase.stopped:
+        return 'iSH 未启动，请重试（重试时会先启动 iSH）';
+    }
+  }
+
+  static String? _bootErrorText(Object? error) {
+    if (error == null) return null;
+    if (error is PlatformException) {
+      final message = error.message;
+      return message == null || message.isEmpty ? error.code : '${error.code}: $message';
+    }
+    return error.toString();
+  }
+
   /// A Remote Host whose owner switched the terminal off in its local Remote
   /// settings (ds-harness-remote `TERMINAL_DISABLED`); only they can turn it on.
   /// Also inside the [ParallelWaitError] of the first load's `(a, b).wait`.
@@ -285,12 +326,22 @@ class _Link {
   }
 }
 
+/// What the Node PTY shim prints when the loopback service is down
+/// (ish-bridge.mjs `ISH_BRIDGE_UNAVAILABLE`): a terminal whose screen
+/// holds this line never ran a shell at all.
+const _ishBridgeUnavailableMarker = 'ish bridge unavailable';
+
 class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
   TerminalWorkspace(this.sessionId);
 
   final String sessionId;
 
   static const _shellKey = 'terminal.shell';
+
+  /// How long a terminal create waits for an in-flight iSH boot to
+  /// settle before creating anyway (the bridge then waits up to 30 s
+  /// for the token file; together they cover a slow first boot).
+  static const _ishBootSettleWait = Duration(seconds: 30);
 
   TerminalBackend? _backend;
   final Map<String, _Link> _links = {};
@@ -584,6 +635,89 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     return terminal;
   }
 
+  /// Makes sure the iSH guest is up before opening a terminal.
+  /// Returns a message for the failed tab when it cannot be started,
+  /// null when the terminal may be created. A boot already in flight
+  /// (phase booting/installing, or `ish_busy` from a concurrent boot)
+  /// is waited out, not failed: the bridge waits for the token file
+  /// after that, so a slow first boot still opens. This is the
+  /// deterministic boot trigger the auto-boot path cannot guarantee:
+  /// opening a terminal always tries once, and a failure shows the
+  /// iSH phase + native error code (stage 3, build 21).
+  Future<String?> _ensureIshBooted(int epoch) async {
+    final ish = ref.read(ishRuntimeProvider.notifier);
+    var status = ref.read(ishRuntimeProvider).status;
+    if (status.phase == IshPhase.running) return null;
+    if (status.phase == IshPhase.booting || status.phase == IshPhase.installing) {
+      status = await _waitForIshSettled(epoch);
+      if (_stale(epoch)) return null;
+      if (status.phase == IshPhase.running) return null;
+      if (status.phase == IshPhase.error) return TerminalCopy.ishDiagnosis(status, null);
+      return null; // Still booting: the bridge waits for the token file.
+    }
+    try {
+      await ish.boot();
+    } on PlatformException catch (error) {
+      // No `dsh/ish` channel in this build (unit tests, or a build
+      // without the iSH plugin): there is no guest to boot, so keep
+      // the old behaviour and let the terminal open as before.
+      if (error.code == 'ish_not_linked') return null;
+      // A boot already in flight answers ish_busy: wait it out like a
+      // booting phase instead of failing the tab.
+      if (error.code == 'ish_busy') {
+        status = await _waitForIshSettled(epoch);
+        if (_stale(epoch)) return null;
+        if (status.phase == IshPhase.running) return null;
+        if (status.phase == IshPhase.error) return TerminalCopy.ishDiagnosis(status, error);
+        return null;
+      }
+      if (_stale(epoch)) return null;
+      await ish.refresh();
+      status = ref.read(ishRuntimeProvider).status;
+      return TerminalCopy.ishDiagnosis(status, error);
+    } on Object catch (error) {
+      if (_stale(epoch)) return null;
+      await ish.refresh();
+      status = ref.read(ishRuntimeProvider).status;
+      return TerminalCopy.ishDiagnosis(status, error);
+    }
+    if (_stale(epoch)) return null;
+    status = ref.read(ishRuntimeProvider).status;
+    if (status.phase == IshPhase.error) return TerminalCopy.ishDiagnosis(status, null);
+    if (status.phase == IshPhase.booting || status.phase == IshPhase.installing) {
+      status = await _waitForIshSettled(epoch);
+      if (_stale(epoch)) return null;
+      if (status.phase == IshPhase.error) return TerminalCopy.ishDiagnosis(status, null);
+    }
+    return null;
+  }
+
+  /// Polls the iSH phase until it leaves booting/installing (or the
+  /// wait runs out). Returns the last seen status.
+  Future<IshStatus> _waitForIshSettled(int epoch) async {
+    final deadline = DateTime.now().add(_ishBootSettleWait);
+    var status = ref.read(ishRuntimeProvider).status;
+    while ((status.phase == IshPhase.booting || status.phase == IshPhase.installing) &&
+        DateTime.now().isBefore(deadline)) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (_stale(epoch) || !ref.mounted) break;
+      status = ref.read(ishRuntimeProvider).status;
+    }
+    return status;
+  }
+
+  /// The PTY shim prints `ish: ish bridge unavailable: ...` and exits
+  /// when the loopback service is down. A tab that ends with that line
+  /// on screen never ran a shell: show why iSH is down (and a retry)
+  /// instead of the plain "ended" state.
+  bool _endedForBridgeUnavailable(TerminalTab tab) {
+    try {
+      return tab.terminal.buffer.getText().contains(_ishBridgeUnavailableMarker);
+    } on Object {
+      return false;
+    }
+  }
+
   Future<void> _create(String id) async {
     final backend = _backend;
     final link = _links[id];
@@ -592,6 +726,15 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     _update(id, (t) => t.copyWith(phase: TerminalPhase.starting, clearMessage: true));
     final environment = state.environment ?? TerminalEnvironment.defaults;
     try {
+      // The iSH guest must be up before the shell can spawn: boot it
+      // on demand (and say why it is down) instead of letting the
+      // terminal die with the bare bridge line (stage 3, build 21).
+      final ishFailure = await _ensureIshBooted(epoch);
+      if (_stale(epoch) || !_links.containsKey(id)) return;
+      if (ishFailure != null) {
+        _update(id, (t) => t.copyWith(phase: TerminalPhase.failed, message: ishFailure));
+        return;
+      }
       final shellPath = link.shellPath ?? await _preferredShell(backend);
       link.shellPath = shellPath;
       await _measured();
@@ -703,28 +846,50 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     final writable = link.attachment?.writable ?? false;
     switch (frame) {
       case TerminalSnapshot(:final info, :final screen):
-        _update(
-          id,
-          (t) => t.copyWith(
+        _update(id, (t) {
+          // Attached after the shell already died: the snapshot's
+          // screen holds the bridge line when the shell never ran.
+          if (!info.running && (screen?.contains(_ishBridgeUnavailableMarker) ?? false)) {
+            return t.copyWith(
+              terminal: _emulator(id, info, screen),
+              info: info,
+              title: info.title,
+              phase: TerminalPhase.failed,
+              writable: false,
+              message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+            );
+          }
+          return t.copyWith(
             terminal: _emulator(id, info, screen),
             info: info,
             title: info.title,
             phase: info.running ? TerminalPhase.live : TerminalPhase.ended,
             writable: writable,
-          ),
-        );
+          );
+        });
       case TerminalOutput(:final data):
         _tab(id)?.terminal.write(data);
       case TerminalStatus(:final info):
-        _update(
-          id,
-          (t) => t.copyWith(
-            info: info,
-            title: info.title,
-            phase: info.running ? TerminalPhase.live : TerminalPhase.ended,
-            writable: writable,
-          ),
-        );
+        _update(id, (t) {
+          if (info.running) {
+            return t.copyWith(
+              info: info,
+              title: info.title,
+              phase: TerminalPhase.live,
+              writable: writable,
+            );
+          }
+          if (_endedForBridgeUnavailable(t)) {
+            return t.copyWith(
+              info: info,
+              title: info.title,
+              phase: TerminalPhase.failed,
+              writable: false,
+              message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+            );
+          }
+          return t.copyWith(info: info, title: info.title, phase: TerminalPhase.ended, writable: writable);
+        });
       case TerminalAck(:final refusal):
         if (refusal != null) _update(id, (t) => t.copyWith(writable: false));
     }
@@ -747,7 +912,16 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
   void _onDone(_Link link, int token) {
     if (token != link.generation) return;
     link.detach();
-    _update(link.id, (t) => t.copyWith(phase: TerminalPhase.ended, writable: false));
+    _update(link.id, (t) {
+      if (_endedForBridgeUnavailable(t)) {
+        return t.copyWith(
+          phase: TerminalPhase.failed,
+          writable: false,
+          message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+        );
+      }
+      return t.copyWith(phase: TerminalPhase.ended, writable: false);
+    });
   }
 
   void _closeQuietly(String id) {
