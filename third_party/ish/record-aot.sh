@@ -13,8 +13,16 @@
 # benchmark/aojit suite):
 #   1. A CLI ish is built from the pinned ish commit with the EMITTING JIT
 #      (-Djit=true, no -Djit_emit=false — the recorder must emit code).
-#   2. The app's rootfs (from prepare-rootfs.sh) is copied to a scratch
-#      rootfs A; the training packages are installed in it with apk.
+#   2. The pinned Alpine minirootfs tarball is extracted to a scratch
+#      rootfs A (a REAL tree — real symlinks); the training packages are
+#      installed in it with apk. NOTE: rootfs A is NOT the fakefs data/
+#      dir from the app's zip: fakefs stores symlinks as text files (the
+#      target path as file content, link metadata only in meta.db), so -r
+#      mode cannot exec /bin/sh there (ENOEXEC) and the recorder dies with
+#      nothing in the log (build 6af8a072, 2026-11-15). The tarball is the
+#      same one prepare-rootfs.sh converts for the app, so the recorded
+#      modules have exactly the app rootfs's package versions (the
+#      dsh-go branding in /etc/profile + /etc/motd does not touch them).
 #   3. Each module is recorded in ONE ish run (ISH_JIT_PIC=1, so the code
 #      is position-independent and has the app's abi): the workload runs,
 #      the translations are written to a .jsonl recording, and gen.py turns
@@ -30,20 +38,20 @@
 # mode. This script refuses to run on a non-arm64 host. On Codemagic use
 # the ios-aot-record workflow (mac_mini_m2, Apple Silicon).
 #
-# The ish CLI is invoked with -r <data-dir> throughout (the AOJIT suite's
-# mode: install.sh, record.sh and the suite README's apk add all use -r;
-# -r reads the data dir directly, so host-staged workloads are visible
-# without fakefs metadata). The app itself uses -f (fakefs); the recording
-# rootfs A is throwaway, so the mode difference does not matter — only the
-# module code that runs matters, and it is identical.
+# The ish CLI is invoked with -r <rootfs-tree> throughout (the AOJIT
+# suite's mode: install.sh, record.sh and the suite README's apk add all
+# use -r; -r reads the host tree directly, so host-staged workloads are
+# visible without fakefs metadata). The app itself uses -f (fakefs); the
+# recording rootfs A is a real extracted tree, so the mode difference does
+# not matter — only the module code that runs matters, and it is identical.
 #
 # GATES (each one stops the run — a silent partial recording is how the abi
 # 1f3bb5a0 copies from ish-arm64 lost 80% of libssl's coverage):
 #   * the recorder's abi is readable (it is printed and stored; it must
 #     equal the app's abi because both come from the same pinned commit —
-#     if it is not 1f3bb5a0, that only means a layout changed since
-#     OpenMinis recorded; the images still match the app, which is built
-#     from the same commit);
+#     the device shows 0535d7e8 for this commit; a different value only
+#     means a layout changed since OpenMinis recorded at 1f3bb5a0; the
+#     images still match the app, which is built from the same commit);
 #   * the bundled package versions are the expected ones (musl 1.2.5-r8,
 #     busybox 1.37.0-r8, zlib 1.3.1-r2, libcrypto3/libssl3 3.3.2-r4,
 #     pcre2 10.43-r0) — a different version means the image name would be
@@ -204,26 +212,67 @@ log_success "Recorder built: $I"
 # Rootfs A: the recording environment (throwaway copy of the shipped rootfs)
 # ============================================================================
 step "📦 rootfs A (recording environment) + training packages"
+# Rootfs A is a REAL extracted Alpine tree (see the header note): -r mode
+# reads the host tree directly, so /bin/sh must be a real symlink to
+# busybox. The fakefs data/ dir from the app's zip cannot be used here —
+# it stores symlinks as text files, and -r on it makes the recorder die
+# with ENOEXEC and nothing in the log (build 6af8a072, 2026-11-15).
+# These constants MUST match prepare-rootfs.sh (same tarball, same SHA256).
+ALPINE_VERSION="3.21.0"
+ALPINE_ARCH="aarch64"
+ALPINE_FILE="alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz"
+ALPINE_SHA256="f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
+tarball="$CACHE_DIR/$ALPINE_FILE"
+[ -f "$tarball" ] || fail "Alpine tarball missing from cache: $tarball (prepare-rootfs.sh should have downloaded it)"
+printf '%s  %s\n' "$ALPINE_SHA256" "$tarball" | shasum -a 256 -c - >/dev/null 2>&1 \
+    || fail "Alpine tarball SHA256 mismatch: $tarball (expected $ALPINE_SHA256)"
 rm -rf "$WORK/rec-A"; mkdir -p "$WORK/rec-A"
-unzip -q "$ARTIFACTS/alpine-rootfs.zip" -d "$WORK/rec-A"
-ROOT="$WORK/rec-A/alpine-rootfs"
-DATA="$ROOT/data"
-[ -d "$DATA" ] || fail "rootfs A has no data/ dir — the zip layout changed"
+tar xzf "$tarball" -C "$WORK/rec-A" || fail "could not extract $tarball to $WORK/rec-A"
+DATA="$WORK/rec-A"
+[ -x "$DATA/bin/sh" ] || fail "rootfs A has no working /bin/sh: $DATA/bin/sh is not executable (symlinks must be real, not fakefs text files)"
+log_success "rootfs A ready: $DATA ($(find "$DATA" -type l | wc -l | tr -d ' ') symlinks)"
 
-# -r takes the data dir (the AOJIT suite's mode; see the header note).
-g() { "$I" -r "$DATA" /bin/sh -c "$1" 2>&1 | { grep -v '^NETDIAG' || true; }; }
+# -r takes the rootfs tree root (the AOJIT suite's mode; see the header
+# note). DATA is a real extracted Alpine tree, NOT the fakefs data/ dir:
+# in -r mode the guest reads the host tree directly, so symlinks must be
+# real (fakefs data/ stores them as text files and /bin/sh cannot exec).
+g() {
+    # Return the RECORDER's exit status, not grep's: the old version ended
+    # in `|| true`, so g() always returned 0 and every `g ... || fail`
+    # guard after it was dead code. PIPESTATUS[0] is the recorder; the
+    # grep only filters the NETDIAG noise lines from the output.
+    "$I" -r "$DATA" /bin/sh -c "$1" 2>&1 | { grep -v '^NETDIAG' || true; }
+    return "${PIPESTATUS[0]}"
+}
 
-ABI_REC=$(ISH_JIT_PIC=1 "$I" -r "$DATA" /bin/sh -c 'grep -o "abi [0-9a-f]*" /proc/ish/jit' 2>/dev/null | awk '{print $2}')
-[ -n "$ABI_REC" ] || fail "could not read the recorder's abi (/proc/ish/jit)"
-log_info "recorder abi: $ABI_REC (expected 1f3bb5a0 for this commit; a different value only means a layout changed since OpenMinis recorded — the images still match the app, which is built from the same commit)"
-if [ "$ABI_REC" != "1f3bb5a0" ]; then
-    echo -e "${YELLOW}⚠️  recorder abi is $ABI_REC, not 1f3bb5a0 — the recorded images will carry $ABI_REC and the app (same commit) will accept them; update the release tag accordingly (aot-minimal-$ABI_REC)${NC}"
+# The recorder's stderr goes to a log file, NEVER /dev/null: if the
+# recorder cannot run /bin/sh at all (e.g. ENOEXEC on a fakefs text-file
+# symlink), set -e would otherwise kill the script with nothing in the
+# log (build 6af8a072, 2026-11-15: the log stopped dead after the
+# "rootfs A" header). Capture the exit code explicitly and fail loudly.
+ABI_LOG="$WORK/recorder-abi.log"
+set +e
+ISH_JIT_PIC=1 "$I" -r "$DATA" /bin/sh -c 'grep -o "abi [0-9a-f]*" /proc/ish/jit' >"$WORK/abi.out" 2>"$ABI_LOG"
+ABI_RC=$?
+set -e
+[ "$ABI_RC" -eq 0 ] || fail "recorder failed to run /bin/sh (exit $ABI_RC; recorder stderr in $ABI_LOG: $(head -c 300 "$ABI_LOG" | tr '\n' ' '))"
+ABI_REC=$(awk '{print $2}' "$WORK/abi.out")
+[ -n "$ABI_REC" ] || fail "could not read the recorder's abi (/proc/ish/jit returned no 'abi ...' line; recorder stderr in $ABI_LOG; guest output in $WORK/abi.out)"
+# 0535d7e8 is the abi observed on device for this commit (2026-11-15,
+# cat /proc/ish/jit). jit_abi() hashes compile-time constants only, so the
+# recorder (same commit) reads the same value. A different value only means
+# a layout changed — the images still match the app (same commit); the
+# release tag and manifest always use the recorder's actual abi ($ABI_REC).
+log_info "recorder abi: $ABI_REC (device shows 0535d7e8 for this commit)"
+if [ "$ABI_REC" != "0535d7e8" ]; then
+    echo -e "${YELLOW}⚠️  recorder abi is $ABI_REC, not 0535d7e8 — the recorded images will carry $ABI_REC and the app (same commit) will accept them; the release tag is aot-minimal-$ABI_REC${NC}"
 fi
 
 # Training packages. NEVER install the openssl CLI: it upgrades libcrypto3
 # away from 3.3.2-r4 (the TLS certificates are made on the host, below).
 g 'echo nameserver 223.5.5.5 > /etc/resolv.conf; apk update >/dev/null 2>&1; apk add python3 py3-pip py3-numpy py3-matplotlib py3-requests nodejs bzip2 git ripgrep >/dev/null 2>&1; true'
-V=$(g 'apk info -v 2>/dev/null | grep -E "^(musl|busybox|zlib|libcrypto3|libssl3|pcre2|python3|py3-requests|nodejs|git|ripgrep)-[0-9]" | sort | tr "\n" " "')
+V=$(g 'apk info -v 2>/dev/null | grep -E "^(musl|busybox|zlib|libcrypto3|libssl3|pcre2|python3|py3-requests|nodejs|git|ripgrep)-[0-9]" | sort | tr "\n" " "') \
+    || fail "could not list guest packages (apk info failed — the recorder may be broken; see the output above)"
 echo "guest: $V"
 echo "$V" | grep -q "musl-$EXPECTED_MUSL" || fail "bundled musl is not $EXPECTED_MUSL: $V (update EXPECTED_MUSL)"
 echo "$V" | grep -q "busybox-$EXPECTED_BUSYBOX" || fail "bundled busybox is not $EXPECTED_BUSYBOX: $V (update EXPECTED_BUSYBOX)"
@@ -250,7 +299,10 @@ cp "$SCRIPT_DIR/aot-workloads/pcre_train.sh" "$S/minis/"
       -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ec.key -out ec.crt -days 365 \
       -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>/dev/null )
-# Host-side copy into the data dir (visible in -r mode; see the header note).
+# Host-side copy into the rootfs tree (visible in -r mode; see the header note).
+for _cert in rsa.key rsa.crt ec.key ec.crt; do
+    [ -f "$S/net/$_cert" ] || fail "host TLS certificate missing: $S/net/$_cert (openssl req failed — rerun with its stderr visible)"
+done
 cp "$S/net"/rsa.key "$S/net"/rsa.crt "$S/net"/ec.key "$S/net"/ec.crt "$DATA/tmp/aojit/net/"
 cp "$S/minis/pcre_train.sh" "$DATA/tmp/aojit/minis/"
 g 'cd /tmp/aojit/net && cat /etc/ssl/certs/ca-certificates.crt rsa.crt ec.crt > ca_bundle.pem && test -f ca_bundle.pem' \
@@ -274,11 +326,16 @@ for m in "${MODULES[@]}"; do
     ISH_JIT_PIC=1 ISH_JIT_RECORD="$rec" ISH_JIT_RECORD_MOD="$M_" \
         "$I" -r "$DATA" /bin/sh "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/rec_$m.log" || true
     grep -q FAIL "$WORK/rec_$m.log" && fail "recording run printed FAIL ($WORK/rec_$m.log)"
+    [ -f "$rec" ] || fail "$m: no recording file $rec (the recorder produced nothing; see $WORK/rec_$m.log)"
     n=$(wc -l < "$rec" | tr -d ' ')
     [ "$n" -ge "$MIN_" ] || fail "$m: only $n translations (floor $MIN_) — the workload did not run fully"
     name=$(basename "$F_" .S | sed 's/^aot_//' | tr '.-' '__')
-    python3 "$ISH_SRC/tools/jit_aot/gen.py" "$rec" "$I" "$DATA" "$WORK/$F_" --name "$name" 2>&1 | grep '✅' \
-        || fail "gen.py $m (see the log above)"
+    # gen.py's output goes to a log file, not through a grep filter: if it
+    # fails, the error must be readable (the old `| grep '✅'` swallowed it
+    # and fail() pointed at a log that did not exist).
+    python3 "$ISH_SRC/tools/jit_aot/gen.py" "$rec" "$I" "$DATA" "$WORK/$F_" --name "$name" >"$WORK/gen_$m.log" 2>&1 \
+        || fail "gen.py $m failed (see $WORK/gen_$m.log)"
+    grep -q '✅' "$WORK/gen_$m.log" || fail "gen.py $m produced no success marker (see $WORK/gen_$m.log)"
     cp "$WORK/$F_" "$AOT_DIR/$F_"
     echo "✅ $m: $n translations -> $AOT_DIR/$F_"
 done
