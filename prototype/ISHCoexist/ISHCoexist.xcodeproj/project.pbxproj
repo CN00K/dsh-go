@@ -303,6 +303,9 @@
 					"-lfakefs",
 					"-lsqlite3",
 					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); build 9 failed to link without it.
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = me.zzuu.ishcoexist;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -374,6 +377,9 @@
 					"-lfakefs",
 					"-lsqlite3",
 					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); build 9 failed to link without it.
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = me.zzuu.ishcoexist;
 				PRODUCT_NAME = "$(TARGET_NAME)";
