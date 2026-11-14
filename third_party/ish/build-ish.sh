@@ -360,8 +360,17 @@ copy_outputs() {
     cp "$ISH_SRC"/emu/arch/arm64/*.h "$ARTIFACTS/include/ish/emu/arch/arm64/" 2>/dev/null || true
     mkdir -p "$ARTIFACTS/include/ish/kernel/arch/arm64"
     cp "$ISH_SRC"/kernel/arch/arm64/*.h "$ARTIFACTS/include/ish/kernel/arch/arm64/" 2>/dev/null || true
+    # cpu-offsets.h is Meson-generated (top-level custom_target 'offsets',
+    # meson.build:73) and is a hard requirement: the prototype's JIT-crash
+    # handler takes all its offsets from ish/cpu-offsets.h. Fail loudly
+    # here instead of silently shipping a header set the prototype cannot
+    # compile against (a missing header would only surface as a confusing
+    # Xcode error a full Codemagic build later).
     if [ -f "$BUILD_DIR/cpu-offsets.h" ]; then
         cp "$BUILD_DIR/cpu-offsets.h" "$ARTIFACTS/include/ish/"
+        log_success "cpu-offsets.h staged"
+    else
+        log_error "cpu-offsets.h MISSING from $BUILD_DIR (Meson 'offsets' custom_target did not run) — the prototype requires ish/cpu-offsets.h; refusing to stage an incomplete header set."
     fi
     if [ -f "$ISH_SRC/deps/config.h" ]; then
         mkdir -p "$ARTIFACTS/include/ish/deps"
