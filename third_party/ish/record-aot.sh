@@ -134,7 +134,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-fail() { echo -e "${RED}❌ $*${NC}" >&2; exit 1; }
+fail() {
+    # Preserve the per-module dry/record/gen logs for diagnosis: they live in
+    # $WORK (a temp dir discarded after the build), but the workflow collects
+    # build-logs/*.log as artifacts, so copy them there (flat) before exiting.
+    # Guarded so an early failure (before $WORK exists) is unaffected.
+    if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+        mkdir -p "$REPO_ROOT/build-logs" 2>/dev/null || true
+        cp "$WORK"/*.log "$REPO_ROOT/build-logs/" 2>/dev/null || true
+    fi
+    echo -e "${RED}❌ $*${NC}" >&2; exit 1; }
 step() { echo; echo -e "${BLUE}==> $*${NC}"; }
 log_info()    { echo -e "${BLUE}ℹ️  $1${NC}"; }
 log_success() { echo -e "${GREEN}✅ $1${NC}"; }
@@ -339,14 +348,22 @@ for m in "${MODULES[@]}"; do
 
     step "🧪 dry run for $m: $WL_"
     "$I" -r "$DATA" /bin/sh "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/dry_$m.log" || true
-    grep -q FAIL "$WORK/dry_$m.log" && fail "dry run printed FAIL ($WORK/dry_$m.log)"
+    if grep -q FAIL "$WORK/dry_$m.log"; then
+        echo "--- FAIL lines in dry_$m.log ---" >&2
+        grep FAIL "$WORK/dry_$m.log" | head -10 >&2
+        fail "dry run printed FAIL ($WORK/dry_$m.log)"
+    fi
     for k in $OK_; do grep -q "$k" "$WORK/dry_$m.log" || fail "dry run missing '$k' ($WORK/dry_$m.log)"; done
 
     step "📼 recording $m ($M_)"
     rec="$WORK/$m.jsonl"; rm -f "$rec"
     ISH_JIT_PIC=1 ISH_JIT_RECORD="$rec" ISH_JIT_RECORD_MOD="$M_" \
         "$I" -r "$DATA" /bin/sh "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/rec_$m.log" || true
-    grep -q FAIL "$WORK/rec_$m.log" && fail "recording run printed FAIL ($WORK/rec_$m.log)"
+    if grep -q FAIL "$WORK/rec_$m.log"; then
+        echo "--- FAIL lines in rec_$m.log ---" >&2
+        grep FAIL "$WORK/rec_$m.log" | head -10 >&2
+        fail "recording run printed FAIL ($WORK/rec_$m.log)"
+    fi
     [ -f "$rec" ] || fail "$m: no recording file $rec (the recorder produced nothing; see $WORK/rec_$m.log)"
     n=$(wc -l < "$rec" | tr -d ' ')
     [ "$n" -ge "$MIN_" ] || fail "$m: only $n translations (floor $MIN_) — the workload did not run fully"
