@@ -15,6 +15,27 @@
 #      unsigned Payload/*.ipa (sideloadable via AltStore / ESign).
 #
 # No Apple signing materials are needed or used.
+#
+# Workflows:
+#   ios-unsigned          — the production unsigned IPA (engine rebuilt from
+#                           source). Unchanged since the dsh-go build.
+#   prototype-ish-coexist — stage-1 prototype App (prototype/ISHCoexist/,
+#                           scheme ISHCoexist): NodeMobile + iSH libs +
+#                           Alpine rootfs in one process. See
+#                           third_party/ish/build-ish.sh and
+#                           third_party/ish/prepare-rootfs.sh.
+#
+# Free-minutes note (Codemagic free tier: 500 min/month, partly used):
+#   The iSH build (Meson + ninja) and the rootfs conversion (fakefsify) are
+#   the expensive steps and they almost never change. Both write a manifest
+#   into app/ios/IShArtifacts/ (ish-manifest.json / rootfs-manifest.json)
+#   recording the pinned input SHA256s. The prototype workflow checks those
+#   manifests FIRST and skips the rebuild entirely when the inputs match —
+#   a re-run then costs only the Xcode build. To force a rebuild, delete
+#   app/ios/IShArtifacts/ish-manifest.json (libs) or
+#   app/ios/IShArtifacts/rootfs-manifest.json (rootfs), or run the scripts
+#   with `clean` / `--force` locally. Never delete the manifests just to
+#   "be safe": that is exactly what burns the free minutes.
 workflows:
   ios-unsigned:
     name: iOS unsigned IPA (engine rebuilt from source)
@@ -260,3 +281,160 @@ workflows:
     artifacts:
       - dsh-go-unsigned.ipa
       - build-logs/*.log
+
+  prototype-ish-coexist:
+    name: Prototype iSH coexist (NodeMobile + iSH, unsigned)
+    instance_type: mac_mini_m2
+    # 120 is provisional: the iSH Meson build + rootfs conversion have never
+    # been timed on Codemagic. Measure the first run and tighten it after.
+    # (The ios-unsigned workflow stays at 90; do not copy this number there.)
+    max_build_duration: 120
+    environment:
+      flutter: 3.47.7
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Check tools
+        script: |
+          set -euo pipefail
+          mkdir -p build-logs-ish
+          {
+            echo "== versions =="
+            xcodebuild -version
+            flutter --version
+            node --version
+            python3 --version
+            echo "== iSH build tools (brew) =="
+            for t in meson ninja; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            # VDSO toolchain: brew llvm clang + ld.lld. build-ish.sh
+            # re-checks these and fails fast if the cross link cannot work.
+            for f in /opt/homebrew/opt/llvm/bin/clang /opt/homebrew/opt/llvm/bin/ld.lld; do
+              [ -x "$f" ] || { echo "MISSING: $f (brew install llvm)"; exit 1; }
+            done
+            echo "== required tools =="
+            for t in rsync unzip zip tar curl shasum file ditto; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            echo "== disk =="
+            df -h "$PWD" | tail -1
+          } 2>&1 | tee build-logs-ish/00-tools.log
+
+      - name: Prepare NodeMobile (reuse prepare-ios.sh logic)
+        script: |
+          set -euo pipefail
+          # Same pinned NodeMobile inputs as runtime/native-node/prepare-ios.sh
+          # (version 24.20.0-0), but WITHOUT the DSH payload archive: the
+          # stage-1 prototype only needs NodeMobile itself (it runs
+          # `node -e "console.log('node ok')"`), not the full engine tree.
+          # Staged to app/ios/NativeNodeArtifacts, the same location the
+          # production flow uses — the prototype Xcode project must reference
+          # that path (retarget here if the prototype owner moves it).
+          version=24.20.0-0
+          stage=engine-build/stage-ish-proto
+          output=app/ios/NativeNodeArtifacts
+          marker="$output/.nodemobile-manifest.json"
+          if [ -f "$marker" ] \
+             && [ -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework" ] \
+             && python3 -c "import json,sys; sys.exit(0 if json.load(open('$marker')).get('version')=='$version' else 1)"; then
+            echo "NodeMobile $version already staged, skipping download"
+            exit 0
+          fi
+          mkdir -p "$stage"
+          curl --fail --location --retry 2 \
+            "https://github.com/digidem/nodejs-mobile/releases/download/v$version/nodejs-mobile-ios-$version.zip" \
+            -o "$stage/node-mobile.zip" 2>&1 | tee build-logs-ish/01-nodemobile-download.log
+          printf '%s  %s\n' f97c5f368f5982fdc062b0f97d96d7696f94dbaf286fbd0d3c515b596088bca8 "$stage/node-mobile.zip" | shasum -a 256 -c -
+          curl --fail --location --retry 2 \
+            "https://raw.githubusercontent.com/digidem/nodejs-mobile/v$version/LICENSE" \
+            -o "$stage/NodeMobile-LICENSE.txt"
+          printf '%s  %s\n' c373dabed995013e091b1908996a69a1647ef19d400e6c1fd4b7fb06d8bc0f66 "$stage/NodeMobile-LICENSE.txt" | shasum -a 256 -c -
+          unzip -q "$stage/node-mobile.zip" 'NodeMobile.xcframework/*' -d "$stage"
+          mkdir -p "$output"
+          rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
+          cp "$stage/NodeMobile-LICENSE.txt" "$output/NodeMobile-LICENSE.txt"
+          python3 -c "import json; json.dump({'version': '$version', 'zip_sha256': 'f97c5f368f5982fdc062b0f97d96d7696f94dbaf286fbd0d3c515b596088bca8', 'license_sha256': 'c373dabed995013e091b1908996a69a1647ef19d400e6c1fd4b7fb06d8bc0f66'}, open('$marker', 'w'), indent=2)"
+          test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
+          echo "NodeMobile $version staged"
+
+      - name: Build iSH libs
+        script: |
+          set -euo pipefail
+          # Skip guard: rebuild only when the pinned iSH input changed.
+          # build-ish.sh itself is idempotent (cached tarball, incremental
+          # ninja), but this guard avoids even invoking it on re-runs.
+          manifest=app/ios/IShArtifacts/ish-manifest.json
+          pinned="$(python3 -c "import json; print(json.load(open('third_party/ish/source.json'))['commit'])")"
+          if [ -f "$manifest" ] \
+             && [ -f app/ios/IShArtifacts/lib/libish.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libish_emu.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libfakefs.a ] \
+             && [ -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf ] \
+             && python3 -c "import json,sys; sys.exit(0 if json.load(open('$manifest')).get('ish_commit')=='$pinned' else 1)"; then
+            echo "iSH libs already built for commit $pinned, skipping rebuild"
+            exit 0
+          fi
+          bash third_party/ish/build-ish.sh 2>&1 | tee build-logs-ish/02-build-ish.log
+          # The script asserts the VDSO itself; re-assert here so the log
+          # shows the check even on a skipped-then-rebuilt run.
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+
+      - name: Stage iSH artifacts (rootfs)
+        script: |
+          set -euo pipefail
+          # prepare-rootfs.sh has its own manifest skip guard; this step
+          # always runs it (cheap when skipped) and then verifies the
+          # contract the prototype App depends on.
+          bash third_party/ish/prepare-rootfs.sh 2>&1 | tee build-logs-ish/03-prepare-rootfs.log
+          test -f app/ios/IShArtifacts/alpine-rootfs.zip
+          test -f app/ios/IShArtifacts/rootfs-manifest.json
+          test -f app/ios/IShArtifacts/lib/libish.a
+          test -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+          echo "IShArtifacts OK:"
+          du -sh app/ios/IShArtifacts
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/rootfs-manifest.json')); print('rootfs zip SHA256:', m['rootfs_zip_sha256'])"
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/ish-manifest.json')); print('ish commit:', m['ish_commit'], '| vdso SHA256:', m['vdso']['sha256'])"
+
+      - name: Build prototype App (xcodebuild, no codesign)
+        script: |
+          set -euo pipefail
+          # Prototype Xcode project lives in prototype/ISHCoexist/; scheme
+          # name ISHCoexist is the contract with the prototype owner.
+          # The .xcodeproj filename is discovered, not hardcoded.
+          proj="$(ls -d prototype/ISHCoexist/*.xcodeproj 2>/dev/null | head -n 1 || true)"
+          [ -n "$proj" ] || { echo "No .xcodeproj found under prototype/ISHCoexist/"; exit 1; }
+          echo "Building $proj (scheme ISHCoexist)..."
+          xcodebuild -project "$proj" -scheme ISHCoexist \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build/ish-coexist-derived \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build-logs-ish/04-xcodebuild.log
+          # Locate the built .app without assuming its product name.
+          app_path="$(find build/ish-coexist-derived/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)"
+          [ -n "$app_path" ] || { echo "No .app found in Release-iphoneos"; exit 1; }
+          echo "$app_path" > build-logs-ish/app-path.txt
+          echo "Built: $app_path"
+          du -sh "$app_path"
+
+      - name: Package prototype unsigned IPA
+        script: |
+          set -euo pipefail
+          app_path="$(cat build-logs-ish/app-path.txt)"
+          rm -rf Payload prototype-ish-coexist-unsigned.ipa
+          mkdir -p Payload
+          # ditto preserves the framework symlinks (needed for re-signing).
+          ditto "$app_path" "Payload/$(basename "$app_path")"
+          find Payload -name .DS_Store -delete || true
+          # -y stores symlinks as links (do not dereference them).
+          zip -r -y -X prototype-ish-coexist-unsigned.ipa Payload 2>&1 | tee build-logs-ish/05-package-ipa.log
+          ls -lh prototype-ish-coexist-unsigned.ipa
+          # NB: `unzip -l | head` exits 141 (SIGPIPE) under `pipefail` when
+          # head closes early, which would fail the step after a good IPA.
+          unzip -l prototype-ish-coexist-unsigned.ipa | head -n 20 || true
+
+    artifacts:
+      - prototype-ish-coexist-unsigned.ipa
+      - build-logs-ish/*.log
