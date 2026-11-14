@@ -45,10 +45,21 @@
 #   app/ios/IShArtifacts/alpine-rootfs.zip
 #   app/ios/IShArtifacts/rootfs-manifest.json   (provenance + zip SHA256)
 #
-# The zip SHA256 is NOT a fixed expected value: zip output embeds timestamps,
-# so it varies between runs. What is pinned is the INPUT tarball SHA256
-# (below); the zip SHA256 is printed and recorded in the manifest on every
-# run, so a later step can verify the exact artifact it is about to ship.
+# The zip is DETERMINISTIC: same input -> byte-identical zip -> the same
+# SHA256 on every run. The zip format embeds per-entry timestamps and
+# extra fields, and `zip -r` walks the directory in readdir order, so a
+# naive zip varies between runs — and the App's RootfsManager compares
+# the zip SHA256 against the installed marker, so any variation looks
+# like a rootfs upgrade requiring an explicit reset (build 22 device
+# test: the zip hash changed on every build, so every new build bricked
+# the terminal until reset). To keep the hash stable, create_zip_archive()
+# normalises every mtime in the tree to ROOTFS_EPOCH, feeds `zip` an
+# LC_ALL=C-sorted file list, and strips extra fields with `zip -X`.
+# fakefsify's own output (meta.db) was verified byte-identical across
+# runs, so the zip step is the only source of variation. What is pinned
+# is the INPUT tarball SHA256 (below); the zip SHA256 is printed and
+# recorded in the manifest on every run, so a later step can verify the
+# exact artifact it is about to ship.
 #
 # License note: Alpine rootfs is an aggregate of its packages' licenses
 # (musl MIT, BusyBox GPL-2.0, ...). iSH itself is GPL-3.0. See design §5.
@@ -75,6 +86,16 @@ ALPINE_URL="${ALPINE_MIRROR}/v3.21/releases/${ALPINE_ARCH}/${ALPINE_FILE}"
 #   ${ALPINE_URL}.sha256
 # and a direct download (3,851,686 bytes). Both agree.
 ALPINE_SHA256="f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
+
+# --- Deterministic zip epoch ---
+# Every mtime in the fakefs tree is normalised to this instant before
+# zipping (touch -t format, POSIX — works on GNU and BSD/macOS touch).
+# 2020-01-01 00:00:00 UTC. The guest never sees these mtimes (its
+# metadata comes from meta.db), so the value is arbitrary — it only has
+# to stay fixed. Changing it changes the zip SHA256 once, and the App
+# then treats the next build as a rootfs upgrade (explicit reset), so
+# do not change it casually.
+ROOTFS_EPOCH="202001010000.00"
 
 FORCE=0
 
@@ -301,7 +322,19 @@ create_zip_archive() {
     # The prototype App's RootfsManager unzips with a minimal ZIP reader
     # (stored/deflate only) and strips the common prefix, so the tree must
     # be zipped as a single top-level dir, same as upstream.
-    (cd "$WORK_DIR" && zip -r "$zip_file" "alpine-rootfs" \
+    # Deterministic zip (see the header comment): the App compares the zip
+    # SHA256 against the installed marker, so any byte-level variation
+    # looks like a rootfs upgrade and bricks the terminal until an
+    # explicit reset. Three sources of variation, all removed here:
+    #   1. mtimes — directory mtimes are set at extraction time and
+    #      configure_rootfs() writes files with "now" mtimes. Normalise
+    #      every entry (files, dirs, and symlinks via -h) to ROOTFS_EPOCH.
+    #   2. order — `zip -r` walks readdir order. Feed zip an
+    #      LC_ALL=C-sorted file list via -@ instead.
+    #   3. extra fields — uid/gid + extended timestamps. Strip with -X.
+    # The guest never sees these mtimes (metadata comes from meta.db).
+    find "$WORK_DIR/alpine-rootfs" -exec touch -h -t "$ROOTFS_EPOCH" {} +
+    (cd "$WORK_DIR" && find "alpine-rootfs" -print | LC_ALL=C sort | zip -X -@ "$zip_file" \
         -x "*.db-shm" \
         -x "*.db-wal" \
         > /dev/null)

@@ -133,6 +133,7 @@ class TerminalTab {
     this.writable = false,
     this.info,
     this.message,
+    this.ishResetOffered = false,
   });
 
   final String id;
@@ -150,6 +151,11 @@ class TerminalTab {
   /// Short copy for [TerminalPhase.failed].
   final String? message;
 
+  /// The failed tab offers a "reset and reinstall" button: the iSH
+  /// failure is a rootfs upgrade that only an explicit user reset can
+  /// clear (reset is never automatic).
+  final bool ishResetOffered;
+
   /// Another page or device took input over.
   bool get readOnly => phase == TerminalPhase.live && !writable;
   int? get exitCode => info?.exitCode;
@@ -162,6 +168,7 @@ class TerminalTab {
     TerminalInfo? info,
     String? message,
     bool clearMessage = false,
+    bool? ishResetOffered,
   }) => TerminalTab(
     id: id,
     terminal: terminal ?? this.terminal,
@@ -170,6 +177,7 @@ class TerminalTab {
     writable: writable ?? this.writable,
     info: info ?? this.info,
     message: clearMessage ? null : message ?? this.message,
+    ishResetOffered: ishResetOffered ?? this.ishResetOffered,
   );
 }
 
@@ -260,6 +268,23 @@ abstract final class TerminalCopy {
         return 'iSH 未启动，请重试（重试时会先启动 iSH）';
     }
   }
+
+  /// True when the iSH failure is a rootfs upgrade that needs an explicit
+  /// user reset (never automatic): the bundled zip changed, so the
+  /// installed rootfs refuses to boot until reset() reinstalls it
+  /// (build 22 device test: the zip hash changed on every build, so
+  /// every new build hit this until reset).
+  static bool needsRootfsReset(IshStatus status) =>
+      status.phase == IshPhase.error &&
+      (status.error?.startsWith('ish_rootfs_upgrade_requires_reset') ?? false);
+
+  /// Label for the reset button on a failed tab.
+  static String get ishResetAction => '重置并重装';
+
+  /// Copy for the reset button: resetting only wipes the Linux sandbox
+  /// and reinstalls the bundled rootfs; chat history in the app is
+  /// untouched.
+  static String get ishResetNote => '重置只会清除 Linux 沙箱并用新版 rootfs 重装，不影响 App 里的聊天记录。';
 
   static String? _bootErrorText(Object? error) {
     if (error == null) return null;
@@ -501,6 +526,26 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     }
   }
 
+  /// Resets the iSH rootfs at the user's explicit tap (the failed tab
+  /// offers this only for a rootfs upgrade) and retries the tab.
+  /// Reset never happens automatically: it only runs from this button.
+  /// The kernel never booted in this state, so reset() is allowed; the
+  /// retry's pre-flight then reinstalls from the bundled zip and boots.
+  /// Guest /root is kept (there is nothing to back up yet — the guest
+  /// never booted — but the safe call keeps a later user's data).
+  Future<void> resetIshAndRetry(String id) async {
+    final tab = _tab(id);
+    if (tab == null || tab.phase != TerminalPhase.failed) return;
+    _update(id, (t) => t.copyWith(phase: TerminalPhase.starting, clearMessage: true, ishResetOffered: false));
+    try {
+      await ref.read(ishRuntimeProvider.notifier).reset(keepUserData: true);
+    } on Object {
+      // Reset refused (e.g. the kernel booted after all): fall through
+      // to the normal retry so the fresh diagnosis shows what is wrong.
+    }
+    await _create(id);
+  }
+
   /// Ends the terminal on the Host and drops the tab.
   void closeTab(String id) {
     final index = state.tabs.indexWhere((t) => t.id == id);
@@ -723,7 +768,7 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     final link = _links[id];
     if (backend == null || link == null) return;
     final epoch = _epoch;
-    _update(id, (t) => t.copyWith(phase: TerminalPhase.starting, clearMessage: true));
+    _update(id, (t) => t.copyWith(phase: TerminalPhase.starting, clearMessage: true, ishResetOffered: false));
     final environment = state.environment ?? TerminalEnvironment.defaults;
     try {
       // The iSH guest must be up before the shell can spawn: boot it
@@ -732,7 +777,12 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       final ishFailure = await _ensureIshBooted(epoch);
       if (_stale(epoch) || !_links.containsKey(id)) return;
       if (ishFailure != null) {
-        _update(id, (t) => t.copyWith(phase: TerminalPhase.failed, message: ishFailure));
+        final ishStatus = ref.read(ishRuntimeProvider).status;
+        _update(id, (t) => t.copyWith(
+          phase: TerminalPhase.failed,
+          message: ishFailure,
+          ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
+        ));
         return;
       }
       final shellPath = link.shellPath ?? await _preferredShell(backend);
@@ -850,13 +900,15 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
           // Attached after the shell already died: the snapshot's
           // screen holds the bridge line when the shell never ran.
           if (!info.running && (screen?.contains(_ishBridgeUnavailableMarker) ?? false)) {
+            final ishStatus = ref.read(ishRuntimeProvider).status;
             return t.copyWith(
               terminal: _emulator(id, info, screen),
               info: info,
               title: info.title,
               phase: TerminalPhase.failed,
               writable: false,
-              message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+              message: TerminalCopy.ishDiagnosis(ishStatus, null),
+              ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
             );
           }
           return t.copyWith(
@@ -880,12 +932,14 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
             );
           }
           if (_endedForBridgeUnavailable(t)) {
+            final ishStatus = ref.read(ishRuntimeProvider).status;
             return t.copyWith(
               info: info,
               title: info.title,
               phase: TerminalPhase.failed,
               writable: false,
-              message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+              message: TerminalCopy.ishDiagnosis(ishStatus, null),
+              ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
             );
           }
           return t.copyWith(info: info, title: info.title, phase: TerminalPhase.ended, writable: writable);
@@ -914,10 +968,12 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
     link.detach();
     _update(link.id, (t) {
       if (_endedForBridgeUnavailable(t)) {
+        final ishStatus = ref.read(ishRuntimeProvider).status;
         return t.copyWith(
           phase: TerminalPhase.failed,
           writable: false,
-          message: TerminalCopy.ishDiagnosis(ref.read(ishRuntimeProvider).status, null),
+          message: TerminalCopy.ishDiagnosis(ishStatus, null),
+          ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
         );
       }
       return t.copyWith(phase: TerminalPhase.ended, writable: false);
