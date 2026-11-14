@@ -110,9 +110,13 @@ check_prerequisites() {
         log_error "Homebrew is required to install llvm/ninja/libarchive/meson. Install it from https://brew.sh first."
     fi
 
-    # llvm provides the VDSO cross clang AND ld.lld; ninja/meson/libarchive
-    # are the build tools. Install whatever is missing, then re-check.
-    for pkg in llvm ninja libarchive meson; do
+    # llvm provides the VDSO cross clang; lld provides ld.lld (the ELF
+    # linker for the aarch64-linux-gnu VDSO). Newer Homebrew splits lld out
+    # of the llvm formula, so install both — relying on llvm alone leaves
+    # ld.lld missing and the VDSO check fails (build 2 hit exactly this).
+    # ninja/meson/libarchive are the build tools. Install whatever is
+    # missing, then re-check.
+    for pkg in llvm lld ninja libarchive meson; do
         if brew list "$pkg" >/dev/null 2>&1; then
             log_info "brew package present: $pkg"
         else
@@ -146,10 +150,15 @@ check_vdso_toolchain() {
     [ -n "$LLVM_CLANG" ] || log_error "No brew LLVM clang found (looked in /opt/homebrew, /usr/local, /opt/local). Run: brew install llvm"
 
     LLVM_LLD=""
-    for lld_path in "/opt/homebrew/opt/llvm/bin/ld.lld" "/usr/local/opt/llvm/bin/ld.lld" "/opt/local/bin/ld.lld"; do
+    # ld.lld ships either inside the llvm formula or (newer Homebrew) in
+    # the separate lld formula. Check both, plus PATH as a last resort.
+    for lld_path in "/opt/homebrew/opt/llvm/bin/ld.lld" "/usr/local/opt/llvm/bin/ld.lld" "/opt/local/bin/ld.lld" "/opt/homebrew/opt/lld/bin/ld.lld" "/usr/local/opt/lld/bin/ld.lld"; do
         if [ -x "$lld_path" ]; then LLVM_LLD="$lld_path"; break; fi
     done
-    [ -n "$LLVM_LLD" ] || log_error "ld.lld not found next to brew LLVM clang. Reinstall llvm (brew reinstall llvm); lld ships inside the llvm formula."
+    if [ -z "$LLVM_LLD" ] && command -v ld.lld >/dev/null 2>&1; then
+        LLVM_LLD="$(command -v ld.lld)"
+    fi
+    [ -n "$LLVM_LLD" ] || log_error "ld.lld not found (looked in llvm + lld formula paths and PATH). Run: brew install lld (and brew reinstall llvm if the llvm formula is stale); lld ships the ELF linker the aarch64 VDSO needs."
 
     log_info "VDSO clang: $LLVM_CLANG"
     log_info "VDSO lld:   $LLVM_LLD"
