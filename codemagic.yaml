@@ -787,6 +787,28 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
+      - name: Install recording deps
+        script: |
+          set -euo pipefail
+          # Same brew set as the iSH lib build (llvm/ninja/libarchive/meson).
+          # The recorder is a macOS CLI (host build); llvm is needed for the
+          # VDSO check inside build-ish.sh's prerequisites, which
+          # record-aot.sh does not call — but prepare-rootfs.sh needs
+          # fakefsify, built from the ish source with the host meson build.
+          # NOTE: this step MUST run before "Check tools": meson/ninja are
+          # not pre-installed on the Codemagic image, so checking first
+          # fails with "MISSING: meson" (build 6af89d00, 2026-11-15).
+          for pkg in llvm lld ninja libarchive meson; do
+            if brew list "$pkg" >/dev/null 2>&1; then
+              echo "brew package present: $pkg"
+            else
+              echo "Installing brew package: $pkg ..."
+              brew install "$pkg"
+            fi
+          done
+          command -v meson >/dev/null || { echo "meson not found after brew install"; exit 1; }
+          command -v ninja >/dev/null || { echo "ninja not found after brew install"; exit 1; }
+
       - name: Check tools
         script: |
           set -euo pipefail
@@ -803,25 +825,6 @@ workflows:
             echo "== disk =="
             df -h "$PWD" | tail -1
           } 2>&1 | tee build-logs/00-tools.log
-
-      - name: Install recording deps
-        script: |
-          set -euo pipefail
-          # Same brew set as the iSH lib build (llvm/ninja/libarchive/meson).
-          # The recorder is a macOS CLI (host build); llvm is needed for the
-          # VDSO check inside build-ish.sh's prerequisites, which
-          # record-aot.sh does not call — but prepare-rootfs.sh needs
-          # fakefsify, built from the ish source with the host meson build.
-          for pkg in llvm lld ninja libarchive meson; do
-            if brew list "$pkg" >/dev/null 2>&1; then
-              echo "brew package present: $pkg"
-            else
-              echo "Installing brew package: $pkg ..."
-              brew install "$pkg"
-            fi
-          done
-          command -v meson >/dev/null || { echo "meson not found after brew install"; exit 1; }
-          command -v ninja >/dev/null || { echo "ninja not found after brew install"; exit 1; }
 
       - name: Record minimal AOT set
         script: |
