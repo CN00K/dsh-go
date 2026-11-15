@@ -269,18 +269,23 @@ abstract final class TerminalCopy {
     }
   }
 
-  /// True when the failed tab should offer the reset button: any iSH
-  /// boot failure, not only a rootfs upgrade. The reset (reset() with
-  /// keepUserData) only wipes the Linux sandbox and reinstalls the
-  /// bundled rootfs; chat history in the app is untouched. It is the
-  /// recovery for an unbootable iSH state — e.g. build 25 (2026-11-15):
-  /// the AOT images crashed the kernel on boot and left the rootfs /
-  /// runtime state corrupted, so even the stub build 24 could no
-  /// longer boot; retry and app restart did not help, only a reset
-  /// (reinstall from the bundled zip) can recover. Reset never
-  /// happens automatically: it only runs from this button.
-  static bool needsRootfsReset(IshStatus status) =>
-      status.phase == IshPhase.error;
+  /// True when the failed tab should offer the reset button. This is
+  /// only ever called for a terminal tab that already failed for an
+  /// iSH-related reason, so the answer is always yes: the reset
+  /// (reset() with keepUserData) only wipes the Linux sandbox and
+  /// reinstalls the bundled rootfs; chat history in the app is
+  /// untouched. It is the recovery for an unbootable iSH state — e.g.
+  /// build 25 (2026-11-15): the AOT images crashed the kernel on boot
+  /// and left the rootfs / runtime state corrupted, so even the stub
+  /// build 24 could no longer boot; retry and app restart did not
+  /// help, only a reset (reinstall from the bundled zip) can recover.
+  /// Reset never happens automatically: it only runs from this button.
+  /// (Fix 2, 2026-11-15: the first version only returned true for
+  /// IshPhase.error, but the iSH phase is often not `error` when the
+  /// terminal fails — e.g. stuck `booting`, or `stopped` after a
+  /// crash — so the button never appeared. And two backend.create
+  /// failure paths never set ishResetOffered at all.)
+  static bool needsRootfsReset(IshStatus status) => true;
 
   /// Label for the reset button on a failed tab.
   static String get ishResetAction => '重置并重装';
@@ -811,10 +816,25 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
         'TERMINAL_DISABLED' => TerminalCopy.disabledOnHost,
         _ => TerminalCopy.startFailed,
       };
-      _update(id, (t) => t.copyWith(phase: TerminalPhase.failed, message: message));
+      // Offer the reset button for the generic start failure (the
+      // iSH / bridge is down), but not for limit / disabled-on-host,
+      // where a reset is meaningless. (Fix 2, 2026-11-15: this path
+      // never set ishResetOffered, so build 26 showed no reset
+      // button even though the terminal failed.)
+      _update(id, (t) => t.copyWith(
+            phase: TerminalPhase.failed,
+            message: message,
+            ishResetOffered: message == TerminalCopy.startFailed,
+          ));
     } on Object {
       if (_stale(epoch)) return;
-      _update(id, (t) => t.copyWith(phase: TerminalPhase.failed, message: TerminalCopy.offline));
+      // The backend could not create the terminal (bridge / iSH
+      // unreachable): offer the reset, it is the recovery path.
+      _update(id, (t) => t.copyWith(
+            phase: TerminalPhase.failed,
+            message: TerminalCopy.offline,
+            ishResetOffered: true,
+          ));
     }
   }
 
