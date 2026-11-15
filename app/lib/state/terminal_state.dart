@@ -273,11 +273,18 @@ abstract final class TerminalCopy {
   /// e.g. `iSH: booting` or `iSH: error (ish_boot_timeout: ...)` or
   /// `iSH: running`. Shown under the failure message so a device test
   /// reveals where the boot is stuck, instead of the bare generic line.
+  /// Build 31 adds the loopback service state: the kernel can be
+  /// "running" while the loopback service is down (no token file), which
+  /// is the bridge failure that shows a bare generic error.
   static String ishStatusLine(IshStatus status) {
     final err = status.error;
-    return err == null || err.isEmpty
+    final base = err == null || err.isEmpty
         ? 'iSH: ${status.phase.name}'
         : 'iSH: ${status.phase.name} ($err)';
+    final loopback = status.loopbackRunning
+        ? 'loopback up :${status.loopbackPort}'
+        : 'loopback DOWN';
+    return '$base, $loopback';
   }
 
   /// True when the failed tab should offer the reset button. This is
@@ -710,6 +717,19 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
   /// deterministic boot trigger the auto-boot path cannot guarantee:
   /// opening a terminal always tries once, and a failure shows the
   /// iSH phase + native error code (stage 3, build 21).
+  /// Re-reads the native iSH status (build 31 diagnostic). The cached
+  /// status is from boot time, before the loopback service started, so
+  /// reading it without a refresh would report a stale loopback flag.
+  /// refresh() never throws.
+  Future<IshStatus> _freshIshStatus() async {
+    try {
+      await ref.read(ishRuntimeProvider.notifier).refresh();
+    } catch (_) {
+      // refresh() is already fail-safe; keep the cached status on error.
+    }
+    return ref.read(ishRuntimeProvider).status;
+  }
+
   Future<String?> _ensureIshBooted(int epoch) async {
     final ish = ref.read(ishRuntimeProvider.notifier);
     var status = ref.read(ishRuntimeProvider).status;
@@ -798,7 +818,7 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       final ishFailure = await _ensureIshBooted(epoch);
       if (_stale(epoch) || !_links.containsKey(id)) return;
       if (ishFailure != null) {
-        final ishStatus = ref.read(ishRuntimeProvider).status;
+        final ishStatus = await _freshIshStatus();
         _update(id, (t) => t.copyWith(
           phase: TerminalPhase.failed,
           message: '$ishFailure\n${TerminalCopy.ishStatusLine(ishStatus)}',
@@ -835,9 +855,12 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       // Diagnostic (build 30): append the raw iSH phase so the
       // failure page shows where it is stuck (booting? running?
       // error?) instead of the bare generic line.
+      // Build 31: refresh first — the cached status is from boot time
+      // (before the loopback service started), so the loopback flag
+      // would be stale without it. refresh() never throws.
       final showIsh = message == TerminalCopy.startFailed;
       final ishLine = showIsh
-          ? '\n${TerminalCopy.ishStatusLine(ref.read(ishRuntimeProvider).status)}'
+          ? '\n${TerminalCopy.ishStatusLine(await _freshIshStatus())}'
           : '';
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
@@ -849,10 +872,11 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       // The backend could not create the terminal (bridge / iSH
       // unreachable): offer the reset, it is the recovery path.
       // Diagnostic (build 30): append the raw iSH phase.
+      // Build 31: refresh first so the loopback flag is fresh.
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
             message:
-                '${TerminalCopy.offline}\n${TerminalCopy.ishStatusLine(ref.read(ishRuntimeProvider).status)}',
+                '${TerminalCopy.offline}\n${TerminalCopy.ishStatusLine(await _freshIshStatus())}',
             ishResetOffered: true,
           ));
     }

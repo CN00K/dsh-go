@@ -147,6 +147,16 @@ import Foundation
     ]
     if let hash = RootfsManager.installedHash() { value["rootfsVersion"] = hash }
     if let error = lastError { value["error"] = error }
+    // Diagnostic (build 31): loopback service state. The kernel can be
+    // "running" while the loopback service is down (no token file), which
+    // makes backend.create fail with a bare generic error — the failure
+    // page then shows `iSH: running` with no hint why. Expose it here so
+    // the Dart failure page can tell the bridge path apart from the kernel.
+    value["loopbackRunning"] = IShLoopbackService.shared.isRunning
+    if let info = IShLoopbackService.shared.serviceInfo,
+       let port = info["port"] as? Int, port > 0 {
+      value["loopbackPort"] = port
+    }
     return value
   }
 

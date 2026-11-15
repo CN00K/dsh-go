@@ -93,6 +93,8 @@ class IshStatus {
     this.guestProcessCount = 0,
     this.governors = const IshGovernors(),
     this.error,
+    this.loopbackRunning = false,
+    this.loopbackPort = 0,
   });
 
   const IshStatus.unknown() : this(phase: IshPhase.notInstalled);
@@ -111,6 +113,8 @@ class IshStatus {
       final String message => message,
       _ => null,
     },
+    loopbackRunning: map['loopbackRunning'] == true,
+    loopbackPort: (map['loopbackPort'] as num?)?.toInt() ?? 0,
   );
 
   final IshPhase phase;
@@ -139,6 +143,15 @@ class IshStatus {
   final IshGovernors governors;
 
   final String? error;
+
+  /// The loopback service (IShLoopbackService) is up and listening, so
+  /// Node's ish-bridge can reach the guest. Diagnostic (build 31): the
+  /// kernel can be "running" while this is false (no token file), which
+  /// is exactly the failure that shows a bare generic error.
+  final bool loopbackRunning;
+
+  /// The loopback service's ephemeral port (0 when down).
+  final int loopbackPort;
 
   bool get isRunning => phase == IshPhase.running;
 
