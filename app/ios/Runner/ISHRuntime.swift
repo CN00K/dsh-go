@@ -221,6 +221,27 @@ import Foundation
     case "status":
       result(status)
       return
+    case "ensureWorkspace":
+      // (Build 46) NOT a lifecycle operation: do not go through the
+      // lifecycleBusy guard. The gateway validates the host workspace
+      // directory when a terminal is created, and creating it only at
+      // boot time is not enough — the boot can be skipped (the
+      // already-running wait / ish_busy paths in Dart never call it)
+      // or the directory can disappear after boot, and then every
+      // terminal fails with "working-directory: directory does not
+      // exist" even though the kernel and loopback are up (build 45
+      // device test 23:47). This is idempotent and fast (mkdir +
+      // fileExists + bind-mount, the mount staying non-fatal), so it
+      // is safe to run on demand right before backend.create.
+      // Fails loudly with ish_workspace_missing when the directory
+      // cannot be created, instead of letting the gateway fail
+      // cryptically later.
+      guard ensureHostWorkspace() else {
+        failWorkspaceMissing(result: result)
+        return
+      }
+      result(nil)
+      return
     case "boot", "stop", "restart", "reset":
       break // Async lifecycle work below.
     default:

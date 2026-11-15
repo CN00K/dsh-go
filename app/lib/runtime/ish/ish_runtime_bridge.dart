@@ -68,6 +68,11 @@ final class IshRuntimeBridge {
   /// Idempotent; installs the rootfs on first use, then boots the kernel.
   Future<void> boot() => _service.boot();
 
+  /// Ensure the host workspace directory exists right now (build 46).
+  /// Idempotent; called immediately before backend.create so the
+  /// gateway always sees an existing working directory.
+  Future<void> ensureWorkspace() => _service.ensureWorkspace();
+
   /// Stops the guest only; the app lives and a later boot() works again.
   Future<void> stop() => _service.stop();
 

@@ -846,6 +846,39 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       await _measured();
       if (_stale(epoch) || !_links.containsKey(id)) return;
       final (cols, rows) = _viewSize ?? (80, 24);
+      // (Build 46) Ensure the host workspace directory exists
+      // IMMEDIATELY before the gateway validates it. Creating it only
+      // at boot time is not enough: the boot can be skipped (the
+      // already-running wait / ish_busy paths never call it) or the
+      // directory can disappear after boot, and then every terminal
+      // fails with "gateway/internal: working-directory: directory
+      // does not exist" even though the kernel and loopback are up
+      // (build 45 device test 23:47). ensureWorkspace() is idempotent
+      // and fast, so it runs on every terminal open. If the directory
+      // truly cannot be created, fail here with the clear reason
+      // instead of letting the gateway fail cryptically.
+      try {
+        await ref.read(ishRuntimeProvider.notifier).ensureWorkspace();
+      } on PlatformException catch (error) {
+        // No `dsh/ish` channel in this build (unit tests, or a build
+        // without the iSH plugin): there is no workspace to ensure, so
+        // keep the old behaviour and let the terminal open as before.
+        if (error.code == 'ish_not_linked') {
+          // Fall through to backend.create below.
+        } else {
+          if (_stale(epoch) || !_links.containsKey(id)) return;
+          final ishStatus = await _freshIshStatus();
+          final reason = error.code == 'ish_workspace_missing'
+              ? error.message ?? '工作目录创建失败，终端无法启动'
+              : TerminalCopy.ishDiagnosis(ishStatus, error);
+          _update(id, (t) => t.copyWith(
+                phase: TerminalPhase.failed,
+                message: '$reason\n${TerminalCopy.ishStatusLine(ishStatus)}',
+                ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
+              ));
+          return;
+        }
+      }
       final info = await backend.create(
         id,
         cols: cols.clamp(2, environment.maxCols),

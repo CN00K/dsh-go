@@ -214,6 +214,19 @@ final class IshRuntimeService {
   /// Installs the rootfs on first use, then boots the kernel.
   Future<void> boot() => _invoke('boot');
 
+  /// Ensure the host workspace directory (NativeNode/home/workspace)
+  /// exists and is bind-mounted into the guest, RIGHT NOW. Idempotent
+  /// and fast. (Build 46) The gateway validates this directory when
+  /// creating a terminal; creating it only at boot time is not enough
+  /// — the boot can be skipped (already-running wait / ish_busy paths)
+  /// or the directory can disappear after boot, and then every
+  /// terminal fails with "working-directory: directory does not
+  /// exist" even though the kernel and loopback are up (build 45
+  /// device test 23:47). TerminalState calls this immediately before
+  /// backend.create so the gateway always sees an existing directory.
+  /// Throws ish_workspace_missing when the directory cannot be created.
+  Future<void> ensureWorkspace() => _invoke('ensureWorkspace');
+
   /// Stops the guest (kills pid >= 2). The kernel stays booted; a later
   /// boot() works without relaunching the app.
   Future<void> stop() => _invoke('stop');
