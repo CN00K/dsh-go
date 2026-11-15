@@ -982,13 +982,13 @@ private final class WSConnection {
 
   private func handleFrame(fin: Bool, opcode: UInt8, payload: Data) {
     switch opcode {
-    case 0x8: // Close — echo the code, then close.
+    case 0x8: // Close — echo the code, then close (waits for the
+      // echo frame to flush before tearing down the connection).
       var code: UInt16 = 1000
       if payload.count >= 2 {
         code = UInt16(payload[0]) << 8 | UInt16(payload[1])
       }
-      sendCloseFrame(code: code)
-      closeLocal()
+      close(code: code, reason: "client requested close")
       return
     case 0x9: // Ping — reply pong with the same payload.
       sendFrame(opcode: 0xA, payload: payload)
@@ -1047,7 +1047,7 @@ private final class WSConnection {
     sendFrame(opcode: 0x2, payload: data)
   }
 
-  private func sendFrame(opcode: UInt8, payload: Data) {
+  private func sendFrame(opcode: UInt8, payload: Data, completion: @escaping () -> Void = {}) {
     var header = Data()
     header.append(0x80 | opcode) // FIN + opcode.
     let count = payload.count
@@ -1066,23 +1066,36 @@ private final class WSConnection {
     }
     var frame = header
     frame.append(payload)
-    httpConnection?.send(frame)
+    guard let httpConnection else { completion(); return }
+    httpConnection.send(frame, completion: completion)
   }
 
-  private func sendCloseFrame(code: UInt16) {
+  private func sendCloseFrame(code: UInt16, completion: @escaping () -> Void = {}) {
     var payload = Data()
     payload.append(UInt8((code >> 8) & 0xFF))
     payload.append(UInt8(code & 0xFF))
-    sendFrame(opcode: 0x8, payload: payload)
+    sendFrame(opcode: 0x8, payload: payload, completion: completion)
   }
 
   /// Send a close frame (if not already closed) and close the
-  /// connection. Idempotent.
+  /// connection. The TCP teardown waits until the close frame has
+  /// been handed to the network stack: cancelling the connection
+  /// synchronously right after enqueueing the frame (the old code)
+  /// discarded the frame, so the client saw `read ECONNRESET`
+  /// instead of the intended close code (e.g. 1008 "another pty
+  /// session is active"). A 2 s fallback tears down anyway, so a
+  /// stuck send can never leak the connection or the shell.
+  /// Idempotent.
   func close(code: UInt16, reason: String) {
     guard !closed else { return }
+    closed = true
     NSLog("ish-loopback: closing pty websocket (code \(code)): \(reason)")
-    sendCloseFrame(code: code)
-    closeLocal()
+    service?.workQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+      self?.tearDown()
+    }
+    sendCloseFrame(code: code) { [weak self] in
+      self?.tearDown()
+    }
   }
 
   /// Close from the local side (service stopping / shell exited /
@@ -1090,6 +1103,12 @@ private final class WSConnection {
   func closeLocal() {
     guard !closed else { return }
     closed = true
+    tearDown()
+  }
+
+  /// Shared teardown: kill the shell's process group, drop the
+  /// session, close the HTTP connection. Idempotent.
+  private func tearDown() {
     ptySession?.close(reason: "websocket closed")
     ptySession = nil
     httpConnection?.close()

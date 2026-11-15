@@ -998,14 +998,12 @@ export class IshPtyTerminal {
       }
       return;
     }
-    // Shell is up. Size it, then move it into the session directory
-    // (the WS has no cwd parameter, so the first input is a cd; it is
-    // echoed once in the scrollback, which is acceptable for v1).
+    // Shell is up. Size it. No default cd: the shell starts in its
+    // own default directory; the user cds where they want. (The old
+    // code sent `cd -- '<session cwd>'` as the first input, which
+    // echoed in the scrollback and forced every terminal into
+    // /home/workspace.)
     ws.sendText(JSON.stringify({type: 'resize', cols: this._cols, rows: this._rows}));
-    const guestCwd = toGuest(this._options.cwd ?? process.cwd());
-    if (guestCwd && guestCwd !== '/') {
-      ws.sendBinary(Buffer.from(`cd -- '${guestCwd.replaceAll("'", "'\\''")}'\n`, 'utf8'));
-    }
   }
 
   _emitData(text) {

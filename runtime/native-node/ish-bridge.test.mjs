@@ -476,9 +476,10 @@ test('ishPtySpawn forwards input and output as raw bytes', async () => {
     const received = [];
     term.onData((data) => received.push(data));
     await term.ready;
-    // The shim sends a cd to the session cwd on open; the mock echoes it.
+    // No default cd on open: the shell starts in its own default
+    // directory (the mock echoes nothing back).
     await new Promise((done) => setTimeout(done, 200));
-    assert.ok(received.join('').includes("cd -- '/home/workspace'"), `expected cd in ${JSON.stringify(received)}`);
+    assert.ok(!received.join('').includes("cd -- '/home/workspace'"), `unexpected cd in ${JSON.stringify(received)}`);
     received.length = 0;
     term.write('ls\n');
     await new Promise((done) => setTimeout(done, 200));
