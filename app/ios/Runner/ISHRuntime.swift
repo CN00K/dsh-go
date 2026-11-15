@@ -275,6 +275,15 @@ import Foundation
       // needed. Only if the restore itself fails do we fall back to
       // the restart error.
       if RootfsManager.criticalFilesPresent() {
+        // (Build 42) The loopback service must be (re)started here:
+        // performReset stops it (listener.cancel(), token file
+        // removed), and this early-return branch used to skip the
+        // start() call that only the fresh-boot path made — so after
+        // a Reset the loopback stayed cancelled forever and the
+        // terminal failed with "iSH: running, loopback DOWN
+        // (state=cancelled)" (build 41 device test 22:03). start()
+        // is idempotent (no-op when already running).
+        IShLoopbackService.shared.start()
         DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
         finish(result, nil)
         return
@@ -293,6 +302,9 @@ import Foundation
         finish(result, error("ish_rootfs_broken_restart_app", message))
         return
       }
+      // (Build 42) Same as above: restart the loopback service, which
+      // a Reset may have stopped. start() is idempotent.
+      IShLoopbackService.shared.start()
       DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
       finish(result, nil)
       return
