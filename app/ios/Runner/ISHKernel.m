@@ -740,6 +740,29 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         } else {
             NSLog(@"ISHKernel: rootfs deleted synchronously; next boot reinstalls from the bundled zip");
         }
+        // (Build 38) Verify the delete actually took: the kernel still
+        // has the rootfs mounted and pid 1 parked on it, so the delete
+        // can fail or be partial while the caller still reports
+        // success — then the next boot sees the stale markers and
+        // returns .alreadyInstalled on a broken tree. If the tree is
+        // still there, rename it out of the way (same fallback as
+        // RootfsManager.clearBrokenInstall) so ensureInstalled is
+        // forced to re-extract.
+        if ([[NSFileManager defaultManager] fileExistsAtPath:rootfs]) {
+            NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+            fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+            fmt.dateFormat = @"yyyyMMdd-HHmmss";
+            NSString *stamp = [fmt stringFromDate:[NSDate date]];
+            NSString *parent = [rootfs stringByDeletingLastPathComponent];
+            NSString *broken = [parent stringByAppendingPathComponent:
+                [NSString stringWithFormat:@".rootfs-broken-%@", stamp]];
+            NSError *renameError = nil;
+            if ([[NSFileManager defaultManager] moveItemAtPath:rootfs toPath:broken error:&renameError]) {
+                NSLog(@"ISHKernel: rootfs delete incomplete, renamed to %@", [broken lastPathComponent]);
+            } else {
+                NSLog(@"ISHKernel: rootfs delete AND rename failed (%@) — next boot may reuse a broken tree", renameError);
+            }
+        }
     }
 }
 

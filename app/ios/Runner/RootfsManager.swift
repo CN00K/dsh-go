@@ -85,6 +85,30 @@ struct RootfsManager {
     static var readyURL: URL { rootfsURL.appendingPathComponent(".ready") }
     static var hashURL: URL { rootfsURL.appendingPathComponent(".zip-sha256") }
 
+    /// Critical guest files the terminal needs to spawn a shell.
+    /// A rootfs that lost these (partial delete, interrupted reset,
+    /// corrupted extraction) still passes isInstalled + the hash
+    /// marker, so the kernel boots fine (phase=running, loopback up)
+    /// but do_execve("/bin/sh") fails and every terminal open dies
+    /// with close 1011 — while a reinstall is a no-op because the
+    /// hash matches. (Builds 25–37: terminal dead since build 25,
+    /// build 24 reinstalled also failed, reset did not help.)
+    /// Verified here so a broken tree is re-extracted, not booted.
+    static var criticalGuestFiles: [String] {
+        ["bin/sh", "bin/busybox"]
+    }
+
+    /// True when every critical guest file exists under data/.
+    static func criticalFilesPresent() -> Bool {
+        let fm = FileManager.default
+        for rel in criticalGuestFiles {
+            if !fm.fileExists(atPath: dataURL.appendingPathComponent(rel).path) {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Installed = data/ exists, .arch reads "aarch64", and .ready
     /// exists (written last, so a crash mid-install is detected).
     static var isInstalled: Bool {
@@ -135,11 +159,21 @@ struct RootfsManager {
         reportProgress(progress, 0.05)
         if isInstalled {
             if installedHash() == hash {
-                reportProgress(progress, 1.0)
-                return .alreadyInstalled
+                // Self-healing (build 38): the hash marker only proves
+                // the zip is the same, not that the extracted tree is
+                // intact. A tree missing bin/sh or bin/busybox boots
+                // fine but can never spawn a shell (close 1011 on every
+                // terminal open). Re-extract instead of booting it.
+                if criticalFilesPresent() {
+                    reportProgress(progress, 1.0)
+                    return .alreadyInstalled
+                }
+                NSLog("RootfsManager: 已安装但缺关键文件 (bin/sh 或 bin/busybox)，重新解压")
+                try clearBrokenInstall()
+            } else {
+                throw RootfsError.upgradeRequiresReset(currentHash: installedHash() ?? "(无)",
+                                                       newHash: hash)
             }
-            throw RootfsError.upgradeRequiresReset(currentHash: installedHash() ?? "(无)",
-                                                   newHash: hash)
         }
         // A broken / partial install is in the way: clear it (rename to
         // .rootfs-broken-<timestamp> when a delete fails) before
