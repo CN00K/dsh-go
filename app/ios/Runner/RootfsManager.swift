@@ -281,6 +281,67 @@ struct RootfsManager {
         try? clearBrokenInstall()
     }
 
+    /// (Build 40) Restores ONLY the critical guest files that are
+    /// missing (or truncated) from the bundled zip, in place, without
+    /// touching meta.db and without deleting anything. Safe to call
+    /// while the kernel is booted: the kernel reads guest files on
+    /// demand through fakefs, so restoring the missing files lets the
+    /// next shell spawn succeed. The shipped meta.db already records
+    /// the correct modes (bin/sh is a symlink, busybox/ld-musl are
+    /// 0755), so it is left alone — replacing it under a running
+    /// kernel would risk SQLite inconsistency.
+    ///
+    /// This is the recovery for a tree that was deleted while booted
+    /// (e.g. the user pressed Reset while the kernel was up): the old
+    /// build-39 path deleted the tree and asked for an app restart,
+    /// but tapping the app icon does not kill the process, so the
+    /// kernel stayed booted, the files stayed gone, and the restart
+    /// error fired forever. Restoring in place needs no restart.
+    static func restoreMissingFiles() throws {
+        let fm = FileManager.default
+        // Which critical files actually need restoring?
+        var missing: [String] = []
+        for rel in criticalGuestFiles {
+            let path = dataURL.appendingPathComponent(rel).path
+            var needsRestore = !fm.fileExists(atPath: path)
+            if !needsRestore, let min = criticalGuestMinSizes[rel] {
+                if let attrs = try? fm.attributesOfItem(atPath: path),
+                   let size = attrs[.size] as? UInt64, size < min {
+                    needsRestore = true
+                }
+            }
+            if needsRestore { missing.append(rel) }
+        }
+        guard !missing.isEmpty else { return }
+        NSLog("RootfsManager: 内核运行中，补回缺失的关键文件：%@", missing.joined(separator: ", "))
+        let zip = try resolveZipURL(nil)
+        let zipData = try Data(contentsOf: zip)
+        let tmp = ishDirURL
+            .appendingPathComponent(".tmp-rootfs-restore-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: ishDirURL, withIntermediateDirectories: true,
+                               attributes: [.posixPermissions: 0o700])
+        try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tmp) }
+        try extract(zipData: zipData, to: tmp)
+        for rel in missing {
+            let src = tmp.appendingPathComponent("data").appendingPathComponent(rel)
+            let dst = dataURL.appendingPathComponent(rel)
+            guard fm.fileExists(atPath: src.path) else {
+                throw RootfsError.ioError("zip 内缺失关键文件 \(rel)，无法补回")
+            }
+            try fm.createDirectory(at: dst.deletingLastPathComponent(),
+                                   withIntermediateDirectories: true)
+            if fm.fileExists(atPath: dst.path) {
+                try fm.removeItem(at: dst)
+            }
+            try fm.moveItem(at: src, to: dst)
+        }
+        guard criticalFilesPresent() else {
+            throw RootfsError.ioError("补回后校验失败：关键文件仍缺失或截断")
+        }
+        NSLog("RootfsManager: 关键文件已补回，内核无需重启")
+    }
+
     // MARK: - Private
 
     private static func resolveZipURL(_ zipURL: URL?) throws -> URL {

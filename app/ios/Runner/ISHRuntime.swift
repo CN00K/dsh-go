@@ -265,30 +265,36 @@ import Foundation
     // reinstalls the rootfs from the bundled zip. See
     // ISHKernel.resetRootfsWhileBooted.)
     if kernel.isBooted {
-      // (Build 39) The old code returned here unconditionally — so a
-      // kernel booted on a broken tree never re-verified the rootfs,
-      // and every terminal open kept dying on do_execve while the
-      // status page insisted everything was "running". If the spawn
-      // chain is missing, the tree cannot be repaired in place: the
-      // kernel cannot reboot in-process (pid 1 parks forever, and
-      // _isBooted never resets until the app restarts), so a
-      // re-extract underneath the running kernel would leave it on
-      // a half-replaced rootfs. Delete the broken tree and report
-      // an error that asks for an app restart — the next launch
-      // reinstalls from the bundled zip via ensureInstalled.
+      // (Build 40) The old build-39 path deleted the broken tree and
+      // asked for an app restart — but tapping the app icon does not
+      // kill the process, so the kernel stayed booted, the files
+      // stayed gone, and the restart error fired forever (build 39
+      // device test 18:42: "重开也没有用"). The kernel reads guest
+      // files on demand, so restore the missing files in place and
+      // keep running: the next shell spawn then succeeds, no restart
+      // needed. Only if the restore itself fails do we fall back to
+      // the restart error.
       if RootfsManager.criticalFilesPresent() {
         DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
         finish(result, nil)
         return
       }
-      NSLog("ISHRuntime: 内核已启动但缺关键文件（shell/动态链接器/libc/profile），已清除损坏的 rootfs，请重启 App 重装")
-      kernel.stopGuest()
-      try? RootfsManager.clearBrokenInstallForRestart()
-      let message = "Linux 沙箱损坏已清除，请重启 App 完成重装"
-      DispatchQueue.main.async { [weak self] in
-        self?.setPhase("error", error: ["code": "ish_rootfs_broken_restart_app", "message": message])
+      NSLog("ISHRuntime: 内核已启动但缺关键文件，正在原地补回（无需重启 App）")
+      do {
+        try RootfsManager.restoreMissingFiles()
+      } catch {
+        NSLog("ISHRuntime: 原地补回失败：%@，回退到重启提示", error.localizedDescription)
+        kernel.stopGuest()
+        try? RootfsManager.clearBrokenInstallForRestart()
+        let message = "Linux 沙箱损坏已清除，请重启 App 完成重装"
+        DispatchQueue.main.async { [weak self] in
+          self?.setPhase("error", error: ["code": "ish_rootfs_broken_restart_app", "message": message])
+        }
+        finish(result, error("ish_rootfs_broken_restart_app", message))
+        return
       }
-      finish(result, error("ish_rootfs_broken_restart_app", message))
+      DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
+      finish(result, nil)
       return
     }
 
