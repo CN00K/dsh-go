@@ -282,8 +282,8 @@ import Foundation
       NSLog("ISHRuntime: 内核已启动但缺关键文件，正在原地补回（无需重启 App）")
       do {
         try RootfsManager.restoreMissingFiles()
-      } catch {
-        NSLog("ISHRuntime: 原地补回失败：%@，回退到重启提示", error.localizedDescription)
+      } catch let restoreError {
+        NSLog("ISHRuntime: 原地补回失败：%@，回退到重启提示", restoreError.localizedDescription)
         kernel.stopGuest()
         try? RootfsManager.clearBrokenInstallForRestart()
         let message = "Linux 沙箱损坏已清除，请重启 App 完成重装"

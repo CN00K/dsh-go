@@ -322,7 +322,7 @@ struct RootfsManager {
                                attributes: [.posixPermissions: 0o700])
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmp) }
-        try extract(zipData: zipData, to: tmp)
+        try extract(zipData: zipData, to: tmp, progress: nil)
         for rel in missing {
             let src = tmp.appendingPathComponent("data").appendingPathComponent(rel)
             let dst = dataURL.appendingPathComponent(rel)
