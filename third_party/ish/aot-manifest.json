@@ -2,10 +2,7 @@
   "abi": "1f3bb5a0",
   "ish_commit": "0fd17a135e78b7a0cf08a4f5831217bbb76ed22f",
   "recorded_at": "2026-11-15",
-  "download": {
-    "url": "https://github.com/CN00K/dsh-go/releases/download/aot-minimal-1f3bb5a0/libish_aot.a",
-    "sha256": "950fe2c46be148d45fa024833ca722652ef139e221dd1cecd032efee7e387648"
-  },
+  "disabled": "AOT OFF since build 29 (2026-11-15): the recorded images crash the device terminal on every boot (builds 25-28 all failed to start a shell; builds 23-24 stub worked). The download section is removed so build-aot.sh stages the empty stub. The recorded set below stays documented for re-enablement once the crash is diagnosed; restore the download.url + download.sha256 to turn AOT back on.",
   "libish_aot_a": {
     "sha256": "950fe2c46be148d45fa024833ca722652ef139e221dd1cecd032efee7e387648",
     "size": 46947640

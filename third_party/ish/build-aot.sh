@@ -106,6 +106,18 @@ SDK="$(xcrun --sdk "$PLATFORM" --show-sdk-path)"
 
 mkdir -p "$ARTIFACTS/lib" "$OBJ_DIR"
 
+# Pre-read the manifest download URL. An absent manifest, or a manifest
+# with no download.url, means stub mode (AOT disabled). This lets us
+# disable AOT by clearing the download section in aot-manifest.json
+# without deleting the file (the recorded set stays documented for
+# re-enablement). See build 29 (2026-11-15): the recorded images crash
+# the device terminal on every boot, so AOT is off until the crash is
+# diagnosed.
+MANIFEST_URL=""
+if [ -f "$MANIFEST_SRC" ]; then
+    MANIFEST_URL="$(python3 -c "import json; print(json.load(open('$MANIFEST_SRC')).get('download', {}).get('url', ''))")"
+fi
+
 # ============================================================================
 # Mode 1: local .S images — assemble them (record-aot.sh's output)
 # ============================================================================
@@ -142,10 +154,9 @@ if [ "${#images[@]}" -gt 0 ]; then
 # ============================================================================
 # Mode 2: download a recorded set (aot-manifest.json, SHA256-pinned)
 # ============================================================================
-elif [ -f "$MANIFEST_SRC" ]; then
-    URL="$(python3 -c "import json; print(json.load(open('$MANIFEST_SRC')).get('download', {}).get('url', ''))")"
+elif [ -n "$MANIFEST_URL" ]; then
+    URL="$MANIFEST_URL"
     SHA="$(python3 -c "import json; print(json.load(open('$MANIFEST_SRC')).get('download', {}).get('sha256', ''))")"
-    [ -n "$URL" ] || log_error "aot-manifest.json has no download.url — remove it for stub mode, or fill in the release URL"
     [ -n "$SHA" ] || log_error "aot-manifest.json has no download.sha256 — refusing to download an unpinned image"
     command -v curl >/dev/null || log_error "curl is required (download mode)"
     command -v shasum >/dev/null || log_error "shasum is required (download mode)"
@@ -167,7 +178,7 @@ elif [ -f "$MANIFEST_SRC" ]; then
 # Mode 3: empty stub — no images, pure gadget interpreter (v1 shipping state)
 # ============================================================================
 else
-    log_info "No local .S images and no aot-manifest.json — building an empty libish_aot.a (stub)"
+    log_info "No local .S images and no manifest download URL (AOT disabled) — building an empty libish_aot.a (stub)"
     stub="$OBJ_DIR/aot_none.o"
     echo 'void ish_aot_none(void) {}' | xcrun --sdk "$PLATFORM" clang -x c -c -arch arm64 \
         -isysroot "$SDK" "$MIN_FLAG" -o "$stub" -
