@@ -259,6 +259,34 @@ import Foundation
 
   // MARK: - Boot
 
+  /// Ensure the host workspace directory exists and is bind-mounted
+  /// into the guest at /home/workspace (design §2.6; idempotent —
+  /// safe to call again after boot). The DSH gateway validates this
+  /// directory before creating a terminal session; if it is missing
+  /// the terminal fails with "gateway/internal: working-directory:
+  /// directory does not exist" (build 43 device test 23:03).
+  /// (Build 44) This used to live only in the fresh-boot path, so
+  /// the kernel.isBooted early-return branch never created the
+  /// directory or the mount — same class of bug as build 42 (the
+  /// loopback service was not restarted in that branch either).
+  /// Non-fatal: the guest still boots without it.
+  private func ensureHostWorkspace() {
+    do {
+      try files.createDirectory(at: Self.hostWorkspaceURL, withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+      let mountRc = kernel.bindMountPath("/home/workspace", toHostPath: Self.hostWorkspaceURL.path, readOnly: false)
+      if mountRc != 0 {
+        DispatchQueue.main.async { [weak self] in
+          self?.log("/home/workspace 挂载失败（rc=\(mountRc)），终端可用但 workspace 不共享")
+        }
+      }
+    } catch {
+      DispatchQueue.main.async { [weak self] in
+        self?.log("/home/workspace 宿主目录创建失败：\(error.localizedDescription)")
+      }
+    }
+  }
+
   private func performBoot(result: @escaping FlutterResult) {
     // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
     // Reset is now synchronous and self-healing; the next boot just
@@ -283,6 +311,11 @@ import Foundation
         // terminal failed with "iSH: running, loopback DOWN
         // (state=cancelled)" (build 41 device test 22:03). start()
         // is idempotent (no-op when already running).
+        // (Build 44) Same for the host workspace: create the
+        // directory and bind-mount it, or the gateway rejects the
+        // terminal with "working-directory: directory does not
+        // exist" (build 43 device test 23:03).
+        ensureHostWorkspace()
         IShLoopbackService.shared.start()
         DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
         finish(result, nil)
@@ -304,6 +337,9 @@ import Foundation
       }
       // (Build 42) Same as above: restart the loopback service, which
       // a Reset may have stopped. start() is idempotent.
+      // (Build 44) Same for the host workspace: create the directory
+      // and bind-mount it (see above).
+      ensureHostWorkspace()
       IShLoopbackService.shared.start()
       DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
       finish(result, nil)
@@ -377,20 +413,7 @@ import Foundation
     // Share the DSH workspace into the guest at /home/workspace
     // (design §2.6; idempotent — safe to call again after boot).
     // Non-fatal: the guest still boots without it.
-    do {
-      try files.createDirectory(at: Self.hostWorkspaceURL, withIntermediateDirectories: true,
-                                attributes: [.posixPermissions: 0o700])
-      let mountRc = kernel.bindMountPath("/home/workspace", toHostPath: Self.hostWorkspaceURL.path, readOnly: false)
-      if mountRc != 0 {
-        DispatchQueue.main.async { [weak self] in
-          self?.log("/home/workspace 挂载失败（rc=\(mountRc)），终端可用但 workspace 不共享")
-        }
-      }
-    } catch {
-      DispatchQueue.main.async { [weak self] in
-        self?.log("/home/workspace 宿主目录创建失败：\(error.localizedDescription)")
-      }
-    }
+    ensureHostWorkspace()
 
     DispatchQueue.main.async { [weak self] in
       self?.setPhase("running")
