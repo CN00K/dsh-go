@@ -265,8 +265,30 @@ import Foundation
     // reinstalls the rootfs from the bundled zip. See
     // ISHKernel.resetRootfsWhileBooted.)
     if kernel.isBooted {
-      DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
-      finish(result, nil)
+      // (Build 39) The old code returned here unconditionally — so a
+      // kernel booted on a broken tree never re-verified the rootfs,
+      // and every terminal open kept dying on do_execve while the
+      // status page insisted everything was "running". If the spawn
+      // chain is missing, the tree cannot be repaired in place: the
+      // kernel cannot reboot in-process (pid 1 parks forever, and
+      // _isBooted never resets until the app restarts), so a
+      // re-extract underneath the running kernel would leave it on
+      // a half-replaced rootfs. Delete the broken tree and report
+      // an error that asks for an app restart — the next launch
+      // reinstalls from the bundled zip via ensureInstalled.
+      if RootfsManager.criticalFilesPresent() {
+        DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
+        finish(result, nil)
+        return
+      }
+      NSLog("ISHRuntime: 内核已启动但缺关键文件（shell/动态链接器/libc/profile），已清除损坏的 rootfs，请重启 App 重装")
+      kernel.stopGuest()
+      try? RootfsManager.clearBrokenInstallForRestart()
+      let message = "Linux 沙箱损坏已清除，请重启 App 完成重装"
+      DispatchQueue.main.async { [weak self] in
+        self?.setPhase("error", error: ["code": "ish_rootfs_broken_restart_app", "message": message])
+      }
+      finish(result, error("ish_rootfs_broken_restart_app", message))
       return
     }
 

@@ -94,16 +94,47 @@ struct RootfsManager {
     /// hash matches. (Builds 25–37: terminal dead since build 25,
     /// build 24 reinstalled also failed, reset did not help.)
     /// Verified here so a broken tree is re-extracted, not booted.
+    ///
+    /// (Build 39) The build-38 check only covered bin/sh +
+    /// bin/busybox, and the terminal STILL failed — so the breakage
+    /// is in a file the shell needs but the old check never looked
+    /// at. do_execve("/bin/sh") loads busybox through the dynamic
+    /// linker, so a tree with bin/sh + bin/busybox present but the
+    /// linker (or libc) missing/corrupt still boots fine and still
+    /// dies on every shell spawn. The check now covers the whole
+    /// spawn chain — shell, busybox, dynamic linker, libc, profile —
+    /// and verifies the two binaries are not truncated (a partial
+    /// extraction leaves a small or zero-byte file behind).
+    /// Sizes are the shipped ones (busybox 919304, ld-musl 723480);
+    /// the minimums leave room for a future Alpine bump.
     static var criticalGuestFiles: [String] {
-        ["bin/sh", "bin/busybox"]
+        ["bin/sh", "bin/busybox", "lib/ld-musl-aarch64.so.1",
+         "lib/libc.musl-aarch64.so.1", "etc/profile"]
     }
 
-    /// True when every critical guest file exists under data/.
+    /// Minimum byte sizes for the two real binaries (0 = any size,
+    /// just existence). Symlinks (bin/sh, libc) and the profile are
+    /// tiny by design and are only checked for existence.
+    static var criticalGuestMinSizes: [String: UInt64] {
+        ["bin/busybox": 500_000, "lib/ld-musl-aarch64.so.1": 500_000]
+    }
+
+    /// True when every critical guest file exists under data/ and
+    /// the two binaries are not truncated.
     static func criticalFilesPresent() -> Bool {
         let fm = FileManager.default
         for rel in criticalGuestFiles {
-            if !fm.fileExists(atPath: dataURL.appendingPathComponent(rel).path) {
+            let path = dataURL.appendingPathComponent(rel).path
+            guard fm.fileExists(atPath: path) else {
+                NSLog("RootfsManager: 缺关键文件 \(rel)")
                 return false
+            }
+            if let min = criticalGuestMinSizes[rel] {
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let size = attrs[.size] as? UInt64, size >= min else {
+                    NSLog("RootfsManager: 关键文件 \(rel) 尺寸异常（疑似截断）")
+                    return false
+                }
             }
         }
         return true
@@ -168,7 +199,7 @@ struct RootfsManager {
                     reportProgress(progress, 1.0)
                     return .alreadyInstalled
                 }
-                NSLog("RootfsManager: 已安装但缺关键文件 (bin/sh 或 bin/busybox)，重新解压")
+                NSLog("RootfsManager: 已安装但缺关键文件（shell/动态链接器/libc/profile），重新解压")
                 try clearBrokenInstall()
             } else {
                 throw RootfsError.upgradeRequiresReset(currentHash: installedHash() ?? "(无)",
@@ -215,6 +246,14 @@ struct RootfsManager {
         reportProgress(progress, 0.95)
         _ = FileManager.default.createFile(atPath: readyURL.path, contents: Data())
         guard isInstalled else { throw RootfsError.ioError("解压后校验失败：data/、.arch 或 .ready 缺失") }
+        // (Build 39) Verify the spawn chain actually landed: a
+        // "successful" extraction that silently dropped the dynamic
+        // linker (or truncated busybox) would boot fine and then fail
+        // every shell spawn — the exact failure seen on builds 25–38.
+        // Fail loudly here instead of booting a broken tree.
+        guard criticalFilesPresent() else {
+            throw RootfsError.ioError("解压后校验失败：关键文件（shell/动态链接器/libc/profile）缺失或截断")
+        }
         reportProgress(progress, 1.0)
         return .installed
     }
@@ -231,6 +270,15 @@ struct RootfsManager {
         }
         guard FileManager.default.fileExists(atPath: rootfsURL.path) else { return }
         try clearBrokenInstall()
+    }
+
+    /// Remove the rootfs tree (best effort, never throws) so the
+    /// next app launch reinstalls it from the bundled zip. Used when
+    /// the kernel is already booted on a broken tree: the kernel
+    /// cannot reboot in-process, so the reinstall has to happen on
+    /// the next launch. (Build 39)
+    static func clearBrokenInstallForRestart() {
+        try? clearBrokenInstall()
     }
 
     // MARK: - Private
