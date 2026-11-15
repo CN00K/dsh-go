@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 // Field offsets into the JIT/emulator state. Taken from the
@@ -403,32 +404,50 @@ static void ish_jit_crash_handler(int sig, siginfo_t *info, void *ctx) {
     // separate thread-local marker set when iSH threads start, to
     // distinguish iSH threads with in_jit==0 (between JIT runs) from
     // non-iSH threads (never set). (OpenMinis L543–553.)
-    //
-    // [PROTO-DELTA-1b] The marker distinction is KEPT (both branches are
-    // recorded separately in ish_crash_handler_last_branch, so test ⑤ can
-    // prove which branch a fault took), but the ACTION is the same on both
-    // sides: forward directly to g_prev. OpenMinis instead PARKED an
-    // iSH-thread non-JIT fault (log diagnostics + block all signals +
-    // select() forever) so that only that guest thread died and the app
-    // survived. Mitigation ① as specified says "all other SEGV/BUS go
-    // directly to g_prev's sa_sigaction", and stage 1.2 test ⑤ requires
-    // the iSH-thread in_jit==0 fault to be forwarded, so the park path is
-    // NOT implemented here.
-    //
-    // CONSEQUENCE (flagged for the parent agent, do not silently ship):
-    // a host-level fault on an iSH thread outside JIT now takes Node's
-    // path — Node's handler treats a non-Wasm fault as fatal (SIG_DFL +
-    // re-raise), so the whole app terminates instead of one guest thread
-    // parking. Guest userspace faults normally never reach this handler
-    // (the emulator delivers them inside the guest), so this only bites
-    // on emulator/host bugs — but if stage 1.2 ever shows a guest
-    // workload tripping it, the park path must be restored for branch 3
-    // before stage 2.
     if (!ish_thread_marker) {
         ish_crash_handler_last_branch = 2;
         ish_forward_to_prev(sig, info, ctx);
         return;
     }
+    // Branch 3: non-JIT fault on an iSH guest thread.
+    // [PROTO-DELTA-1b RESTORED for AOT (build 49)] OpenMinis PARKED this
+    // fault (log diagnostics + block all signals + select() forever) so
+    // that only the faulting guest thread died and the app survived.
+    // The prototype forwarded it to g_prev instead, but g_prev is now
+    // Node/V8's trap handler, which treats a non-Wasm fault as fatal
+    // (SIG_DFL + re-raise) and kills the whole app — the suspected cause
+    // of the AOT builds 25–28 terminal failures. Park it here, as
+    // OpenMinis does. (Stage 1.2 test ⑤ asserted the forward; that
+    // expectation is superseded now that Node owns g_prev.)
     ish_crash_handler_last_branch = 3;
-    ish_forward_to_prev(sig, info, ctx);
+    {
+        char buf[512];
+        int len;
+        ucontext_t *uc = (ucontext_t *)ctx;
+        len = snprintf(buf, sizeof(buf), "\n=== iSH GUEST CRASH: signal %d ===\nfault addr: %p\n", sig, info->si_addr);
+        write(STDERR_FILENO, buf, len);
+#ifdef __aarch64__
+        len = snprintf(buf, sizeof(buf),
+            "pc:  0x%llx\nlr:  0x%llx\nsp:  0x%llx\n"
+            "x0:  0x%llx\nx1:  0x%llx\nx2:  0x%llx\n"
+            "x7:  0x%llx\nx28: 0x%llx\n",
+            uc->uc_mcontext->__ss.__pc, uc->uc_mcontext->__ss.__lr,
+            uc->uc_mcontext->__ss.__sp,
+            uc->uc_mcontext->__ss.__x[0], uc->uc_mcontext->__ss.__x[1],
+            uc->uc_mcontext->__ss.__x[2],
+            uc->uc_mcontext->__ss.__x[7], uc->uc_mcontext->__ss.__x[28]);
+        write(STDERR_FILENO, buf, len);
+#endif
+        void *bt[20];
+        int n = backtrace(bt, 20);
+        backtrace_symbols_fd(bt, n, STDERR_FILENO);
+
+        // Block all signals and suspend this thread forever.
+        // pthread_exit() triggers SIGTRAP on iOS in certain thread states.
+        sigset_t all;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, NULL);
+        select(0, NULL, NULL, NULL, NULL);
+        __builtin_unreachable();
+    }
 }
