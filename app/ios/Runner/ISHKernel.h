@@ -81,11 +81,6 @@ int ISHDecodeWaitStatus(int status);
 /// YES once the supervisor thread has finished boot (PID 1 parked).
 @property (nonatomic, readonly) BOOL isBooted;
 
-/// Set by resetRootfsWhileBooted. While set, boot/execute refuse work
-/// until the app is relaunched (in-memory flag; a fresh launch clears it
-/// and the rootfs is re-installed from the bundle zip).
-@property (nonatomic, readonly) BOOL didResetWhileBooted;
-
 /// Guest output (PTY/console bytes) sink, called on the main queue.
 /// Batched: at most one invocation per burst of guest writes. Also used
 /// by the harness to capture one-shot command output.
@@ -109,7 +104,6 @@ int ISHDecodeWaitStatus(int status);
 /// thread, with a fresh fake PTY for stdio. Returns 0 on success and
 /// writes the guest pid to `outPid` (may be NULL). The guest runs
 /// asynchronously; poll exitCodeForGuestPid: for completion.
-/// Refuses with -100 while didResetWhileBooted is set.
 /// This is the INTERACTIVE-terminal path (single shared _consoleTTY);
 /// one-shot agent commands use ISHShellExecutor instead.
 - (int)executeCommand:(NSArray<NSString *> *)command
@@ -152,9 +146,13 @@ int ISHDecodeWaitStatus(int status);
 /// booted; a later executeCommand works again.
 - (void)stopGuest;
 
-/// Stage 1.4 reset path: stop the guest, set didResetWhileBooted, and
-/// delete the rootfs directory (best effort). Afterwards executeCommand:
-/// refuses until the app is relaunched.
+/// Stage 1.4 reset path: stop the guest and delete the rootfs
+/// directory synchronously (best effort). The next boot reinstalls
+/// the rootfs from the bundled zip via RootfsManager.ensureInstalled.
+/// (Retired 2026-11-15: the didResetWhileBooted flag used to refuse
+/// every boot until an App relaunch, but the relaunch did not
+/// reliably clear it on device, leaving the terminal permanently
+/// wedged. Reset is now synchronous and self-healing.)
 - (void)resetRootfsWhileBooted;
 
 /// Re-write the guest's /etc/resolv.conf from the iOS system resolver

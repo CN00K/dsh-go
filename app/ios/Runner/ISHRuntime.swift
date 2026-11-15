@@ -83,7 +83,6 @@ import Foundation
   private var lifecycleBusy = false
 
   private static func initialPhase() -> String {
-    if ISHKernel.shared.didResetWhileBooted { return "error" }
     if ISHKernel.shared.isBooted { return "running" }
     return RootfsManager.isInstalled ? "installed" : "notInstalled"
   }
@@ -243,17 +242,10 @@ import Foundation
   // MARK: - Boot
 
   private func performBoot(result: @escaping FlutterResult) {
-    // A reset while booted refuses every boot until the app relaunches.
-    if kernel.didResetWhileBooted {
-      let err = ["code": "ish_boot_reset_flag",
-                 "message": "rootfs 已重置，终端将拒绝起 shell，直到重启 App。"]
-      DispatchQueue.main.async { [weak self] in
-        self?.setPhase("error", error: err)
-        self?.log("boot 被拒：didResetWhileBooted 已置位，需重启 App")
-      }
-      finish(result, error("ish_boot_reset_flag", err["message"]!))
-      return
-    }
+    // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
+    // Reset is now synchronous and self-healing; the next boot just
+    // reinstalls the rootfs from the bundled zip. See
+    // ISHKernel.resetRootfsWhileBooted.)
     if kernel.isBooted {
       DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
       finish(result, nil)
@@ -428,8 +420,10 @@ import Foundation
       // reset so no client keeps talking to a dead guest.
       IShLoopbackService.shared.stop()
       // Booted kernel: back up Guest /root first when asked, then the
-      // reset-while-booted path (sets didResetWhileBooted, deletes the
-      // rootfs; the terminal refuses new shells until relaunch).
+      // reset-while-booted path (stops the guest, deletes the rootfs
+      // synchronously; the next boot reinstalls it from the bundled
+      // zip). No relaunch required — reset is self-healing now
+      // (retired the didResetWhileBooted flag, 2026-11-15).
       if keepUserData {
         let backup = RootfsManager.ishDirURL
           .appendingPathComponent("rootfs-backup-\(Self.backupStamp())", isDirectory: true)
@@ -445,9 +439,9 @@ import Foundation
         }
       }
       kernel.resetRootfsWhileBooted()
-      let message = "rootfs 已删除，终端将拒绝起 shell，直到重启 App。"
+      let message = "rootfs 已重置，下次启动时将从内置包重装。"
       DispatchQueue.main.async { [weak self] in
-        self?.setPhase("error", error: ["code": "ish_reset_requires_relaunch", "message": message])
+        self?.setPhase("notInstalled")
         self?.log("reset：\(message)")
       }
       finish(result, nil)

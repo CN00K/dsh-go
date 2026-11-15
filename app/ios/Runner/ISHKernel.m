@@ -204,7 +204,6 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 
 @implementation ISHKernel {
     BOOL _isBooted;
-    BOOL _didResetWhileBooted;
     struct tty *_consoleTTY;
     NSString *_rootPath;
     NSString *_dataPath;
@@ -243,7 +242,6 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 }
 
 - (BOOL)isBooted { return _isBooted; }
-- (BOOL)didResetWhileBooted { return _didResetWhileBooted; }
 
 - (NSData *)drainOutput {
     [g_ptyOutputLock lock];
@@ -286,10 +284,10 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         NSLog(@"ISHKernel: already booted");
         return 0;
     }
-    if (_didResetWhileBooted) {
-        NSLog(@"ISHKernel: reset flag set — relaunch the app to boot again");
-        return -100;
-    }
+    // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
+    // Reset is now synchronous and self-healing; the next boot just
+    // reinstalls the rootfs from the bundled zip. See
+    // resetRootfsWhileBooted.)
     _rootPath = [rootPath copy];
     _dataPath = [rootPath stringByAppendingPathComponent:@"data"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:_dataPath]) {
@@ -531,10 +529,8 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         NSLog(@"ISHKernel: kernel not booted");
         return -1;
     }
-    if (_didResetWhileBooted) {
-        NSLog(@"ISHKernel: refusing execute — reset flag set, relaunch app");
-        return -100;
-    }
+    // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
+    // See resetRootfsWhileBooted.)
     if (command.count == 0) return -2;
     NSArray<NSString *> *commandCopy = [command copy];
     NSDictionary<NSString *, NSString *> *customEnv = self.customEnvironment;
@@ -723,22 +719,27 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 }
 
 - (void)resetRootfsWhileBooted {
-    _didResetWhileBooted = YES;
+    // Retired the didResetWhileBooted flag (2026-11-15, build 28):
+    // it refused every boot/execute until an App relaunch, but the
+    // flag is in-memory and the relaunch did not reliably clear it
+    // on device (build 27: force-quit + relaunch still showed
+    // ish_boot_reset_flag), leaving the terminal permanently wedged.
+    // Now the reset is synchronous and self-healing: stop the guest,
+    // delete the rootfs inline (no async window where the rootfs is
+    // half-deleted), and let the next boot reinstall it from the
+    // bundled zip via RootfsManager.ensureInstalled. No flag, no
+    // relaunch required.
     [self stopGuest];
     NSString *rootfs = _rootPath;
     if (rootfs) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-            NSError *error = nil;
-            [[NSFileManager defaultManager]
-                removeItemAtPath:rootfs error:&error];
-            if (error) {
-                NSLog(@"ISHKernel: rootfs delete failed (best effort): %@",
-                      error);
-            } else {
-                NSLog(@"ISHKernel: rootfs deleted; didResetWhileBooted set — "
-                      @"relaunch the app to reinstall");
-            }
-        });
+        NSError *error = nil;
+        [[NSFileManager defaultManager] removeItemAtPath:rootfs error:&error];
+        if (error) {
+            NSLog(@"ISHKernel: rootfs delete failed (best effort): %@",
+                  error);
+        } else {
+            NSLog(@"ISHKernel: rootfs deleted synchronously; next boot reinstalls from the bundled zip");
+        }
     }
 }
 
