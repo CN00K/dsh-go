@@ -262,10 +262,20 @@ export async function getServiceInfo(opts = {}) {
   return info;
 }
 
-/** Drop the cached service info (call after a connection failure, then retry once). */
+/**
+ * Drop the cached service info (call after a connection failure, then
+ * retry once). Also resets the wait state so the retry does a fresh
+ * read of ish-service.json instead of failing fast on the 5s window
+ * (fix, build 37: the loopback service can restart with a new
+ * port/token — e.g. stop/start across a terminal reopen — and the
+ * bridge kept dialling the stale cached port/token forever, because
+ * only the /ish/exec path invalidated and the WS path never retried).
+ */
 export function invalidateServiceInfo() {
   cachedService = null;
   cachedServiceFile = null;
+  waitedForServiceFile = false;
+  lastMissingCheck = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +296,6 @@ export function invalidateServiceInfo() {
  * @returns {exitCode, durationMs, timedOut?, cancelled?} from the final frame.
  */
 export async function ishExec(opts) {
-  const service = await getServiceInfo(opts);
-  if (!service) throw bridgeUnavailableError(opts);
   const body = JSON.stringify({
     command: opts.command,
     ...(opts.cwd ? {cwd: opts.cwd} : {}),
@@ -296,8 +304,28 @@ export async function ishExec(opts) {
       ? {stdinData: Buffer.from(opts.stdinData).toString('base64')} : {}),
     timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
   });
-  const result = await postExec(service, body, opts);
-  return result;
+  // Retry once with a fresh read of ish-service.json (same stale-cache
+  // fix as the WS path, build 37): postExec invalidates on
+  // ECONNREFUSED/ECONNRESET, and a 401 means the token rotated, so a
+  // retry with fresh info can succeed where the cached one failed.
+  // ISH_NOT_BOOTED is a real state, not a stale cache — do not retry it.
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) invalidateServiceInfo();
+    const service = await getServiceInfo(opts);
+    if (!service) throw bridgeUnavailableError(opts);
+    try {
+      return await postExec(service, body, opts);
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
+      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+        || error?.code === 'ISH_HTTP_ERROR';
+      if (retryable && attempt === 0) continue;
+      throw lastError;
+    }
+  }
+  throw lastError;
 }
 
 function postExec(service, body, opts) {
@@ -446,9 +474,36 @@ export function ishWebSocket(opts) {
   if (opts.onError) on('error', opts.onError);
   const emit = (event, ...args) => { for (const fn of listeners[event]) { try { fn(...args); } catch {} } };
 
+  // Connect + WS handshake, retrying once with a FRESH read of
+  // ish-service.json. Fix (build 37): the loopback service can restart
+  // with a new port/token (stop/start across a terminal reopen), and
+  // the bridge kept dialling the stale cached port/token forever —
+  // the old code never invalidated the cache on a WS failure, so every
+  // retry failed the same way (ECONNREFUSED on the dead port, or 401
+  // on the rotated token) while the service itself was up.
   const ready = (async () => {
-    const service = await getServiceInfo(opts);
-    if (!service) throw bridgeUnavailableError(opts);
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) invalidateServiceInfo();
+      const service = await getServiceInfo(opts);
+      if (!service) throw bridgeUnavailableError(opts);
+      try {
+        await connectOnce(service);
+        return;
+      } catch (error) {
+        lastError = error;
+        try { socket?.destroy(); } catch {}
+        socket = null;
+        handshakeDone = false;
+        handshakeBuffer = Buffer.alloc(0);
+        if (attempt === 0) continue;
+        throw lastError;
+      }
+    }
+    throw lastError;
+  })();
+
+  async function connectOnce(service) {
     const key = randomBytes(16).toString('base64');
     const expectedAccept = createHash('sha1').update(key + WS_GUID).digest('base64');
     socket = netConnect({host: service.host, port: service.port});
@@ -497,7 +552,7 @@ export function ishWebSocket(opts) {
     socket.on('data', (chunk) => feedFrames(chunk));
     socket.on('error', (error) => { emit('error', error); closeSocket(); });
     socket.on('close', () => closeSocket());
-  })();
+  }
 
   function feedFrames(chunk) {
     frameBuffer = Buffer.concat([frameBuffer, chunk]);

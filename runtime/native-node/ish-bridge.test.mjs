@@ -332,6 +332,34 @@ async function startMockWsServer({closeCode = null} = {}) {
   })};
 }
 
+test('ishWebSocket retries once with a fresh service file after a stale cache (build 37)', async () => {
+  const {server, port, close} = await startMockWsServer();
+  try {
+    invalidateServiceInfo();
+    // Prime the cache with a dead port: the loopback service restarted
+    // with a new port after the bridge cached the old one.
+    const serviceFile = join(fakeHome, 'ish-service-retry.json');
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port: 1, token: TOKEN}));
+    const cached = await getServiceInfo({serviceFile});
+    assert.equal(cached.port, 1);
+    // The service restarts: the file now points at the live server.
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    const received = [];
+    const ws = ishWebSocket({
+      path: '/ish/pty',
+      serviceFile,
+      onBinary: (data) => received.push(data.toString('utf8')),
+    });
+    await ws.ready;
+    ws.sendBinary(Buffer.from('retry ok\n', 'utf8'));
+    await new Promise((done) => setTimeout(done, 200));
+    assert.deepEqual(received, ['retry ok\n']);
+    ws.close();
+  } finally {
+    await close();
+  }
+});
+
 test('ishWebSocket handshakes with Bearer auth and echoes binary frames', async () => {
   const {server, port, close} = await startMockWsServer();
   try {
