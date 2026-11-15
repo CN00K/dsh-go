@@ -870,9 +870,18 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       final ishLine = showIsh
           ? '\n${TerminalCopy.ishStatusLine(await _freshIshStatus())}'
           : '';
+      // Build 43: show the backend's real error (code + message) under
+      // the generic line. DshRemoteException carries the engine/bridge
+      // detail in error.message (e.g. WS upgrade 401, ECONNREFUSED,
+      // close 1011 shell spawn) — since build 25 the catch swallowed
+      // it and the page only ever said "没能启动终端", so every fix
+      // since has been aimed at the status line instead of the cause.
+      final detail = showIsh && error.message.isNotEmpty
+          ? '\n${error.code}: ${error.message}'
+          : '';
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
-            message: '$message$ishLine',
+            message: '$message$detail$ishLine',
             ishResetOffered: showIsh,
           ));
     } on Object {
