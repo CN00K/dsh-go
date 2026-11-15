@@ -269,14 +269,18 @@ abstract final class TerminalCopy {
     }
   }
 
-  /// True when the iSH failure is a rootfs upgrade that needs an explicit
-  /// user reset (never automatic): the bundled zip changed, so the
-  /// installed rootfs refuses to boot until reset() reinstalls it
-  /// (build 22 device test: the zip hash changed on every build, so
-  /// every new build hit this until reset).
+  /// True when the failed tab should offer the reset button: any iSH
+  /// boot failure, not only a rootfs upgrade. The reset (reset() with
+  /// keepUserData) only wipes the Linux sandbox and reinstalls the
+  /// bundled rootfs; chat history in the app is untouched. It is the
+  /// recovery for an unbootable iSH state — e.g. build 25 (2026-11-15):
+  /// the AOT images crashed the kernel on boot and left the rootfs /
+  /// runtime state corrupted, so even the stub build 24 could no
+  /// longer boot; retry and app restart did not help, only a reset
+  /// (reinstall from the bundled zip) can recover. Reset never
+  /// happens automatically: it only runs from this button.
   static bool needsRootfsReset(IshStatus status) =>
-      status.phase == IshPhase.error &&
-      (status.error?.startsWith('ish_rootfs_upgrade_requires_reset') ?? false);
+      status.phase == IshPhase.error;
 
   /// Label for the reset button on a failed tab.
   static String get ishResetAction => '重置并重装';
@@ -527,7 +531,8 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
   }
 
   /// Resets the iSH rootfs at the user's explicit tap (the failed tab
-  /// offers this only for a rootfs upgrade) and retries the tab.
+  /// offers this for any boot failure, not only a rootfs upgrade) and
+  /// retries the tab.
   /// Reset never happens automatically: it only runs from this button.
   /// The kernel never booted in this state, so reset() is allowed; the
   /// retry's pre-flight then reinstalls from the bundled zip and boots.
