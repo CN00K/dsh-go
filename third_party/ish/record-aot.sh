@@ -139,9 +139,20 @@ MODULES=("${@:-musl busybox zlib libcrypto libssl pcre2}"); MODULES=(${MODULES[@
 # step) so a hang fails loudly instead of burning the whole quota:
 # dry run 15 min (a full pcre2 dry run completed in 8-11 min when it
 # failed fast; a good one is ~5-6 min), recording 30 min per module
-# (attempt 11 averaged ~12 min/module for dry+record). gtimeout exits 124
-# on timeout; the check below turns that into fail(), which preserves the
-# partial dry/rec log to build-logs/ so the hang point is visible.
+# (attempt 11 averaged ~12 min/module for dry+record). The timeout is
+# detected by ELAPSED WALL-CLOCK TIME, not by gtimeout's exit code:
+# attempt 12 proved the exit code unreliable — the pcre2 dry run ran the
+# full 900s (5 modules done by 05:46:54, fail at 06:01:56) yet no
+# "TIMED OUT" line appeared, because ish catches SIGTERM and exits
+# cleanly (exit 0), so gtimeout returns the child's code, not 124
+# (reproduced locally: timeout wrapping a SIGTERM-trapping child returns
+# 0; wrapping sleep directly returns 124; -s KILL returns 137). So each
+# run records $(date +%s) before and after, and [ elapsed -ge TIMEOUT ]
+# triggers fail(), which preserves the partial dry/rec log to build-logs/
+# so the hang point is visible. The dry run also uses `sh -x` (trace to
+# stderr, unbuffered): attempt 12's pcre2 dry log was 0 bytes because the
+# guest's stdout is block-buffered through the pipe and lost on kill —
+# the trace shows exactly which command was running when it hung.
 DRY_TIMEOUT=900
 REC_TIMEOUT=1800
 command -v gtimeout >/dev/null || fail "gtimeout not found (GNU coreutils — add coreutils to the Install recording deps brew list in codemagic.yaml)"
@@ -385,8 +396,10 @@ for m in "${MODULES[@]}"; do
     F_=$(field "$m" 1); M_=$(field "$m" 2); MIN_=$(field "$m" 3); WL_=$(field "$m" 4); OK_=$(field "$m" 5)
 
     step "🧪 dry run for $m: $WL_"
-    gtimeout -k 30 "$DRY_TIMEOUT" "$I" -r "$DATA" /bin/sh "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/dry_$m.log" || true
-    [ "${PIPESTATUS[0]}" -eq 124 ] && fail "dry run for $m TIMED OUT after ${DRY_TIMEOUT}s (see $WORK/dry_$m.log — its last lines show where it hung; attempt 11 hung here on pcre2 for ~79 min)"
+    _dry_start=$(date +%s)
+    gtimeout -k 30 "$DRY_TIMEOUT" "$I" -r "$DATA" /bin/sh -x "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/dry_$m.log" || true
+    _dry_elapsed=$(( $(date +%s) - _dry_start ))
+    [ "$_dry_elapsed" -ge "$DRY_TIMEOUT" ] && fail "dry run for $m TIMED OUT after ${DRY_TIMEOUT}s (ran ${_dry_elapsed}s; see $WORK/dry_$m.log — its last lines show where it hung; attempt 11 hung here on pcre2 for ~79 min)"
     if grep -q FAIL "$WORK/dry_$m.log"; then
         echo "--- FAIL lines in dry_$m.log ---" >&2
         grep FAIL "$WORK/dry_$m.log" | head -10 >&2
@@ -396,9 +409,11 @@ for m in "${MODULES[@]}"; do
 
     step "📼 recording $m ($M_)"
     rec="$WORK/$m.jsonl"; rm -f "$rec"
+    _rec_start=$(date +%s)
     ISH_JIT_PIC=1 ISH_JIT_RECORD="$rec" ISH_JIT_RECORD_MOD="$M_" \
         gtimeout -k 30 "$REC_TIMEOUT" "$I" -r "$DATA" /bin/sh "$WL_" 2>&1 | { grep -v "^NETDIAG" || true; } > "$WORK/rec_$m.log" || true
-    [ "${PIPESTATUS[0]}" -eq 124 ] && fail "recording run for $m TIMED OUT after ${REC_TIMEOUT}s (see $WORK/rec_$m.log — its last lines show where it hung)"
+    _rec_elapsed=$(( $(date +%s) - _rec_start ))
+    [ "$_rec_elapsed" -ge "$REC_TIMEOUT" ] && fail "recording run for $m TIMED OUT after ${REC_TIMEOUT}s (ran ${_rec_elapsed}s; see $WORK/rec_$m.log — its last lines show where it hung)"
     if grep -q FAIL "$WORK/rec_$m.log"; then
         echo "--- FAIL lines in rec_$m.log ---" >&2
         grep FAIL "$WORK/rec_$m.log" | head -10 >&2
