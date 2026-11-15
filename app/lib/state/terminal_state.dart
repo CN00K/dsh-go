@@ -873,10 +873,13 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       // unreachable): offer the reset, it is the recovery path.
       // Diagnostic (build 30): append the raw iSH phase.
       // Build 31: refresh first so the loopback flag is fresh.
+      // (await hoisted out of the _update closure: `await` is not allowed
+      // inside a synchronous closure.)
+      final ishStatus = await _freshIshStatus();
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
             message:
-                '${TerminalCopy.offline}\n${TerminalCopy.ishStatusLine(await _freshIshStatus())}',
+                '${TerminalCopy.offline}\n${TerminalCopy.ishStatusLine(ishStatus)}',
             ishResetOffered: true,
           ));
     }
