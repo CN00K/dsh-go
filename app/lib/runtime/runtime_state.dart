@@ -332,6 +332,16 @@ class IshRuntimeController extends Notifier<IshRuntimeState> {
     if (ref.mounted) await _refresh();
   }
 
+  /// Ensure the host workspace directory exists right now (build 46).
+  /// Idempotent; called immediately before backend.create so the
+  /// gateway always sees an existing working directory. Refreshes the
+  /// status afterwards so a failed ensure (ish_workspace_missing, the
+  /// Swift side sets phase error) shows up in the diagnosis.
+  Future<void> ensureWorkspace() async {
+    await _bridge.ensureWorkspace();
+    if (ref.mounted) await _refresh();
+  }
+
   Future<void> stop() async {
     await _bridge.stop();
     if (ref.mounted) await _refresh();
