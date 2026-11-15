@@ -95,6 +95,10 @@ class IshStatus {
     this.error,
     this.loopbackRunning = false,
     this.loopbackPort = 0,
+    this.loopbackState = 'unknown',
+    this.loopbackError,
+    this.loopbackStartCalled = false,
+    this.loopbackStartCount = 0,
   });
 
   const IshStatus.unknown() : this(phase: IshPhase.notInstalled);
@@ -115,6 +119,10 @@ class IshStatus {
     },
     loopbackRunning: map['loopbackRunning'] == true,
     loopbackPort: (map['loopbackPort'] as num?)?.toInt() ?? 0,
+    loopbackState: map['loopbackState'] as String? ?? 'unknown',
+    loopbackError: map['loopbackError'] as String?,
+    loopbackStartCalled: map['loopbackStartCalled'] == true,
+    loopbackStartCount: (map['loopbackStartCount'] as num?)?.toInt() ?? 0,
   );
 
   final IshPhase phase;
@@ -152,6 +160,21 @@ class IshStatus {
 
   /// The loopback service's ephemeral port (0 when down).
   final int loopbackPort;
+
+  /// The loopback listener's last state (build 36): "not-started",
+  /// "starting", "created", "setup", "waiting", "ready", "failed",
+  /// "cancelled", "create-failed", "ready-no-port". Tells the failure
+  /// page WHY the service is down instead of a bare `loopback DOWN`.
+  final String loopbackState;
+
+  /// The loopback listener's last error text (null when none).
+  final String? loopbackError;
+
+  /// Whether IShLoopbackService.start() was ever called from performBoot.
+  final bool loopbackStartCalled;
+
+  /// How many times start() ran (idempotent — >1 means a re-boot).
+  final int loopbackStartCount;
 
   bool get isRunning => phase == IshPhase.running;
 

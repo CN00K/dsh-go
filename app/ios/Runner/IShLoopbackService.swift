@@ -86,6 +86,16 @@ final class IShLoopbackService {
   private var boundPort: Int = 0
   private var running = false
 
+  // Diagnostic (build 36): why the listener never becomes ready.
+  // Build 35 showed `loopback DOWN` with no cause (start() is called
+  // from performBoot, but `running` only flips in the .ready handler),
+  // so track the listener's last state + error and expose them via
+  // `diagnostics` for the failure page. All guarded by `queue`.
+  private var listenerState = "not-started"
+  private var lastErrorText: String?
+  private var startCalled = false
+  private var startCount = 0
+
   /// The single active PTY session (nil when none). Guarded by `queue`.
   private var ptySession: PTYSession?
 
@@ -110,6 +120,22 @@ final class IShLoopbackService {
     }
   }
 
+  /// Diagnostic snapshot for the failure page (build 36): the
+  /// listener's last state, the last error, and whether start() ran.
+  var diagnostics: [String: Any] {
+    queue.sync {
+      var d: [String: Any] = [
+        "state": listenerState,
+        "startCalled": startCalled,
+        "startCount": startCount,
+        "boundPort": boundPort,
+        "running": running,
+      ]
+      if let e = lastErrorText { d["lastError"] = e }
+      return d
+    }
+  }
+
   /// Start listening on 127.0.0.1 (ephemeral port). Idempotent.
   /// Writes the token file (0600). Non-fatal on failure: logs and
   /// leaves isRunning == false.
@@ -117,15 +143,21 @@ final class IShLoopbackService {
     queue.async { [weak self] in
       guard let self else { return }
       if self.running { return }
+      self.startCalled = true
+      self.startCount += 1
+      self.listenerState = "starting"
       let token = Self.makeToken()
       let parameters = NWParameters.tcp
       // NWListener(using:on:) takes a Port, not an Endpoint (no endpoint
       // overload in this SDK): bind an ephemeral port on all interfaces
       // and enforce loopback-only in accept(_:) below.
       guard let listener = try? NWListener(using: parameters, on: .any) else {
+        self.listenerState = "create-failed"
+        self.lastErrorText = "NWListener creation failed"
         NSLog("ish-loopback: NWListener creation failed")
         return
       }
+      self.listenerState = "created"
       self.listener = listener
       self.token = token
       listener.stateUpdateHandler = { [weak self] state in
@@ -137,9 +169,12 @@ final class IShLoopbackService {
             self.boundPort = Int(listener.port?.rawValue ?? 0)
             self.running = self.boundPort > 0
             if self.running {
+              self.listenerState = "ready"
               self.writeServiceFile(port: self.boundPort, token: token)
               NSLog("ish-loopback: listening on 127.0.0.1:\(self.boundPort)")
             } else {
+              self.listenerState = "ready-no-port"
+              self.lastErrorText = "listener ready but no port assigned"
               NSLog("ish-loopback: listener ready but no port assigned")
             }
           }
@@ -148,11 +183,23 @@ final class IShLoopbackService {
           self.queue.async { [weak self] in
             self?.running = false
             self?.boundPort = 0
+            self?.listenerState = "failed"
+            self?.lastErrorText = "\(error)"
           }
         case .cancelled:
           self.queue.async { [weak self] in
             self?.running = false
             self?.boundPort = 0
+            self?.listenerState = "cancelled"
+          }
+        case .waiting(let error):
+          self.queue.async { [weak self] in
+            self?.listenerState = "waiting"
+            self?.lastErrorText = "\(error)"
+          }
+        case .setup:
+          self.queue.async { [weak self] in
+            self?.listenerState = "setup"
           }
         default:
           break

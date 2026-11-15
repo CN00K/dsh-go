@@ -283,8 +283,16 @@ abstract final class TerminalCopy {
         : 'iSH: ${status.phase.name} ($err)';
     final loopback = status.loopbackRunning
         ? 'loopback up :${status.loopbackPort}'
-        : 'loopback DOWN';
+        : 'loopback DOWN (${_loopbackWhy(status)})';
     return '$base, $loopback';
+  }
+
+  /// Why the loopback service is down (build 36 diagnostic).
+  static String _loopbackWhy(IshStatus status) {
+    if (!status.loopbackStartCalled) return 'start never called';
+    final err = status.loopbackError;
+    if (err != null && err.isNotEmpty) return '${status.loopbackState}: $err';
+    return 'state=${status.loopbackState}';
   }
 
   /// True when the failed tab should offer the reset button. This is

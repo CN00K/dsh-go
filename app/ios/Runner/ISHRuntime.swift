@@ -157,6 +157,14 @@ import Foundation
        let port = info["port"] as? Int, port > 0 {
       value["loopbackPort"] = port
     }
+    // Diagnostic (build 36): why the loopback service is down. Build 35
+    // showed `loopback DOWN` with no cause — expose the listener's last
+    // state + error so the failure page can name it.
+    let lb = IShLoopbackService.shared.diagnostics
+    value["loopbackState"] = lb["state"] as? String ?? "unknown"
+    value["loopbackStartCalled"] = lb["startCalled"] as? Bool ?? false
+    value["loopbackStartCount"] = lb["startCount"] as? Int ?? 0
+    if let e = lb["lastError"] as? String { value["loopbackError"] = e }
     return value
   }
 
