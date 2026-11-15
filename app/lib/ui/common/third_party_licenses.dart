@@ -37,6 +37,10 @@ void registerThirdPartyLicenses() {
       LicenseEntryWithLineBreaks(<String>['Phosphor Icons'], _phosphorMit),
       LicenseEntryWithLineBreaks(<String>['Material Icons'], _materialIconsNotice + _apache2),
       LicenseEntryWithLineBreaks(<String>['discourse-emojis'], _discourseEmojisMit),
+      // iOS Linux sandbox (iSH): the in-app Linux environment (terminal + agent bash).
+      LicenseEntryWithLineBreaks(<String>['iSH'], '$_ishNotice\n$_gpl3'),
+      LicenseEntryWithLineBreaks(<String>['Alpine Linux'], _alpineNotice),
+      LicenseEntryWithLineBreaks(<String>['NodeMobile (Node.js)'], _nodeMobileMit),
     ]),
   );
   LicenseRegistry.addLicense(() async* {
@@ -230,6 +234,54 @@ discourse-emojis (https://github.com/discourse/discourse-emojis)
 Discourse, author Joffrey Jaffeux
 
 Released under the MIT License (per discourse-emojis.gemspec):
+
+$_mitTerms''';
+
+/// iSH (https://github.com/openminis/ish-arm64, pinned commit 0fd17a13):
+/// the user-mode Linux kernel + Alpine userland behind the in-app Linux
+/// sandbox (terminal + agent bash). GPLv3; contributions after commit
+/// 0e3a4144 are additionally licensed under GPLv2; the additional terms
+/// in LICENSE.IOS also apply. Corresponding source is the
+/// feat/ish-linux-sandbox branch of https://github.com/CN00K/dsh-go
+/// (see THIRD_PARTY_NOTICES.md at the repository root).
+const _ishNotice = '''
+iSH — iOS Linux shell environment (https://github.com/openminis/ish-arm64)
+
+iSH is licensed under the GNU General Public License v3.0. The full text
+of the GPLv3 follows below. Contributions made after commit
+0e3a4144f93135c4fd618c8397d2cfd87194f69f are additionally licensed under
+the GPLv2, and the additional terms in LICENSE.IOS apply (App Store
+distribution waiver: the copyright holders will not pursue a violation
+that results solely from the conflict between the GPL and the App Store
+terms, as long as the GPL is complied with in all other respects,
+including providing users with source code and the text of the license).
+''';
+
+/// Alpine Linux 3.21.0 minirootfs: the guest root filesystem iSH runs
+/// (converted to fakefs by third_party/ish/prepare-rootfs.sh). Alpine is a
+/// collection of packages under their own licenses (MIT, BSD, GPL, Apache
+/// and others); the per-package license list is in the Alpine package
+/// database for 3.21.0. AOT-recorded modules: musl (MIT), busybox (GPLv2),
+/// zlib (zlib license), OpenSSL libcrypto/libssl 3.3.2 (Apache 2.0),
+/// pcre2 10.43 (BSD 3-Clause). See THIRD_PARTY_NOTICES.md.
+const _alpineNotice = '''
+Alpine Linux 3.21.0 (https://alpinelinux.org)
+
+Alpine Linux is a collection of packages, each under its own license
+(MIT, BSD, GPL, Apache and others). The guest root filesystem in this app
+is the Alpine 3.21.0 minirootfs for aarch64, converted to the fakefs
+format iSH runs. Per-package licenses are listed in the Alpine package
+database for 3.21.0; the AOT-recorded modules are musl (MIT), busybox
+(GPLv2), zlib (zlib license), OpenSSL libcrypto/libssl 3.3.2
+(Apache License 2.0) and pcre2 10.43 (BSD 3-Clause).
+''';
+
+/// NodeMobile 24.20.0: the iOS build of Node.js that runs the DSH engine
+/// the sandbox integrates with.
+const _nodeMobileMit = '''
+NodeMobile (Node.js) (https://nodejs.org)
+
+Copyright Node.js contributors. All rights reserved.
 
 $_mitTerms''';
 

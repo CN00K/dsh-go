@@ -84,3 +84,23 @@
 +			terminal = ishTerminal && ishPty !== void 0
 +				? ishPty.spawn(direct?.file ?? scope?.command ?? file, direct?.args ?? scope?.args ?? [...launch.argv.slice(1)], direct?.options ?? options)
 +				: requireNodePty().spawn(direct?.file ?? scope?.command ?? file, direct?.args ?? scope?.args ?? [...launch.argv.slice(1)], direct?.options ?? options);
+--- a/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
++++ b/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
+@@ -1033,7 +1033,17 @@
+ 	const child = (internals.spawn ?? spawn)(program, args, {
+ 		cwd: spec.cwd,
+ 		env: controlEnvironment(childEnv(spec.env), spec.stdio.control),
+ 		stdio,
++		// iSH Linux sandbox (Stage 5.2, dsh-go): forward the caller's
++		// AbortSignal to the spawn so the bridge (which intercepts this
++		// spawn for "/ish-runner") can abort the loopback request on
++		// DSH timeout / user Stop. Without this the managed handle's
++		// owner.signal() is a no-op for the bridge's synthetic pid
++		// (process.kill on the fake group is ESRCH) and the guest
++		// command would run until the server timeout instead of dying
++		// promptly. Node's real spawn honours options.signal natively,
++		// so non-iSH spawns are unaffected.
++		signal: spec.signal,
+ 		detached: platform !== "win32",
+ 		windowsHide: platform === "win32"
+ 	});

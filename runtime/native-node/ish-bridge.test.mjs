@@ -20,6 +20,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 import {
+  DEFAULT_EXEC_TIMEOUT_MS,
   ISH_PTY_COMMAND,
   ISH_RUNNER_COMMAND,
   extractBashCommand,
@@ -457,6 +458,63 @@ test('spawnIshExec fails closed when the bridge is down', async () => {
   // The runner-failure line still names the file that was checked, so a
   // device log tells a missing boot from a wrong path.
   assert.match(stderr, /ish-service\.json not found at /);
+});
+
+test('spawnIshExec posts the 600s backstop timeout (never before the DSH deadline)', async () => {
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.ok(bearerOk(req));
+    const parsed = JSON.parse(body.toString('utf8'));
+    assert.equal(parsed.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS);
+    assert.equal(parsed.timeoutMs, 600_000);
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({exitCode: 0, durationMs: 5}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'echo hi'],
+      {cwd: join(fakeHome, 'workspace'), env: {}});
+    const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    assert.deepEqual(outcome, {code: 0, signal: null});
+  } finally {
+    await close();
+  }
+});
+
+test('spawnIshExec aborts the request when the caller signal aborts (DSH timeout / Stop)', async () => {
+  let requestClosed = false;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.ok(bearerOk(req));
+    // Never send the final frame: the command "runs" until aborted.
+    req.on('close', () => { requestClosed = true; });
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'partial'}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const outer = new AbortController();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'sleep 300'],
+      {cwd: join(fakeHome, 'workspace'), env: {}, signal: outer.signal});
+    let stdout = '';
+    child.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+    const outcomePromise = new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    // Abort after the POST is in flight, like the DSH deadline / user Stop.
+    setTimeout(() => outer.abort(), 150);
+    const outcome = await outcomePromise;
+    assert.deepEqual(outcome, {code: null, signal: 'SIGTERM'});
+    assert.equal(stdout, 'partial\n');
+    // Give the socket a moment to tear down server-side.
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(requestClosed, true);
+  } finally {
+    await close();
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -1779,6 +1779,10 @@
         "node_modules/@deepseek-ai/dsh-subprocess-local/lib/index.js": {
           "after": "0665a14e2dcefd3f596a589a77c1ea42e16466159ca89c36c92508409c66dca3",
           "before": "4784084d8dd7abf217b75fe546dec6c87975a167e1a20ed035e220d279080d1c"
+        },
+        "node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js": {
+          "after": "debd0633440548723955c62a0f2a30c1a2eea652671a935f673d0faf8f3a3e79",
+          "before": "6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153"
         }
       }
     }

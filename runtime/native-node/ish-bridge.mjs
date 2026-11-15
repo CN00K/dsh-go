@@ -101,8 +101,21 @@ function nextSyntheticPid() {
 export const ISH_BRIDGE_UNAVAILABLE = 'ish bridge unavailable';
 export const ISH_NOT_BOOTED = 'ish_not_booted';
 
-/** Default /ish/exec timeoutMs. Matches the bash-sandbox config (60s). */
-export const DEFAULT_EXEC_TIMEOUT_MS = 60_000;
+/**
+ * Default /ish/exec timeoutMs. 600s = the bash executor's maxTimeoutMs
+ * (dsh-bash-local: default 120s, max 600s; the model-requested timeout
+ * is clamped into that range by clampTimeout). The DSH-side deadline
+ * is the operative timeout — it reaches the bridge as options.signal
+ * (plumbed by the patched spawnSubprocess) and aborts the request,
+ * so the tool reports "[timed out after Nms]" with partial output.
+ * The server timeout is only a backstop (for commands whose DSH
+ * deadline is disabled, e.g. background jobs, or if the abort path
+ * fails); it must never fire first for a DSH-timed command, or the
+ * tool would see exitCode -3 with no timeout marker. The old 60s
+ * value cut every 60–120s command (e.g. `sleep 70`) at 60s.
+ * The server clamps to 1s–15min, so 600s is in range.
+ */
+export const DEFAULT_EXEC_TIMEOUT_MS = 600_000;
 /**
  * First call waits this long for ish-service.json to appear. 30 s, not
  * 10 s: a first boot (rootfs install + kernel boot) routinely takes
@@ -396,9 +409,26 @@ function postExec(service, body, opts) {
         if (finalFrame) settleResolve(finalFrame);
         else settleReject(Object.assign(new Error('ish exec ended without a final frame'), {code: 'ISH_NO_FINAL_FRAME'}));
       });
-      res.on('error', (error) => settleReject(error));
+      res.on('error', (error) => {
+        // Aborted by the caller (kill / DSH timeout / Stop): the socket
+        // is torn down after the abort, so a trailing ECONNRESET is a
+        // consequence of the cancel, not a real failure.
+        if (opts.signal?.aborted) {
+          settleResolve({exitCode: null, durationMs: 0, cancelled: true});
+          return;
+        }
+        settleReject(error);
+      });
     });
     req.on('error', (error) => {
+      // Aborted by the caller: Node 24 surfaces a signal-abort as an
+      // 'error' event (AbortError / ABORT_ERR) — the 'abort' event below
+      // does not fire for signal-aborts. Treat it as a cancel, not a
+      // failure, so the caller sees SIGTERM, not exit code 1.
+      if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+        settleResolve({exitCode: null, durationMs: 0, cancelled: true});
+        return;
+      }
       // Connection failure: the service file may have been rewritten
       // (restart with a new port/token); drop the cache so the next call
       // re-reads it. The caller retries once if it wants to.
@@ -728,18 +758,23 @@ export function extractBashCommand(argv) {
  * the guest command sees EOF. This matches the bash tool's non-
  * interactive contract.
  *
- * Timeout: the DSH timeout is not visible to spawn(), so the exec uses
- * DEFAULT_EXEC_TIMEOUT_MS (60s, the bash-sandbox config). The server
- * kills the guest process group at that point and returns exitCode -3.
- * A future improvement is to plumb spec.timeoutMs through (needs a DSH
- * patch); until then, commands longer than 60s are cut off at 60s.
+ * Timeout: the DSH-side deadline (default 120s, max 600s) is the
+ * operative timeout. It reaches the shim as options.signal (plumbed
+ * by the patched spawnSubprocess), and aborting it cancels the HTTP
+ * request, so the server kills the guest process group and the tool
+ * reports the timeout with partial output. The exec's own timeoutMs
+ * is DEFAULT_EXEC_TIMEOUT_MS (600s = the bash executor's max), a
+ * backstop only — it must never fire first for a DSH-timed command,
+ * or the tool would see exitCode -3 with no timeout marker.
  *
- * Kill: aborts the HTTP request. The Swift side cancels the exec on
- * disconnect, which kills the guest process group. Note the managed
- * handle's owner.signal() is a no-op for a synthetic pid (process.kill
- * on the fake group is ESRCH), so the DSH-side terminate() cannot reach
- * the guest directly — the abort-through-disconnect is the kill path,
- * and the server-side timeout is the backstop.
+ * Kill: child.kill() aborts the HTTP request, as does the caller's
+ * AbortSignal (options.signal — the DSH deadline / user Stop). The
+ * Swift side cancels the exec on disconnect, which kills the guest
+ * process group. Note the managed handle's owner.signal() is a no-op
+ * for a synthetic pid (process.kill on the fake group is ESRCH), so
+ * the DSH-side terminate() cannot reach the guest directly — the
+ * abort-through-disconnect is the kill path, and the server-side
+ * timeout is the backstop.
  */
 export function spawnIshExec(argv, options = {}) {
   const command = extractBashCommand(argv);
@@ -773,7 +808,19 @@ export function spawnIshExec(argv, options = {}) {
   child.spawnargs = argv;
 
   let settled = false;
-  let abortController = null;
+  const abortController = new AbortController();
+  // Wire the caller's AbortSignal (DSH passes spec.signal via the spawn
+  // options — the deadline abort / user Stop — plumbed by the patched
+  // spawnSubprocess). Aborting cancels the HTTP request, which makes
+  // the Swift side kill the guest process group. Without this, DSH
+  // timeout / Stop never reaches the guest: the managed handle's
+  // owner.signal() is a no-op for the synthetic pid (ESRCH), so the
+  // guest command would run until the server timeout instead.
+  const outerSignal = options.signal;
+  if (outerSignal) {
+    if (outerSignal.aborted) abortController.abort();
+    else outerSignal.addEventListener('abort', () => abortController.abort(), {once: true});
+  }
   const finish = (code, signal) => {
     if (settled) return;
     settled = true;
@@ -795,7 +842,7 @@ export function spawnIshExec(argv, options = {}) {
   child.kill = (signal) => {
     if (settled) return false;
     child.killed = true;
-    abortController?.abort();
+    abortController.abort();
     finish(null, typeof signal === 'string' ? signal : 'SIGTERM');
     return true;
   };
@@ -814,9 +861,9 @@ export function spawnIshExec(argv, options = {}) {
     try {
       await stdinWait;
       if (settled) return; // killed while waiting for stdin
+      if (abortController.signal.aborted) { finish(null, 'SIGTERM'); return; } // aborted while waiting for stdin
       const stdinData = stdinChunks.length > 0 ? Buffer.concat(stdinChunks) : undefined;
       const guestCwd = toGuest(options.cwd ?? process.cwd());
-      abortController = new AbortController();
       const result = await ishExec({
         command,
         cwd: guestCwd ?? undefined,
