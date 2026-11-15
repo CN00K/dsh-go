@@ -269,22 +269,47 @@ import Foundation
   /// the kernel.isBooted early-return branch never created the
   /// directory or the mount — same class of bug as build 42 (the
   /// loopback service was not restarted in that branch either).
-  /// Non-fatal: the guest still boots without it.
-  private func ensureHostWorkspace() {
+  /// (Build 45) Returns whether the directory exists after the
+  /// attempt, so a silent create failure surfaces as a clear boot
+  /// error instead of the cryptic gateway error later. The
+  /// bind-mount itself stays non-fatal (the guest boots without it).
+  @discardableResult
+  private func ensureHostWorkspace() -> Bool {
     do {
       try files.createDirectory(at: Self.hostWorkspaceURL, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
-      let mountRc = kernel.bindMountPath("/home/workspace", toHostPath: Self.hostWorkspaceURL.path, readOnly: false)
-      if mountRc != 0 {
-        DispatchQueue.main.async { [weak self] in
-          self?.log("/home/workspace 挂载失败（rc=\(mountRc)），终端可用但 workspace 不共享")
-        }
-      }
     } catch {
       DispatchQueue.main.async { [weak self] in
         self?.log("/home/workspace 宿主目录创建失败：\(error.localizedDescription)")
       }
+      return false
     }
+    guard files.fileExists(atPath: Self.hostWorkspaceURL.path) else {
+      DispatchQueue.main.async { [weak self] in
+        self?.log("/home/workspace 宿主目录创建后仍不存在")
+      }
+      return false
+    }
+    let mountRc = kernel.bindMountPath("/home/workspace", toHostPath: Self.hostWorkspaceURL.path, readOnly: false)
+    if mountRc != 0 {
+      DispatchQueue.main.async { [weak self] in
+        self?.log("/home/workspace 挂载失败（rc=\(mountRc)），终端可用但 workspace 不共享")
+      }
+    }
+    return true
+  }
+
+  /// Fail performBoot with a clear error when the host workspace
+  /// directory cannot be created (build 45): without it the gateway
+  /// rejects every terminal with the cryptic "working-directory:
+  /// directory does not exist", so surface the cause here instead.
+  private func failWorkspaceMissing(result: @escaping FlutterResult) {
+    let message = "工作目录创建失败：\(Self.hostWorkspaceURL.path) 不存在，终端无法启动"
+    DispatchQueue.main.async { [weak self] in
+      self?.setPhase("error", error: ["code": "ish_workspace_missing", "message": message])
+      self?.log("boot 失败：\(message)")
+    }
+    finish(result, error("ish_workspace_missing", message))
   }
 
   private func performBoot(result: @escaping FlutterResult) {
@@ -315,7 +340,12 @@ import Foundation
         // directory and bind-mount it, or the gateway rejects the
         // terminal with "working-directory: directory does not
         // exist" (build 43 device test 23:03).
-        ensureHostWorkspace()
+        // (Build 45) Fail loudly if the directory still cannot be
+        // created, instead of letting the gateway fail cryptically.
+        guard ensureHostWorkspace() else {
+          failWorkspaceMissing(result: result)
+          return
+        }
         IShLoopbackService.shared.start()
         DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
         finish(result, nil)
@@ -339,7 +369,11 @@ import Foundation
       // a Reset may have stopped. start() is idempotent.
       // (Build 44) Same for the host workspace: create the directory
       // and bind-mount it (see above).
-      ensureHostWorkspace()
+      // (Build 45) Fail loudly if the directory still cannot be created.
+      guard ensureHostWorkspace() else {
+        failWorkspaceMissing(result: result)
+        return
+      }
       IShLoopbackService.shared.start()
       DispatchQueue.main.async { [weak self] in self?.setPhase("running") }
       finish(result, nil)
@@ -412,8 +446,11 @@ import Foundation
 
     // Share the DSH workspace into the guest at /home/workspace
     // (design §2.6; idempotent — safe to call again after boot).
-    // Non-fatal: the guest still boots without it.
-    ensureHostWorkspace()
+    // (Build 45) Fail loudly if the directory still cannot be created.
+    guard ensureHostWorkspace() else {
+      failWorkspaceMissing(result: result)
+      return
+    }
 
     DispatchQueue.main.async { [weak self] in
       self?.setPhase("running")

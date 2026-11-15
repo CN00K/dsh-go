@@ -741,7 +741,14 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
   Future<String?> _ensureIshBooted(int epoch) async {
     final ish = ref.read(ishRuntimeProvider.notifier);
     var status = ref.read(ishRuntimeProvider).status;
-    if (status.phase == IshPhase.running) return null;
+    // (Build 45) Do NOT return early when already running: ish.boot()
+    // must run on every terminal open so performBoot (re)ensures the
+    // host workspace directory, the bind-mount and the loopback
+    // service. The isBooted branch is fast and idempotent; skipping
+    // it left the workspace directory missing and the terminal failed
+    // with "gateway/internal: working-directory: directory does not
+    // exist" even though the kernel and loopback were up (build 44
+    // device test 23:21).
     if (status.phase == IshPhase.booting || status.phase == IshPhase.installing) {
       status = await _waitForIshSettled(epoch);
       if (_stale(epoch)) return null;
