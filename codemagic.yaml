@@ -282,7 +282,14 @@ workflows:
           set -euo pipefail
           cd app
           (cd ios && pod install) 2>&1 | tee ../build-logs/08-pod-install.log
-          flutter build ios --no-codesign 2>&1 | tee ../build-logs/09-flutter-build-ios.log || echo "NOTE: flutter exited non-zero (likely post-build Development Team check); continuing if Runner.app exists"
+          # Bypass `flutter build ios`: its post-build Development Team check
+          # fails on Flutter 3.47.7 even though the Xcode build succeeds,
+          # and it leaves no Runner.app behind (builds 31/32/33).
+          # Build with xcodebuild directly; the Runner target's script phase
+          # builds App.framework (Dart AOT). Then copy the .app into place.
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tee ../build-logs/09-flutter-build-ios.log
+          mkdir -p build/ios/iphoneos
+          cp -R build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
           test -d build/ios/iphoneos/Runner.app
           du -sh build/ios/iphoneos/Runner.app
 
@@ -595,7 +602,14 @@ workflows:
           set -euo pipefail
           cd app
           (cd ios && pod install) 2>&1 | tee ../build-logs/08-pod-install.log
-          flutter build ios --no-codesign 2>&1 | tee ../build-logs/09-flutter-build-ios.log || echo "NOTE: flutter exited non-zero (likely post-build Development Team check); continuing if Runner.app exists"
+          # Bypass `flutter build ios`: its post-build Development Team check
+          # fails on Flutter 3.47.7 even though the Xcode build succeeds,
+          # and it leaves no Runner.app behind (builds 31/32/33).
+          # Build with xcodebuild directly; the Runner target's script phase
+          # builds App.framework (Dart AOT). Then copy the .app into place.
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tee ../build-logs/09-flutter-build-ios.log
+          mkdir -p build/ios/iphoneos
+          cp -R build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
           test -d build/ios/iphoneos/Runner.app
           du -sh build/ios/iphoneos/Runner.app
 
