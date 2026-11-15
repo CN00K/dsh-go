@@ -269,6 +269,17 @@ abstract final class TerminalCopy {
     }
   }
 
+  /// One-line raw iSH status for the failure page (diagnostic, build 30).
+  /// e.g. `iSH: booting` or `iSH: error (ish_boot_timeout: ...)` or
+  /// `iSH: running`. Shown under the failure message so a device test
+  /// reveals where the boot is stuck, instead of the bare generic line.
+  static String ishStatusLine(IshStatus status) {
+    final err = status.error;
+    return err == null || err.isEmpty
+        ? 'iSH: ${status.phase.name}'
+        : 'iSH: ${status.phase.name} ($err)';
+  }
+
   /// True when the failed tab should offer the reset button. This is
   /// only ever called for a terminal tab that already failed for an
   /// iSH-related reason, so the answer is always yes: the reset
@@ -790,7 +801,7 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
         final ishStatus = ref.read(ishRuntimeProvider).status;
         _update(id, (t) => t.copyWith(
           phase: TerminalPhase.failed,
-          message: ishFailure,
+          message: '$ishFailure\n${TerminalCopy.ishStatusLine(ishStatus)}',
           ishResetOffered: TerminalCopy.needsRootfsReset(ishStatus),
         ));
         return;
@@ -821,18 +832,27 @@ class TerminalWorkspace extends Notifier<TerminalWorkspaceState> {
       // where a reset is meaningless. (Fix 2, 2026-11-15: this path
       // never set ishResetOffered, so build 26 showed no reset
       // button even though the terminal failed.)
+      // Diagnostic (build 30): append the raw iSH phase so the
+      // failure page shows where it is stuck (booting? running?
+      // error?) instead of the bare generic line.
+      final showIsh = message == TerminalCopy.startFailed;
+      final ishLine = showIsh
+          ? '\n${TerminalCopy.ishStatusLine(ref.read(ishRuntimeProvider).status)}'
+          : '';
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
-            message: message,
-            ishResetOffered: message == TerminalCopy.startFailed,
+            message: '$message$ishLine',
+            ishResetOffered: showIsh,
           ));
     } on Object {
       if (_stale(epoch)) return;
       // The backend could not create the terminal (bridge / iSH
       // unreachable): offer the reset, it is the recovery path.
+      // Diagnostic (build 30): append the raw iSH phase.
       _update(id, (t) => t.copyWith(
             phase: TerminalPhase.failed,
-            message: TerminalCopy.offline,
+            message:
+                '${TerminalCopy.offline}\n${TerminalCopy.ishStatusLine(ref.read(ishRuntimeProvider).status)}',
             ishResetOffered: true,
           ));
     }
