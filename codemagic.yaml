@@ -5,7 +5,7 @@
 #
 # What it does:
 #   1. flutter pub get + analyze
-#   2. Rebuilds the DSH engine tree from npm (locked) + applies the 137
+#   2. Rebuilds the DSH engine tree from npm (locked) + applies the 139
 #      hash-pinned patches (runtime/patches) — this replaces the 218 MB
 #      payload archive that prepare-ios.sh would otherwise require.
 #   3. Assembles app/ios/NativeNodeArtifacts/ (NodeMobile.xcframework +
@@ -154,7 +154,7 @@ workflows:
           sys.exit(0 if ok else 1)
           PYEOF
 
-      - name: Apply DSH patches (137, hash-pinned)
+      - name: Apply DSH patches (139, hash-pinned)
         script: |
           set -euo pipefail
           python3 -I runtime/lib/rtbuild.py patch-dsh \
@@ -162,7 +162,7 @@ workflows:
             --dsh-version 0.2.2-rc.1 \
             --patches runtime/patches \
             --out engine-build/dsh-patches.json 2>&1 | tee build-logs/05-patch-dsh.log
-          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==137, len(a)"
+          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==139, len(a)"
 
       - name: iSH bridge unit tests (ish-bridge.mjs)
         script: |
@@ -434,7 +434,7 @@ workflows:
           sys.exit(0 if ok else 1)
           PYEOF
 
-      - name: Apply DSH patches (137, hash-pinned)
+      - name: Apply DSH patches (139, hash-pinned)
         script: |
           set -euo pipefail
           python3 -I runtime/lib/rtbuild.py patch-dsh \
@@ -442,7 +442,7 @@ workflows:
             --dsh-version 0.2.2-rc.1 \
             --patches runtime/patches \
             --out engine-build/dsh-patches.json 2>&1 | tee build-logs/05-patch-dsh.log
-          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==137, len(a)"
+          python3 -c "import json; a=json.load(open('engine-build/dsh-patches.json')); print('patches applied:', len(a)); assert len(a)==139, len(a)"
 
       - name: iSH bridge unit tests (ish-bridge.mjs)
         script: |

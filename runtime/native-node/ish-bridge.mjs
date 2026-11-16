@@ -56,6 +56,18 @@
  *   a nonce-tagged marker line the Swift wrapper prints on stderr
  *   (see resolveExecCwd / ishExec opts.cwdNonce), and reuses it while
  *   the engine cwd is unchanged. See the REPORT for the full contract.
+ * - Persistent shell worker (ENV-04): piped execs with a session id
+ *   run on the session's long-lived guest /bin/bash (ishWorkerExec,
+ *   POST /ish/worker/run) instead of a fresh shell per command — the
+ *   per-command process creation + shell start under emulation was
+ *   1–2 s of fixed cost. The worker keeps its cwd natively, scopes
+ *   per-command env with a save/restore overlay, and tracks `&`
+ *   background jobs (ishWorkerJobs / ishWorkerKillJob; the agent uses
+ *   plain `jobs` / `kill %1` in the worker). One-shot /ish/exec stays
+ *   as the fallback (no session id, stdin data, tty exec, or an old
+ *   service). Timeout is a no-output watchdog (120 s of silence kills
+ *   the foreground command; the DSH deadline still aborts first for a
+ *   model-requested limit).
  *
  * What this file does NOT do:
  * - It does not change the sandbox policy. The guest only sees the
@@ -264,6 +276,14 @@ let cachedService = null; // {host, port, token} | null
 let cachedServiceFile = null;
 let lastMissingCheck = 0;
 let waitedForServiceFile = false;
+/**
+ * True once a worker request has proven this service predates the
+ * worker endpoints (HTTP 404 on /ish/worker/run). While set, the
+ * spawn shim skips the worker and goes straight to one-shot /ish/exec.
+ * Reset by invalidateServiceInfo (a service restart may bring a newer
+ * build with the endpoints).
+ */
+let workerUnsupported = false;
 
 /** Read and parse ish-service.json; returns null when absent/unparsable. */
 function readServiceFile(serviceFile) {
@@ -324,6 +344,9 @@ export function invalidateServiceInfo() {
   cachedServiceFile = null;
   waitedForServiceFile = false;
   lastMissingCheck = 0;
+  // A restart may bring a newer loopback build; re-probe the worker
+  // endpoints instead of trusting the old 404 forever.
+  workerUnsupported = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +408,7 @@ export async function ishExec(opts) {
     opts.onLine?.(frame);
   }} : opts;
   // Retry once with a fresh read of ish-service.json (same stale-cache
-  // fix as the WS path, build 37): postExec invalidates on
+  // fix as the WS path, build 37): postNdjson invalidates on
   // ECONNREFUSED/ECONNRESET, and a 401 means the token rotated, so a
   // retry with fresh info can succeed where the cached one failed.
   // ISH_NOT_BOOTED is a real state, not a stale cache — do not retry it.
@@ -395,7 +418,7 @@ export async function ishExec(opts) {
     const service = await getServiceInfo(opts);
     if (!service) throw bridgeUnavailableError(opts);
     try {
-      return await postExec(service, body, execOpts);
+      return await postNdjson(service, '/ish/exec', body, execOpts);
     } catch (error) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
@@ -408,7 +431,16 @@ export async function ishExec(opts) {
   throw lastError;
 }
 
-function postExec(service, body, opts) {
+/**
+ * POST a JSON body to the loopback service and stream back chunked
+ * NDJSON ({stream, line} frames + a terminal frame {exitCode, ...}).
+ * Shared by /ish/exec and /ish/worker/run (same framing, same abort
+ * semantics). Rejects with ISH_NOT_BOOTED on 503, ISH_HTTP_ERROR (+
+ * statusCode) on any other non-200, ISH_NO_FINAL_FRAME when the stream
+ * ends without a terminal frame. Aborting opts.signal resolves as
+ * {cancelled: true} (the server kills the guest command on disconnect).
+ */
+function postNdjson(service, path, body, opts) {
   return new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
     const settleResolve = (value) => { if (!settled) { settled = true; resolvePromise(value); } };
@@ -416,7 +448,7 @@ function postExec(service, body, opts) {
     const req = httpRequest({
       host: service.host,
       port: service.port,
-      path: '/ish/exec',
+      path,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${service.token}`,
@@ -433,7 +465,7 @@ function postExec(service, body, opts) {
         return;
       }
       if (res.statusCode !== 200) {
-        const error = new Error(`ish exec failed: HTTP ${res.statusCode}`);
+        const error = new Error(`ish ${path} failed: HTTP ${res.statusCode}`);
         error.code = 'ISH_HTTP_ERROR';
         error.statusCode = res.statusCode;
         settleReject(error);
@@ -533,6 +565,480 @@ export async function ishStatus(opts = {}) {
     req.on('error', () => resolvePromise(false));
     req.end();
   });
+}
+
+// ---------------------------------------------------------------------------
+// Persistent shell worker client (ENV-04)
+// ---------------------------------------------------------------------------
+// One long-lived guest /bin/bash per DSH session (ISHWorkerShell,
+// Swift-side), so agent execs stop paying a fresh process creation +
+// shell start per command. The bridge routes piped execs with a
+// session id to POST /ish/worker/run and falls back to one-shot
+// /ish/exec when the worker is unavailable (no session id, stdin data,
+// tty exec, worker start failure, or an old service that 404s the
+// worker endpoints). A fallback only ever happens BEFORE any output
+// has streamed — re-running a command that already produced output
+// would execute it twice.
+//
+// Protocol (see IShLoopbackService.buildWorkerCommand): the Swift
+// wrapper prints, on stderr, an END marker
+// `__DSH_END__<nonce>:<exitCode>:<cwd>` and a jobs snapshot
+// (`jobs -l` lines between JOBS_BEGIN/JOBS_END, `jobs -p` pids between
+// JOBPIDS_BEGIN/JOBPIDS_END). All protocol lines are swallowed here
+// (never delivered to onLine); the END marker updates the session cwd
+// memory (same mechanism as ENV-14) and the snapshot updates the
+// per-session job table. A line with any other nonce is ordinary
+// output. The terminal frame only arrives after the marker AND the
+// snapshot, so the job table is current when the run resolves.
+//
+// Timeouts: the DSH-side deadline (options.signal) is still the
+// operative timeout for a model-requested limit, and the server's
+// 600 s wall clock is the backstop. Between them sits the Swift
+// no-output watchdog: 120 s of silence kills the foreground command
+// (5 s grace, then the worker is killed and rebuilt). A command that
+// keeps producing output is never killed by it.
+//
+// Jobs: a command's `&` children are jobs OF THE WORKER SHELL (no
+// subshell wrapper), so the agent uses plain bash builtins in the
+// worker — `jobs -l` to list, `kill %1` / `kill <pid>` to kill — and
+// ishWorkerJobs / ishWorkerKillJob are the programmatic equivalents
+// over the same state. ishWorkerJobs runs the no-op command `:` on the
+// worker to refresh the snapshot (there is no dedicated loopback
+// endpoint: a control channel into the worker's stdin would queue
+// behind the running command anyway). Killing a job goes through
+// POST /ish/worker/jobs/kill, which refuses any pid that is not a live
+// descendant of the worker. Stopping a worker (ishWorkerStop, or the
+// service stop) kills its whole process tree, so no background job
+// survives its session.
+//
+// Concurrency: runs for one session are serialized (the worker reads
+// one command stream — two runs must never interleave stdin writes).
+// Cross-session runs are independent (different workers).
+
+/** Error code when the service predates the worker endpoints (HTTP 404). */
+export const ISH_WORKER_UNSUPPORTED = 'ish_worker_unsupported';
+/** Error code when a job kill names a pid that is not a job of the worker. */
+export const ISH_JOB_NOT_FOUND = 'ish_job_not_found';
+
+/** Protocol line prefixes the worker wrapper prints on stderr. */
+export const WORKER_END_MARKER_PREFIX = '__DSH_END__';
+export const WORKER_JOBS_BEGIN_PREFIX = '__DSH_JOBS_BEGIN__';
+export const WORKER_JOBS_END_PREFIX = '__DSH_JOBS_END__';
+export const WORKER_JOBPIDS_BEGIN_PREFIX = '__DSH_JOBPIDS_BEGIN__';
+export const WORKER_JOBPIDS_END_PREFIX = '__DSH_JOBPIDS_END__';
+
+/**
+ * Parse a worker END marker frame: `__DSH_END__<nonce>:<exitCode>:<cwd>`.
+ * Returns {exitCode, cwd}, or null when the frame is not a marker for
+ * this nonce (same exact-nonce rule as the cwd marker: a command that
+ * prints a look-alike line cannot corrupt the run).
+ */
+export function parseWorkerEndMarker(frame, nonce) {
+  if (!nonce || frame?.stream !== 'stderr' || typeof frame?.line !== 'string') return null;
+  const prefix = `${WORKER_END_MARKER_PREFIX}${nonce}:`;
+  if (!frame.line.startsWith(prefix)) return null;
+  const rest = frame.line.slice(prefix.length);
+  const colon = rest.indexOf(':');
+  if (colon < 0) return null;
+  const code = Number(rest.slice(0, colon));
+  const cwd = rest.slice(colon + 1);
+  if (!Number.isInteger(code) || code < 0 || code > 255) return null;
+  if (!cwd.startsWith('/') || /[\0-\x1f\x7f]/.test(cwd)) return null;
+  return {exitCode: code, cwd};
+}
+
+/**
+ * Parse one `jobs -l` line: `[1]+  1234 Running  sleep 600 &`.
+ * Returns {job, pid, state, command}, or null. A job notification line
+ * (`[1]+ Done sleep 1`, no pid) is NOT a jobs line. State is
+ * normalized to 'running' | 'done' | 'stopped' ('Done' / 'Exit 1' /
+ * 'Terminated' all read as done — bash drops done jobs from the table
+ * once notified, so a missing job is done too).
+ */
+export function parseJobsLine(line) {
+  if (typeof line !== 'string') return null;
+  const m = /^\[(\d+)\][+-]?\s+(\d+)\s+([A-Za-z]+(?:\s+\d+)?)\s+(.*)$/.exec(line);
+  if (!m) return null;
+  const stateWord = m[3].split(/\s+/)[0];
+  const state = stateWord === 'Running' ? 'running'
+    : stateWord === 'Stopped' ? 'stopped' : 'done';
+  return {job: Number(m[1]), pid: Number(m[2]), state, command: m[4]};
+}
+
+/**
+ * Parse a jobs snapshot (the raw `jobs -l` text between the JOBS_BEGIN
+ * / JOBS_END markers) into an array of jobs. Lines that are not jobs
+ * lines (notifications, blanks) are ignored.
+ */
+export function parseJobsSnapshot(text) {
+  if (typeof text !== 'string') return [];
+  const jobs = [];
+  for (const line of text.split('\n')) {
+    const job = parseJobsLine(line);
+    if (job) jobs.push(job);
+  }
+  return jobs;
+}
+
+/**
+ * Per-session worker state (bridge-side mirror of the Swift worker):
+ * - knownAlive: a run completed on this worker (so its cwd is known).
+ *   Cleared when a run reports workerDied, is aborted, or the worker
+ *   is stopped — the next run then resends the cwd (a rebuilt worker
+ *   starts in the remembered directory).
+ * - cwd: the worker's last known directory (from the last END marker).
+ * - jobs: Map pid → {id, pid, job, command, state, startedAt, endedAt?}.
+ * - generation: bumped whenever the worker is known dead/rebuilt; a
+ *   run that started under an older generation must not update the
+ *   state afterwards (it raced with a stop/kill).
+ */
+const workerSessions = new Map();
+/** Per-session promise chain serializing worker operations. */
+const workerRunQueues = new Map();
+
+function workerSessionState(sessionId) {
+  let state = workerSessions.get(sessionId);
+  if (!state) {
+    state = {knownAlive: false, cwd: null, jobs: new Map(), generation: 0};
+    workerSessions.set(sessionId, state);
+  }
+  return state;
+}
+
+/** Drop all worker state (tests; also bounds the maps). */
+export function clearWorkerState() {
+  workerSessions.clear();
+  workerRunQueues.clear();
+}
+
+/** The cached job table for a session (no network call), sorted by pid. */
+export function getWorkerJobs(sessionId) {
+  const state = workerSessions.get(sessionId);
+  if (!state) return [];
+  return [...state.jobs.values()].sort((a, b) => a.pid - b.pid);
+}
+
+/** Merge a fresh jobs snapshot into the session's job table. */
+function updateWorkerJobs(sessionId, jobs) {
+  const state = workerSessionState(sessionId);
+  const now = Date.now();
+  const seen = new Set();
+  for (const job of jobs) {
+    seen.add(job.pid);
+    const prev = state.jobs.get(job.pid);
+    if (prev) {
+      prev.state = job.state;
+      prev.command = job.command;
+      prev.job = job.job;
+      if (job.state === 'done' && !prev.endedAt) prev.endedAt = now;
+      if (job.state !== 'done') delete prev.endedAt;
+    } else {
+      state.jobs.set(job.pid, {
+        id: String(job.pid), pid: job.pid, job: job.job,
+        command: job.command, state: job.state, startedAt: now,
+        ...(job.state === 'done' ? {endedAt: now} : {}),
+      });
+    }
+  }
+  // A job missing from the snapshot has finished (bash drops done jobs
+  // from the table once notified).
+  for (const [pid, job] of state.jobs) {
+    if (!seen.has(pid) && job.state !== 'done') {
+      job.state = 'done';
+      job.endedAt = now;
+    }
+  }
+}
+
+/**
+ * Serialize worker operations per session: the worker reads one command
+ * stream, so two runs (or a run and a jobs refresh) for the same session
+ * must never interleave stdin writes. Cross-session operations are
+ * independent (different workers). A failed operation does not block
+ * the queue (the chain continues).
+ */
+function enqueueWorkerOp(sessionId, fn) {
+  const prev = workerRunQueues.get(sessionId) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  workerRunQueues.set(sessionId, next);
+  // The queue tail must never surface an unhandled rejection.
+  next.catch(() => {});
+  return next;
+}
+
+/**
+ * POST a small JSON body and parse the JSON response. Used by the
+ * worker kill/stop endpoints (no NDJSON streaming there). Rejects with
+ * ISH_NOT_BOOTED on 503, ISH_HTTP_ERROR (+ statusCode) otherwise.
+ */
+function postJson(service, path, bodyObj, opts = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const settleResolve = (value) => { if (!settled) { settled = true; resolvePromise(value); } };
+    const settleReject = (error) => { if (!settled) { settled = true; rejectPromise(error); } };
+    const body = JSON.stringify(bodyObj);
+    const req = httpRequest({
+      host: service.host,
+      port: service.port,
+      path,
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${service.token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      signal: opts.signal,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        if (res.statusCode === 503) {
+          const error = new Error(ISH_NOT_BOOTED);
+          error.code = 'ISH_NOT_BOOTED';
+          settleReject(error);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          const error = new Error(`ish ${path} failed: HTTP ${res.statusCode}`);
+          error.code = 'ISH_HTTP_ERROR';
+          error.statusCode = res.statusCode;
+          settleReject(error);
+          return;
+        }
+        try {
+          settleResolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        } catch {
+          settleReject(Object.assign(new Error(`ish ${path} returned invalid JSON`), {code: 'ISH_BAD_JSON'}));
+        }
+      });
+      res.on('error', (error) => settleReject(error));
+    });
+    req.on('error', (error) => {
+      if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+        settleReject(Object.assign(new Error('ish request aborted'), {code: 'ISH_ABORTED'}));
+        return;
+      }
+      if (error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET') invalidateServiceInfo();
+      settleReject(error);
+    });
+    req.end(body);
+  });
+}
+
+/**
+ * Run one command on the session worker via POST /ish/worker/run.
+ * @param opts.command shell source (required).
+ * @param opts.sessionId DSH_SESSION_ID (required — the worker key).
+ * @param opts.cwd guest cwd (already translated) or undefined. Sent only
+ *   when it differs from the worker's last known cwd, or the worker is
+ *   not known alive (a rebuilt worker starts in the remembered cwd).
+ * @param opts.env env vars for the per-command overlay (already sanitised) or undefined.
+ * @param opts.timeoutMs run timeout (server clamps 1s-15min).
+ * @param opts.serviceFile override for tests.
+ * @param opts.onLine({stream, line}) called per NDJSON output line
+ *   (protocol lines — END marker, jobs blocks — are swallowed).
+ * @param opts.onSessionCwd(cwd) called with the worker's final cwd
+ *   (from the END marker).
+ * @param opts.signal AbortSignal; aborting cancels the HTTP request,
+ *   which makes the Swift side kill the current command (never the
+ *   worker). An abort that lands while the run is still queued behind
+ *   another run resolves as cancelled when its turn comes.
+ * @returns {exitCode, durationMs, timedOut?, cancelled?, workerDied?, cwd?}.
+ * @throws ISH_WORKER_UNSUPPORTED (code) when the service predates the
+ *   worker endpoints (HTTP 404) — the caller falls back to one-shot.
+ */
+export async function ishWorkerExec(opts) {
+  const sessionId = opts.sessionId;
+  if (!sessionId) {
+    throw Object.assign(new Error('ishWorkerExec requires a sessionId'), {code: 'ISH_WORKER_NO_SESSION'});
+  }
+  const state = workerSessionState(sessionId);
+  return enqueueWorkerOp(sessionId, async () => {
+    const generation = state.generation;
+    if (opts.signal?.aborted) return {exitCode: null, durationMs: 0, cancelled: true};
+    const nonce = randomBytes(16).toString('hex');
+    const body = JSON.stringify({
+      command: opts.command,
+      sessionId,
+      ...(opts.cwd && (!state.knownAlive || opts.cwd !== state.cwd) ? {cwd: opts.cwd} : {}),
+      ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
+      nonce,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
+    });
+    // Protocol-line filter: the END marker and the jobs snapshot blocks
+    // are worker protocol, not command output — swallow them, update the
+    // session state, and report the cwd via onSessionCwd. A line with a
+    // different nonce is ordinary output (same rule as the cwd marker).
+    let inJobsBlock = false;
+    let inJobpidsBlock = false;
+    const jobsLines = [];
+    const execOpts = {...opts, onLine: (frame) => {
+      const end = parseWorkerEndMarker(frame, nonce);
+      if (end) {
+        if (state.generation === generation) state.cwd = end.cwd;
+        opts.onSessionCwd?.(end.cwd);
+        return;
+      }
+      if (frame?.stream === 'stderr' && typeof frame?.line === 'string') {
+        const line = frame.line;
+        if (line === `${WORKER_JOBS_BEGIN_PREFIX}${nonce}`) { inJobsBlock = true; jobsLines.length = 0; return; }
+        if (line === `${WORKER_JOBS_END_PREFIX}${nonce}`) {
+          inJobsBlock = false;
+          if (state.generation === generation) updateWorkerJobs(sessionId, parseJobsSnapshot(jobsLines.join('\n')));
+          return;
+        }
+        if (inJobsBlock) { jobsLines.push(line); return; }
+        if (line === `${WORKER_JOBPIDS_BEGIN_PREFIX}${nonce}`) { inJobpidsBlock = true; return; }
+        if (line === `${WORKER_JOBPIDS_END_PREFIX}${nonce}`) { inJobpidsBlock = false; return; }
+        if (inJobpidsBlock) return; // pid lines are Swift-side only
+      }
+      opts.onLine?.(frame);
+    }};
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) invalidateServiceInfo();
+      const service = await getServiceInfo(opts);
+      if (!service) throw bridgeUnavailableError(opts);
+      try {
+        const result = await postNdjson(service, '/ish/worker/run', body, execOpts);
+        // The run resolved: record the worker state (unless a stop
+        // bumped the generation while this run was in flight).
+        if (state.generation === generation) {
+          if (result.workerDied) {
+            state.knownAlive = false;
+            state.generation += 1;
+            const now = Date.now();
+            for (const job of state.jobs.values()) {
+              if (job.state !== 'done') { job.state = 'done'; job.endedAt = now; }
+            }
+          } else if (result.cancelled) {
+            // The worker is alive, but its cwd is uncertain (the killed
+            // command may have cd'd): force the next run to resend it.
+            state.knownAlive = false;
+          } else {
+            state.knownAlive = true;
+          }
+        }
+        return result;
+      } catch (error) {
+        lastError = error;
+        if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
+        if (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode === 404) {
+          workerUnsupported = true;
+          throw Object.assign(
+            new Error('ish worker endpoints are not available on this service'),
+            {code: ISH_WORKER_UNSUPPORTED});
+        }
+        const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+          || error?.code === 'ISH_HTTP_ERROR';
+        if (retryable && attempt === 0) continue;
+        throw lastError;
+      }
+    }
+    throw lastError;
+  });
+}
+
+/**
+ * List the session worker's background jobs (fresh snapshot): runs the
+ * no-op command `:` on the worker and returns the parsed job table.
+ * There is no dedicated loopback endpoint for this on purpose — the
+ * snapshot is in-band on every run, and a control channel into the
+ * worker's stdin would queue behind the running command anyway.
+ * @returns [{id, pid, job, command, state, startedAt, endedAt?}] sorted by pid.
+ */
+export async function ishWorkerJobs(sessionId, opts = {}) {
+  await ishWorkerExec({
+    command: ':',
+    sessionId,
+    timeoutMs: opts.timeoutMs ?? 30_000,
+    signal: opts.signal,
+    serviceFile: opts.serviceFile,
+    onLine: () => {},
+  });
+  return getWorkerJobs(sessionId);
+}
+
+/**
+ * Kill one background job by pid (POST /ish/worker/jobs/kill). The
+ * server refuses any pid that is not a live descendant of the worker.
+ * A pure pid operation — it does not go through the per-session run
+ * queue, so it works while a foreground command is running.
+ * @returns true when the kill was issued.
+ * @throws an error with code ISH_JOB_NOT_FOUND when the pid is not a
+ *   job of this worker (already finished, or never was one).
+ */
+export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
+  const state = workerSessionState(sessionId);
+  const generation = state.generation;
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) invalidateServiceInfo();
+    const service = await getServiceInfo(opts);
+    if (!service) throw bridgeUnavailableError(opts);
+    try {
+      const result = await postJson(service, '/ish/worker/jobs/kill', {sessionId, pid}, opts);
+      if (result?.killed === true && state.generation === generation) {
+        const job = state.jobs.get(pid);
+        if (job && job.state !== 'done') { job.state = 'done'; job.endedAt = Date.now(); }
+      }
+      return result?.killed === true;
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
+      if (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode === 404) {
+        throw Object.assign(
+          new Error(`ish job not found: session ${sessionId} pid ${pid}`),
+          {code: ISH_JOB_NOT_FOUND});
+      }
+      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+        || error?.code === 'ISH_HTTP_ERROR';
+      if (retryable && attempt === 0) continue;
+      throw lastError;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Stop one session's worker (POST /ish/worker/stop): kills the worker's
+ * whole process tree, so no background job survives its session.
+ * Local state is cleared regardless of the outcome (a stop is teardown).
+ * @returns true when the request was answered.
+ */
+export async function ishWorkerStop(sessionId, opts = {}) {
+  const state = workerSessions.get(sessionId);
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) invalidateServiceInfo();
+    const service = await getServiceInfo(opts);
+    if (!service) throw bridgeUnavailableError(opts);
+    try {
+      await postJson(service, '/ish/worker/stop', {sessionId}, opts);
+      break;
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
+      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+        || error?.code === 'ISH_HTTP_ERROR';
+      if (retryable && attempt === 0) continue;
+      throw lastError;
+    }
+  }
+  if (state) {
+    state.knownAlive = false;
+    state.generation += 1;
+    const now = Date.now();
+    for (const job of state.jobs.values()) {
+      if (job.state !== 'done') { job.state = 'done'; job.endedAt = now; }
+    }
+  }
+  return true;
+}
+
+/** Whether this service is known to predate the worker endpoints (HTTP 404). */
+export function isWorkerUnsupported() {
+  return workerUnsupported;
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1502,18 @@ export function extractBashCommand(argv) {
  * engine cwd changes (working-directory cd tool), the engine wins
  * and the memory is forgotten. Without a DSH_SESSION_ID in the env
  * there is no memory (stateless, as before).
+ *
+ * Persistent worker (ENV-04): a piped exec with a session id runs on
+ * the session's long-lived guest /bin/bash (ishWorkerExec) instead of
+ * a fresh shell per command — no per-command process creation or shell
+ * start. The worker takes no stdin (a command that reads stdin sees
+ * /dev/null; stdinData forces the one-shot path), no tty, and is
+ * skipped when options.worker === false or the service predates the
+ * worker endpoints (then the shim goes straight to one-shot). A
+ * worker failure falls back to one-shot only before any output has
+ * streamed and only for failures that prove the command never ran;
+ * anything else fails closed. child.ishWorker reports which path
+ * served the exec (like child.ishTty for the PTY path).
  */
 export function spawnIshExec(argv, options = {}) {
   const command = extractBashCommand(argv);
@@ -1021,6 +1539,10 @@ export function spawnIshExec(argv, options = {}) {
   // Whether this exec ran on a PTY (options.tty, confirmed by the
   // server's terminal frame). False until the frame says otherwise.
   child.ishTty = false;
+  // Whether this exec ran on the persistent shell worker (ENV-04).
+  // False until a worker run serves it (a one-shot fallback leaves it
+  // false, so callers can tell which path served the exec).
+  child.ishWorker = false;
   // stdio[7] is the subprocess control fd; the shim has no control
   // channel, so stdio is exactly 3 entries and controlPipe() yields
   // undefined (the managed handle works without it).
@@ -1096,23 +1618,65 @@ export function spawnIshExec(argv, options = {}) {
         ? options.env.DSH_SESSION_ID : null;
       const engineCwd = toGuest(options.cwd ?? process.cwd());
       const guestCwd = resolveExecCwd(sessionId, engineCwd);
+      const env = guestEnv(options.env ?? {}, {hasPty: options.pty === true, ptyTerm: options.ptyTerm});
       // One nonce per exec: the Swift wrapper echoes it in the cwd
       // marker, so only this exec's marker can update the memory.
       const cwdNonce = sessionId ? randomBytes(8).toString('hex') : null;
-      const result = await ishExec({
+      const emitLine = ({stream, line}) => {
+        (stream === 'stderr' ? err : out).write(line + '\n');
+      };
+      const runOneShot = () => ishExec({
         command,
         cwd: guestCwd ?? undefined,
-        env: guestEnv(options.env ?? {}, {hasPty: options.pty === true, ptyTerm: options.ptyTerm}),
+        env,
         stdinData,
         ...(cwdNonce ? {cwdNonce} : {}),
         onSessionCwd: (cwd) => noteExecCwd(sessionId, cwd),
         tty: options.tty === true,
         timeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
         signal: abortController.signal,
-        onLine: ({stream, line}) => {
-          (stream === 'stderr' ? err : out).write(line + '\n');
-        },
+        onLine: emitLine,
       });
+      // ENV-04: route piped execs with a session id to the persistent
+      // worker (no per-command shell start). The worker takes no stdin
+      // (its stdin is the command channel — a command that reads stdin
+      // sees /dev/null instead, see buildWorkerCommand), no tty, and
+      // can be opted out of with options.worker === false. A fallback
+      // to one-shot happens ONLY before any output has streamed, and
+      // only for failures that prove the command never ran (old service
+      // 404, not booted, worker start failure, bad request): re-running
+      // a command that already produced output — or may have run —
+      // would execute it twice, so those fail closed instead.
+      let result = null;
+      const useWorker = options.worker !== false && sessionId && !options.tty
+        && !stdinData && !workerUnsupported;
+      if (useWorker) {
+        let sawOutput = false;
+        try {
+          result = await ishWorkerExec({
+            command,
+            sessionId,
+            cwd: guestCwd ?? undefined,
+            // The worker has no tty: never forward TERM, even if the
+            // caller passed options.pty (that flag belongs to the tty
+            // exec path, which never takes the worker).
+            env: guestEnv(options.env ?? {}, {hasPty: false}),
+            timeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
+            signal: abortController.signal,
+            onSessionCwd: (cwd) => noteExecCwd(sessionId, cwd),
+            onLine: (frame) => { sawOutput = true; emitLine(frame); },
+          });
+          child.ishWorker = true;
+        } catch (error) {
+          const fallBack = !sawOutput && (error?.code === ISH_WORKER_UNSUPPORTED
+            || error?.code === 'ISH_NOT_BOOTED' || error?.code === 'ISH_HTTP_ERROR');
+          if (!fallBack) throw error;
+          // Worker unavailable (old service, start failure, or a
+          // request the server rejected before running it): one-shot.
+          result = null;
+        }
+      }
+      if (result === null) result = await runOneShot();
       if (settled) return;
       if (result.cancelled) {
         finish(null, 'SIGTERM');

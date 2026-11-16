@@ -61,6 +61,39 @@
 #   multi-thread crashes reappear after this lands, re-add a cap —
 #   scaled to the CPU count, not 2 — instead of reverting wholesale.
 #
+# ENV-09 follow-up (readlink /proc/<pid>/fd/N, dsh-go, 2026-11-17):
+#   ENV-09 fixed stat and listing; readlink still returned
+#   "anon_inode:[unknown]" for every pipe/socket/tty. Root cause was in
+#   fs/adhoc.c: adhoc_getpath hardcoded type "unknown" and fd->stat.inode
+#   was never filled in for pipes/sockets (Darwin's fstat reports st_ino
+#   0 for them, so there is no host number to use). This appends:
+#   - fs/adhoc.c: adhoc_alloc_inode() (guest-side inode counter, base
+#     2^32) + a type-dispatching adhoc_getpath — pipe:[ino], socket:[ino],
+#     anon_inode:[eventfd|timerfd|epoll|inotify|pidfd], /dev/pts/N and
+#     /dev/pts/ptmx for pty fds; anon_inode:[unknown] only where no target
+#     is derivable (stdio regular file, host-tty stdio).
+#   - fs/pipe.c: one inode per pipe, shared by both ends (Linux: one
+#     pipe_inode_info). fs/sock.c: one inode per socket (socket(),
+#     accept(), each socketpair end, netlink stub). kernel/init.c: piped
+#     stdio keeps the host st_ino when nonzero, else allocates one.
+#   - fs/tty.c + fs/tty.h: tty_fd_target(), shared by adhoc_getpath and
+#     by the new interception in fs/proc/pid.c proc_pid_fd_readlink
+#     (/dev/tty and /dev/ptmx fds now resolve to the pty they are).
+#   - kernel/epoll.c, kernel/eventfd.c, kernel/time.c, kernel/inotify.c,
+#     kernel/pidfd.c: the five anon fd_ops structs (and their forward
+#     declarations) lose `static` so adhoc_getpath can identify the
+#     subtype; declared in kernel/fs.h.
+#   - kernel/calls.c: fast_fstat64 (ARM64 syscall-80 fast path) used the
+#     host fstat directly, so fstat on a pipe reported inode 0 while
+#     stat -L (ENV-09 hook -> adhoc_fstat) reported the allocated number;
+#     it now prefers fd->stat.inode for adhoc fds so all stat routes agree.
+#   - Unchanged on purpose: the open-path magic link (build 22), the
+#     stat-path interception (ENV-09) and lstat (still the link itself).
+#   - NOT fixed: stdio from a regular file (guest never learns its path)
+#     and stdio from a host tty fd (no guest /dev/pts/N corresponds) keep
+#     anon_inode:[unknown]; the two ends of one HOST pipe can get different
+#     numbers (the host exposes no pipe identity — in-guest pipes do share).
+#
 #
 # NOT fixed here (see the 2026-11-16 defect report): signalfd4 /
 # memfd_create need real implementations (not stubs); clone3 already
@@ -604,3 +637,449 @@ index 22f1435..3e22217 100644
          };
          for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
              // Check if already present (search by prefix up to '=')
+
+diff --git a/fs/adhoc.c b/fs/adhoc.c
+index a56a3bc..3d12627 100644
+--- a/fs/adhoc.c
++++ b/fs/adhoc.c
+@@ -3,6 +3,7 @@
+ #include "debug.h"
+ #include "kernel/fs.h"
+ #include "fs/fd.h"
++#include "fs/tty.h"
+ #include "kernel/errno.h"
+ 
+ static struct mount adhoc_mount;
+@@ -17,6 +18,31 @@ struct fd *adhoc_fd_create(const struct fd_ops *ops) {
+     return fd;
+ }
+ 
++// Guest-side inode numbers for anonymous fds (pipes, sockets).
++//
++// Linux gives every pipe and socket a stable inode number (pipefs /
++// sockfs), and /proc/<pid>/fd/N readlink prints it as pipe:[ino] /
++// socket:[ino]. iSH never assigned one: fd->stat.inode stayed 0 for
++// pipes and sockets, so adhoc_getpath could only print
++// "anon_inode:[unknown]". Darwin's fstat cannot fill the gap — it
++// reports st_ino 0 for pipes and sockets, which is exactly why the
++// defect report saw anon_inode:[unknown] for piped stdio (see
++// open_fd_from_actual_fd, which copies the host st_ino verbatim).
++//
++// Allocate here instead. The counter starts at 2^32, above the range
++// host APFS cnids occupy in practice, so a guest pipe/socket inode is
++// unlikely to collide numerically with a real file's host inode. A
++// dup/fork shares the struct fd, so it shares the number too — same as
++// Linux. Wrapping is a non-issue (64-bit, one increment per pipe/socket
++// created). _Atomic, like tmpfs's next_inode: creation sites run
++// concurrently.
++#define ADHOC_INODE_BASE ((ino_t) 0x100000000ULL)
++static _Atomic ino_t next_adhoc_inode = ADHOC_INODE_BASE;
++
++ino_t adhoc_alloc_inode(void) {
++    return next_adhoc_inode++;
++}
++
+ static int adhoc_fstat(struct fd *fd, struct statbuf *stat) {
+     *stat = fd->stat;
+     return 0;
+@@ -40,11 +66,74 @@ static int adhoc_fsetattr(struct fd *fd, struct attr attr) {
+ }
+ 
+ static int adhoc_getpath(struct fd *fd, char *buf) {
+-    const char *type = "unknown"; // TODO allow this to be customized
+-    if (fd->stat.inode == 0)
+-        sprintf(buf, "anon_inode:[%s]", type);
+-    else
+-        sprintf(buf, "%s:[%lu]", type, (unsigned long) fd->stat.inode);
++    // Pipes, sockets and anonymous fds have no pathname: Linux reports
++    // them as pipe:[ino], socket:[ino] or anon_inode:[type], and that is
++    // what /proc/<pid>/fd/N readlink must return (it is also what
++    // `ls -l /proc/self/fd` prints). The old code printed
++    // "anon_inode:[unknown]" for all of them: the type was hardcoded and
++    // fd->stat.inode was never filled in for pipes/sockets.
++    //
++    // Dispatch order matters: a tty fd is identified by fd->tty, not by
++    // its mode (a pty slave is S_IFCHR, same as any char device).
++    if (fd->tty != NULL) {
++        // Pty slave -> /dev/pts/N, master -> /dev/pts/ptmx (Linux).
++        // Other tty drivers (console) have no pty number to report, and
++        // an adhoc-mounted fd has no /dev node to resolve either (this
++        // branch is only reached for the create_stdio fallback), so they
++        // keep anon_inode below. (Fakefs-mounted tty fds never reach
++        // here: proc_pid_fd_readlink intercepts pty fds first, and
++        // generic_getpath already returns /dev/console, /dev/tty1 etc.
++        // for the rest.)
++        if (tty_fd_target(fd, buf) == 0)
++            return 0;
++        // Not a pty (e.g. console fallback stdio): there is no guest
++        // pathname that identifies it, so keep anon_inode below.
++    } else if (S_ISFIFO(fd->stat.mode)) {
++        // Both ends of one pipe share the inode (allocated once in
++        // sys_pipe2); a dup/fork shares the struct fd, so it shares the
++        // number too — same as Linux's one pipe_inode_info.
++        if (fd->stat.inode != 0) {
++            sprintf(buf, "pipe:[%lu]", (unsigned long) fd->stat.inode);
++            return 0;
++        }
++    } else if (S_ISSOCK(fd->stat.mode)) {
++        // Each socket has its own inode (allocated in sock_fd_create);
++        // the two ends of a socketpair do NOT share one, same as Linux.
++        if (fd->stat.inode != 0) {
++            sprintf(buf, "socket:[%lu]", (unsigned long) fd->stat.inode);
++            return 0;
++        }
++    } else if (fd->stat.mode == 0) {
++        // Anonymous fds with no mode and no pathname: eventfd, timerfd,
++        // epoll, inotify, pidfd. Linux names the subtype; these fds have
++        // no inode, so there is no number to print. The ops pointers are
++        // the only thing distinguishing them (their ops structs are
++        // non-static for exactly this comparison).
++        const char *type = NULL;
++        if (fd->ops == &eventfd_ops)
++            type = "eventfd";
++        else if (fd->ops == &timerfd_ops)
++            type = "timerfd";
++        else if (fd->ops == &epoll_ops)
++            type = "epoll";
++        else if (fd->ops == &inotify_ops)
++            type = "inotify";
++        else if (fd->ops == &pidfd_ops)
++            type = "pidfd";
++        if (type != NULL) {
++            sprintf(buf, "anon_inode:[%s]", type);
++            return 0;
++        }
++    }
++    // Anything left has no derivable target, and none is fabricated:
++    //  - a regular file passed in as stdio: the guest never learns its
++    //    host path (F_GETPATH would return a host path outside the guest
++    //    namespace, which must not leak into a guest readlink);
++    //  - stdio from a host tty fd: no guest /dev/pts/N corresponds to it
++    //    (the in-guest pty numbers are allocated separately);
++    //  - a pipe/socket whose inode is 0 (should not happen after the
++    //    creation-site fixes, kept as a guard).
++    sprintf(buf, "anon_inode:[unknown]");
+     return 0;
+ }
+ 
+diff --git a/fs/pipe.c b/fs/pipe.c
+index ff900e6..0938811 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -5,7 +5,7 @@
+ #include "fs/real.h"
+ #include "debug.h"
+ 
+-static fd_t pipe_f_create(int pipe_fd, int flags) {
++static fd_t pipe_f_create(int pipe_fd, int flags, ino_t inode) {
+     struct fd *fd = adhoc_fd_create(&realfs_fdops);
+     if (fd == NULL)
+         return _ENOMEM;
+@@ -13,6 +13,11 @@ static fd_t pipe_f_create(int pipe_fd, int flags) {
+     fd->stat.mode = S_IFIFO | 0660;
+     fd->stat.uid = current->uid;
+     fd->stat.gid = current->gid;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("pipe:[ino]") and
++    // for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
++    // pipes, so there is no host number to use). Both ends share the one
++    // inode allocated by the caller — Linux: one pipe_inode_info.
++    fd->stat.inode = inode;
+     return f_install(fd, flags);
+ }
+ 
+@@ -28,11 +33,13 @@ int_t sys_pipe2(addr_t pipe_addr, int_t flags) {
+     if (err < 0)
+         return err;
+ 
++    // One inode for the pipe, shared by both ends (see pipe_f_create).
++    ino_t inode = adhoc_alloc_inode();
+     int fp[2];
+-    err = fp[0] = pipe_f_create(p[0], flags);
++    err = fp[0] = pipe_f_create(p[0], flags, inode);
+     if (fp[0] < 0)
+         goto close_pipe;
+-    err = fp[1] = pipe_f_create(p[1], flags);
++    err = fp[1] = pipe_f_create(p[1], flags, inode);
+     if (fp[1] < 0)
+         goto close_fake_0;
+ 
+diff --git a/fs/proc/pid.c b/fs/proc/pid.c
+index 107ddce..c92d4e1 100644
+--- a/fs/proc/pid.c
++++ b/fs/proc/pid.c
+@@ -375,6 +375,17 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
+     proc_put_task(task); // releases pids_lock
+     if (fd == NULL)
+         return _ENOENT;
++    // Pty fds: /dev/pts/N for a slave, /dev/pts/ptmx for a master
++    // (Linux). generic_getpath would return the /dev node the fd was
++    // opened from instead (/dev/ptmx, /dev/tty) — meaningful, but not
++    // the device the fd actually is (a /dev/tty fd IS the pts slave).
++    // Other tty drivers (console) fall through: their /dev-node path
++    // (/dev/console, /dev/tty1) is already correct. Pipes, sockets and
++    // anonymous fds are handled one layer down, in adhoc_getpath.
++    if (tty_fd_target(fd, buf) == 0) {
++        fd_close(fd);
++        return 0;
++    }
+     int err = generic_getpath(fd, buf);
+     fd_close(fd);
+     return err;
+diff --git a/fs/sock.c b/fs/sock.c
+index fc69238..759e423 100644
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -192,6 +192,10 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
+         return _ENOMEM;
+     }
+     fd->stat.mode = S_IFSOCK | 0666;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
++    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0
++    // for sockets). One inode per socket.
++    fd->stat.inode = adhoc_alloc_inode();
+     fd->real_fd = sv[0];
+     fd->socket.domain = AF_NETLINK_;
+     fd->socket.type = type & SOCKET_TYPE_MASK;
+@@ -218,6 +222,12 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+     if (fd == NULL)
+         return _ENOMEM;
+     fd->stat.mode = S_IFSOCK | 0666;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
++    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
++    // sockets). One inode per socket: socket(), accept() and each end of
++    // socketpair() all come through here and each get their own, same as
++    // Linux (a socketpair's two ends do NOT share an inode).
++    fd->stat.inode = adhoc_alloc_inode();
+     fd->real_fd = sock_fd;
+     fd->socket.domain = domain;
+     fd->socket.type = type & SOCKET_TYPE_MASK;
+diff --git a/fs/tty.c b/fs/tty.c
+index b289a74..f8df904 100644
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -130,6 +130,21 @@ static void tty_set_controlling(struct tgroup *group, struct tty *tty) {
+ int console_major = TTY_CONSOLE_MAJOR;
+ int console_minor = 1;
+ 
++int tty_fd_target(struct fd *fd, char *buf) {
++    if (fd->tty == NULL)
++        return -1;
++    struct tty *tty = fd->tty;
++    if (tty->driver->major == TTY_PSEUDO_SLAVE_MAJOR) {
++        sprintf(buf, "/dev/pts/%d", tty->num);
++        return 0;
++    }
++    if (tty->driver->major == TTY_PSEUDO_MASTER_MAJOR) {
++        strcpy(buf, "/dev/pts/ptmx");
++        return 0;
++    }
++    return -1;
++}
++
+ int tty_open(struct tty *tty, struct fd *fd) {
+     fd->tty = tty;
+ 
+diff --git a/fs/tty.h b/fs/tty.h
+index ff70dc4..7a46d0b 100644
+--- a/fs/tty.h
++++ b/fs/tty.h
+@@ -160,6 +160,15 @@ int tty_open(struct tty *tty, struct fd *fd);
+ extern lock_t ttys_lock;
+ void tty_release(struct tty *tty); // must be called with ttys_lock
+ 
++// /proc/<pid>/fd/N readlink target for a pty fd: /dev/pts/N for a slave,
++// /dev/pts/ptmx for a master (Linux semantics). Returns 0 on success, -1
++// if the fd is not attached to a pty — other tty drivers (console) keep
++// the /dev-node path generic_getpath already returns, so they fall
++// through to it. Safe to call on a retained fd: the fd holds a tty
++// reference (tty_get refcount++ at open, released at close), and num /
++// driver->major never change after tty_alloc, so no lock is needed here.
++int tty_fd_target(struct fd *fd, char *buf);
++
+ extern struct dev_ops tty_dev;
+ extern struct dev_ops ptmx_dev;
+ 
+diff --git a/kernel/calls.c b/kernel/calls.c
+index 6295ad7..a88c7c0 100644
+--- a/kernel/calls.c
++++ b/kernel/calls.c
+@@ -1340,6 +1340,22 @@ static inline int fast_fstat64(struct cpu_state *cpu) {
+     fake_stat.ctime_nsec = real_stat.st_ctim.tv_nsec;
+ #endif
+ 
++    // Anonymous fds (pipes, stdio pipes) have no host inode: Darwin's
++    // fstat reports st_ino 0 for them, but the guest-side stat (slow path
++    // sys_fstat64 -> adhoc_fstat, and stat -L via the ENV-09 hook) reports
++    // the inode allocated at creation time (adhoc_alloc_inode). Use that
++    // number here too, so fstat and stat -L agree on the same fd — without
++    // it, `stat -c %i /proc/self/fd/0` and fstat(0) would report different
++    // inodes for the same pipe. The override is unconditional when the
++    // guest has a number: on a Linux host, host fstat returns the host
++    // pipefs inode, which is a host detail that must not leak into the
++    // guest (the guest's pipe inode namespace is the allocator). For a
++    // real file passed in as stdio the guest number IS the host inode
++    // (copied at creation, and an open file's inode cannot change), so
++    // the override is a no-op there.
++    if (is_adhoc_fd(fd) && fd->stat.inode != 0)
++        fake_stat.inode = fd->stat.inode;
++
+     // Convert to ARM64 stat structure
+     struct stat_arm64 arm64stat = {};
+     arm64stat.dev = fake_stat.dev;
+diff --git a/kernel/epoll.c b/kernel/epoll.c
+index ed4f0c4..db1ea92 100644
+--- a/kernel/epoll.c
++++ b/kernel/epoll.c
+@@ -2,7 +2,7 @@
+ #include "kernel/calls.h"
+ #include "fs/poll.h"
+ 
+-static struct fd_ops epoll_ops;
++struct fd_ops epoll_ops;
+ 
+ fd_t sys_epoll_create(int_t flags) {
+     STRACE("epoll_create(%#x)", flags);
+@@ -157,6 +157,6 @@ static int epoll_close(struct fd *fd) {
+     return 0;
+ }
+ 
+-static struct fd_ops epoll_ops = {
++struct fd_ops epoll_ops = {
+     .close = epoll_close,
+ };
+diff --git a/kernel/eventfd.c b/kernel/eventfd.c
+index f4ba285..7503042 100644
+--- a/kernel/eventfd.c
++++ b/kernel/eventfd.c
+@@ -2,7 +2,7 @@
+ #include "kernel/fs.h"
+ #include "fs/poll.h"
+ 
+-static struct fd_ops eventfd_ops;
++struct fd_ops eventfd_ops;
+ 
+ int_t sys_eventfd2(uint_t initval, int_t flags) {
+     STRACE("eventfd(%d, %#x)", initval, flags);
+@@ -80,7 +80,7 @@ static int eventfd_poll(struct fd *fd) {
+     return types;
+ }
+ 
+-static struct fd_ops eventfd_ops = {
++struct fd_ops eventfd_ops = {
+     .read = eventfd_read,
+     .write = eventfd_write,
+     .poll = eventfd_poll,
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 0a41ffe..7cd5387 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -184,6 +184,21 @@ struct mount *find_mount_and_trim_path(char *path);
+ struct fd *adhoc_fd_create(const struct fd_ops *ops);
+ // this is for the "wtf is apple smoking" section
+ bool is_adhoc_fd(struct fd *fd);
++// Allocate a stable guest-side inode number for an anonymous fd (pipe,
++// socket, stdio pipe). Defined in fs/adhoc.c; the counter starts at 2^32
++// to stay clear of host APFS inode numbers used for real files.
++ino_t adhoc_alloc_inode(void);
++// fd_ops of the anonymous fds, for the type dispatch in adhoc_getpath
++// (fs/adhoc.c): an eventfd/timerfd/epoll/inotify/pidfd has no mode and no
++// pathname, so its ops pointer is the only thing identifying it, and
++// Linux's /proc/<pid>/fd/N readlink names the subtype
++// (anon_inode:[eventfd] etc.). Non-static for exactly this comparison;
++// each is defined in its own subsystem file.
++extern struct fd_ops epoll_ops;
++extern struct fd_ops eventfd_ops;
++extern struct fd_ops timerfd_ops;
++extern struct fd_ops inotify_ops;
++extern struct fd_ops pidfd_ops;
+ 
+ // filesystems
+ extern const struct fs_ops procfs;
+diff --git a/kernel/init.c b/kernel/init.c
+index 416011d..8129196 100644
+--- a/kernel/init.c
++++ b/kernel/init.c
+@@ -201,6 +201,17 @@ static struct fd *open_fd_from_actual_fd(int fd_no) {
+             fd->stat.rdev = dev_make(TTY_PSEUDO_SLAVE_MAJOR, 0);
+         }
+     }
++    // Darwin's fstat reports st_ino 0 for pipes and sockets, which left
++    // readlink /proc/self/fd/N as "anon_inode:[unknown]" for piped stdio
++    // (and fstat/stat -L reporting inode 0). Keep a real host inode when
++    // there is one (regular file); otherwise allocate a guest one so the
++    // readlink prints pipe:[ino] / socket:[ino] like an in-guest pipe.
++    // Note the two ends of one host pipe can still get different numbers
++    // here (each stdio fd is allocated independently) — the host exposes
++    // no identity for a pipe, so the ends cannot be matched; in-guest
++    // pipes (sys_pipe2) do share one inode, see fs/pipe.c.
++    if (fd->stat.inode == 0)
++        fd->stat.inode = adhoc_alloc_inode();
+     return fd;
+ }
+ 
+diff --git a/kernel/inotify.c b/kernel/inotify.c
+index 93eafb5..3f17c4f 100644
+--- a/kernel/inotify.c
++++ b/kernel/inotify.c
+@@ -1,7 +1,7 @@
+ #include "kernel/calls.h"
+ #include "kernel/fs.h"
+ 
+-static struct fd_ops inotify_ops;
++struct fd_ops inotify_ops;
+ 
+ #define IN_CLOEXEC_ O_CLOEXEC_
+ #define IN_NONBLOCK_ O_NONBLOCK_
+@@ -59,7 +59,7 @@ static int inotify_poll(struct fd *fd) {
+     return 0;
+ }
+ 
+-static struct fd_ops inotify_ops = {
++struct fd_ops inotify_ops = {
+     .read = inotify_read,
+     .poll = inotify_poll,
+ };
+diff --git a/kernel/pidfd.c b/kernel/pidfd.c
+index 38724f2..f78c4b0 100644
+--- a/kernel/pidfd.c
++++ b/kernel/pidfd.c
+@@ -11,7 +11,7 @@
+ // runs at startup); with the old ENOSYS stub it fell back to a path that
+ // deadlocked its worker pool under iSH.
+ 
+-static struct fd_ops pidfd_ops;
++struct fd_ops pidfd_ops;
+ 
+ // Registry of live pidfds so process exit can wake any poller waiting on them.
+ static struct list pidfd_list = LIST_INITIALIZER(pidfd_list);
+@@ -95,7 +95,7 @@ void pidfd_notify_exit(pid_t_ pid) {
+                 pid, matched, total);
+ }
+ 
+-static struct fd_ops pidfd_ops = {
++struct fd_ops pidfd_ops = {
+     .poll = pidfd_poll,
+     .close = pidfd_close,
+ };
+diff --git a/kernel/time.c b/kernel/time.c
+index 6dee9ac..1228ff7 100644
+--- a/kernel/time.c
++++ b/kernel/time.c
+@@ -566,7 +566,7 @@ int_t sys_timer_delete(dword_t timer_id) {
+     return 0;
+ }
+ 
+-static struct fd_ops timerfd_ops;
++struct fd_ops timerfd_ops;
+ 
+ static void timerfd_callback(struct fd *fd) {
+     lock(&fd->lock);
+@@ -686,7 +686,7 @@ static int timerfd_close(struct fd *fd) {
+     return 0;
+ }
+ 
+-static struct fd_ops timerfd_ops = {
++struct fd_ops timerfd_ops = {
+     .read = timerfd_read,
+     .poll = timerfd_poll,
+     .close = timerfd_close,

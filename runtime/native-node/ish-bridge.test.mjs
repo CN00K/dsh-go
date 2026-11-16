@@ -21,18 +21,35 @@ import {join} from 'node:path';
 import test from 'node:test';
 import {
   DEFAULT_EXEC_TIMEOUT_MS,
+  ISH_JOB_NOT_FOUND,
   ISH_PTY_COMMAND,
   ISH_RUNNER_COMMAND,
+  ISH_WORKER_UNSUPPORTED,
+  WORKER_END_MARKER_PREFIX,
+  WORKER_JOBPIDS_BEGIN_PREFIX,
+  WORKER_JOBPIDS_END_PREFIX,
+  WORKER_JOBS_BEGIN_PREFIX,
+  WORKER_JOBS_END_PREFIX,
   clearExecCwdState,
+  clearWorkerState,
   extractBashCommand,
   getServiceInfo,
+  getWorkerJobs,
   guestEnv,
   invalidateServiceInfo,
   ishExec,
   ishPtySpawn,
   ishWebSocket,
+  ishWorkerExec,
+  ishWorkerJobs,
+  ishWorkerKillJob,
+  ishWorkerStop,
+  isWorkerUnsupported,
   noteExecCwd,
   parseCwdMarker,
+  parseJobsLine,
+  parseJobsSnapshot,
+  parseWorkerEndMarker,
   resolveExecCwd,
   spawnIshExec,
   splitConfinedArgv,
@@ -522,6 +539,13 @@ test('ishWebSocket reports a 1008 refusal as a close event', async () => {
 test('spawnIshExec returns a ChildProcess-shaped handle with streamed output', async () => {
   const {server, port, close} = await startMockServer((req, res, body) => {
     assert.ok(bearerOk(req));
+    // The old service has no worker endpoints: an unknown path 404s, and
+    // spawnIshExec falls back to one-shot (this is what the test exercises).
+    if (req.url !== '/ish/exec') {
+      res.writeHead(404, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({error: 'not_found'}));
+      return;
+    }
     const parsed = JSON.parse(body.toString('utf8'));
     assert.equal(parsed.command, 'echo hi');
     assert.equal(parsed.cwd, '/home/workspace');
@@ -557,6 +581,13 @@ test('spawnIshExec remembers a bare cd across execs of one session (ENV-14)', as
   const seenCwds = [];
   const {server, port, close} = await startMockServer((req, res, body) => {
     assert.ok(bearerOk(req));
+    // The old service has no worker endpoints: an unknown path 404s, and
+    // spawnIshExec falls back to one-shot (this is what the test exercises).
+    if (req.url !== '/ish/exec') {
+      res.writeHead(404, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({error: 'not_found'}));
+      return;
+    }
     const parsed = JSON.parse(body.toString('utf8'));
     seenCwds.push(parsed.cwd);
     // The Swift wrapper sends the cwd nonce; emulate its marker line.
@@ -902,6 +933,471 @@ test('two IshPtyTerminal instances keep separate streams and record sessionIds',
     });
     assert.deepEqual(exitB, {exitCode: null, signal: null});
   } finally {
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Persistent shell worker (ENV-04)
+// ---------------------------------------------------------------------------
+
+/** Reply to a /ish/worker/run request like the Swift WorkerSession does. */
+function mockWorkerRunResponse(res, {nonce, exitCode = 0, cwd = '/home/workspace', jobsText = '', jobPids = [], stdoutLines = []}) {
+  res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+  for (const line of stdoutLines) {
+    res.write(JSON.stringify({stream: 'stdout', line}) + '\n');
+  }
+  res.write(JSON.stringify({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:${exitCode}:${cwd}`}) + '\n');
+  res.write(JSON.stringify({stream: 'stderr', line: `${WORKER_JOBS_BEGIN_PREFIX}${nonce}`}) + '\n');
+  for (const line of jobsText.split('\n').filter(Boolean)) {
+    res.write(JSON.stringify({stream: 'stderr', line}) + '\n');
+  }
+  res.write(JSON.stringify({stream: 'stderr', line: `${WORKER_JOBS_END_PREFIX}${nonce}`}) + '\n');
+  res.write(JSON.stringify({stream: 'stderr', line: `${WORKER_JOBPIDS_BEGIN_PREFIX}${nonce}`}) + '\n');
+  for (const pid of jobPids) {
+    res.write(JSON.stringify({stream: 'stderr', line: String(pid)}) + '\n');
+  }
+  res.write(JSON.stringify({stream: 'stderr', line: `${WORKER_JOBPIDS_END_PREFIX}${nonce}`}) + '\n');
+  res.write(JSON.stringify({exitCode, durationMs: 4}) + '\n');
+  res.end();
+}
+
+test('parseWorkerEndMarker only accepts the exact nonce and a clean result', () => {
+  const nonce = '0123456789abcdef0123456789abcdef';
+  assert.deepEqual(
+    parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:3:/tmp/work`}, nonce),
+    {exitCode: 3, cwd: '/tmp/work'});
+  // Wrong nonce, wrong stream, bad exit code, relative cwd: all ordinary output.
+  assert.equal(parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}ffffffffffffffffffffffffffffffff:0:/tmp`}, nonce), null);
+  assert.equal(parseWorkerEndMarker({stream: 'stdout', line: `${WORKER_END_MARKER_PREFIX}${nonce}:0:/tmp`}, nonce), null);
+  assert.equal(parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:x:/tmp`}, nonce), null);
+  assert.equal(parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:0:tmp`}, nonce), null);
+  assert.equal(parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:256:/tmp`}, nonce), null);
+  assert.equal(parseWorkerEndMarker({stream: 'stderr', line: `${WORKER_END_MARKER_PREFIX}${nonce}:0:/tmp`}, null), null);
+});
+
+test('parseJobsLine reads jobs -l, ignores notifications and garbage', () => {
+  assert.deepEqual(parseJobsLine('[1]+  1234 Running                 sleep 600 &'),
+    {job: 1, pid: 1234, state: 'running', command: 'sleep 600 &'});
+  assert.deepEqual(parseJobsLine('[2]-  5678 Done                    sleep 1'),
+    {job: 2, pid: 5678, state: 'done', command: 'sleep 1'});
+  assert.deepEqual(parseJobsLine('[1]+  99 Exit 1                   false'),
+    {job: 1, pid: 99, state: 'done', command: 'false'});
+  assert.deepEqual(parseJobsLine('[3]  4242 Stopped                 cat'),
+    {job: 3, pid: 4242, state: 'stopped', command: 'cat'});
+  // Notification lines have no pid: not jobs lines.
+  assert.equal(parseJobsLine('[1]+ Done                    sleep 1'), null);
+  assert.equal(parseJobsLine('[1]+ Terminated              sleep 600 &'), null);
+  assert.equal(parseJobsLine(''), null);
+  assert.equal(parseJobsLine('hello'), null);
+  assert.equal(parseJobsLine(null), null);
+});
+
+test('parseJobsSnapshot collects only the jobs lines', () => {
+  const jobs = parseJobsSnapshot('[1]+  1234 Running                 sleep 600 &\n[2]-  5678 Done                    sleep 1\n[1]+ Done                    sleep 1\n');
+  assert.deepEqual(jobs, [
+    {job: 1, pid: 1234, state: 'running', command: 'sleep 600 &'},
+    {job: 2, pid: 5678, state: 'done', command: 'sleep 1'},
+  ]);
+  assert.deepEqual(parseJobsSnapshot(''), []);
+  assert.deepEqual(parseJobsSnapshot(null), []);
+});
+
+test('ishWorkerExec streams output, swallows the protocol lines, and updates the job table', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-worker-1';
+  const requests = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.equal(req.url, '/ish/worker/run');
+    assert.ok(bearerOk(req));
+    const parsed = JSON.parse(body.toString('utf8'));
+    requests.push(parsed);
+    assert.equal(parsed.sessionId, sessionId);
+    assert.match(parsed.nonce, /^[0-9a-f]{32}$/, 'a 128-bit nonce per run');
+    // No TERM on a worker run (no tty, ENV-12) — when env is sent.
+    if (parsed.env) {
+      assert.equal(parsed.env.TERM, undefined);
+      assert.equal(parsed.env.PYTHONDONTWRITEBYTECODE, '0');
+    }
+    mockWorkerRunResponse(res, {
+      nonce: parsed.nonce,
+      exitCode: 0,
+      cwd: '/tmp',
+      jobsText: '[1]+  1234 Running                 sleep 600 &',
+      jobPids: [1234],
+      stdoutLines: ['hi'],
+    });
+  });
+  try {
+    invalidateServiceInfo();
+    const lines = [];
+    const cwds = [];
+    const result = await ishWorkerExec({
+      command: 'sleep 600 & echo hi',
+      sessionId,
+      cwd: '/home/workspace',
+      env: guestEnv({DSH_SESSION_ID: sessionId}, {hasPty: false}),
+      serviceFile: writeServiceFile(port),
+      onLine: (frame) => lines.push(frame),
+      onSessionCwd: (cwd) => cwds.push(cwd),
+    });
+    assert.deepEqual(result, {exitCode: 0, durationMs: 4});
+    // Only the command output reaches the caller: marker + jobs blocks are swallowed.
+    assert.deepEqual(lines, [{stream: 'stdout', line: 'hi'}]);
+    assert.deepEqual(cwds, ['/tmp']);
+    assert.equal(requests[0].cwd, '/home/workspace', 'first run sends the cwd (worker not known alive)');
+    // The job table learned the background job from the snapshot.
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => ({pid: j.pid, state: j.state, command: j.command})), [
+      {pid: 1234, state: 'running', command: 'sleep 600 &'},
+    ]);
+    // Second run: the worker is known alive in /tmp, so no cwd is sent.
+    const second = await ishWorkerExec({
+      command: 'pwd', sessionId, cwd: '/tmp',
+      serviceFile: writeServiceFile(port), onLine: () => {},
+    });
+    assert.equal(second.exitCode, 0);
+    assert.equal(requests[1].cwd, undefined, 'steady-state runs send no cwd (the worker already is there)');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerExec maps a 404 to ISH_WORKER_UNSUPPORTED (old service)', async () => {
+  clearWorkerState();
+  const {server, port, close} = await startMockServer((_req, res) => {
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishWorkerExec({command: 'ls', sessionId: 'sess-worker-404', serviceFile: writeServiceFile(port)}),
+      (error) => error.code === ISH_WORKER_UNSUPPORTED);
+    assert.equal(isWorkerUnsupported(), true);
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerExec reports a dead worker and the next run resends the cwd', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-worker-died';
+  const requests = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    requests.push(parsed);
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    // The shell exited (e.g. the command was `exit 3`): no marker, no
+    // snapshot — the terminal frame carries the shell's exit code.
+    res.write(JSON.stringify({stream: 'stderr', line: 'bye'}) + '\n');
+    res.write(JSON.stringify({exitCode: 3, durationMs: 2, workerDied: true}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    const first = await ishWorkerExec({
+      command: 'exit 3', sessionId, cwd: '/home/workspace',
+      serviceFile: writeServiceFile(port), onLine: () => {},
+    });
+    assert.deepEqual(first, {exitCode: 3, durationMs: 2, workerDied: true});
+    assert.equal(requests[0].cwd, '/home/workspace');
+    // The next run rebuilds the worker and resends the remembered cwd.
+    const second = await ishWorkerExec({
+      command: 'pwd', sessionId, cwd: '/home/workspace',
+      serviceFile: writeServiceFile(port), onLine: () => {},
+    });
+    assert.equal(second.exitCode, 3);
+    assert.equal(requests[1].cwd, '/home/workspace', 'a rebuilt worker starts in the remembered cwd');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('spawnIshExec routes a piped exec with a session id to the worker', async () => {
+  clearExecCwdState();
+  clearWorkerState();
+  const sessionId = 'sess-spawn-worker';
+  const requests = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.ok(bearerOk(req));
+    const parsed = JSON.parse(body.toString('utf8'));
+    requests.push({url: req.url, parsed});
+    if (req.url === '/ish/worker/run') {
+      mockWorkerRunResponse(res, {nonce: parsed.nonce, cwd: '/tmp', stdoutLines: ['ok']});
+      return;
+    }
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const run = async (command) => {
+      const child = spawnIshExec(
+        [ISH_RUNNER_COMMAND, '--', 'bash', '-c', command],
+        {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: sessionId}});
+      let stdout = '';
+      child.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+      const outcome = await new Promise((done) => child.once('exit', (code) => done(code)));
+      return {outcome, stdout, child};
+    };
+    const first = await run('cd /tmp && pwd');
+    assert.equal(first.outcome, 0);
+    assert.equal(first.stdout, 'ok\n');
+    assert.equal(first.child.ishWorker, true);
+    assert.equal(first.child.ishTty, false);
+    assert.equal(requests[0].url, '/ish/worker/run');
+    assert.equal(requests[0].parsed.sessionId, sessionId);
+    // Second exec reuses the worker (and the remembered cwd).
+    const second = await run('pwd');
+    assert.equal(second.outcome, 0);
+    assert.equal(second.child.ishWorker, true);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].url, '/ish/worker/run');
+    assert.equal(requests[1].parsed.cwd, undefined);
+  } finally {
+    clearExecCwdState();
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('spawnIshExec falls back to one-shot when the service has no worker endpoints', async () => {
+  clearExecCwdState();
+  clearWorkerState();
+  const sessionId = 'sess-spawn-fallback';
+  const requests = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    requests.push(req.url);
+    if (req.url === '/ish/worker/run') {
+      res.writeHead(404, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({error: 'not_found'}));
+      return;
+    }
+    assert.equal(req.url, '/ish/exec');
+    assert.match(parsed.cwdNonce, /^[0-9a-f]{16}$/);
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'oneshot'}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 5}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const run = async (command) => {
+      const child = spawnIshExec(
+        [ISH_RUNNER_COMMAND, '--', 'bash', '-c', command],
+        {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: sessionId}});
+      let stdout = '';
+      child.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+      const outcome = await new Promise((done) => child.once('exit', (code) => done(code)));
+      return {outcome, stdout, child};
+    };
+    const first = await run('echo hi');
+    assert.equal(first.outcome, 0);
+    assert.equal(first.stdout, 'oneshot\n');
+    assert.equal(first.child.ishWorker, false, 'the fallback exec is one-shot, not a worker run');
+    assert.deepEqual(requests, ['/ish/worker/run', '/ish/exec']);
+    // The 404 is remembered: the second exec skips the worker entirely.
+    const second = await run('echo hi');
+    assert.equal(second.outcome, 0);
+    assert.equal(second.child.ishWorker, false);
+    assert.deepEqual(requests, ['/ish/worker/run', '/ish/exec', '/ish/exec']);
+    assert.equal(isWorkerUnsupported(), true);
+  } finally {
+    clearExecCwdState();
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('spawnIshExec skips the worker for stdin data, tty execs, and worker:false', async () => {
+  clearExecCwdState();
+  clearWorkerState();
+  const urls = [];
+  const {server, port, close} = await startMockServer((req, res) => {
+    urls.push(req.url);
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'ok'}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 5}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const sessionOpts = {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: 'sess-skip-worker'}};
+    const run = async (command, opts) => {
+      const child = spawnIshExec([ISH_RUNNER_COMMAND, '--', 'bash', '-c', command], opts);
+      const outcome = await new Promise((done) => child.once('exit', (code) => done(code)));
+      return {outcome, child};
+    };
+    // stdin data: the worker's stdin is the command channel.
+    const withStdin = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'cat'], sessionOpts);
+    withStdin.stdin.end('hello\n');
+    await new Promise((done) => withStdin.once('exit', done));
+    assert.equal(withStdin.ishWorker, false);
+    // tty exec: the PTY path is one-shot by design.
+    const tty = await run('ls', {...sessionOpts, tty: true});
+    assert.equal(tty.child.ishWorker, false);
+    // Explicit opt-out.
+    const opted = await run('ls', {...sessionOpts, worker: false});
+    assert.equal(opted.child.ishWorker, false);
+    // No session id: stateless, like the cwd memory.
+    const noSession = await run('ls', {cwd: join(fakeHome, 'workspace'), env: {}});
+    assert.equal(noSession.child.ishWorker, false);
+    assert.ok(urls.every((u) => u === '/ish/exec'), `all one-shot, got ${urls.join(',')}`);
+  } finally {
+    clearExecCwdState();
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerJobs refreshes the table and ishWorkerKillJob marks the job done', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-jobs';
+  let jobsText = '[1]+  1234 Running                 sleep 600 &';
+  const kills = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (req.url === '/ish/worker/run') {
+      assert.equal(parsed.command, ':');
+      mockWorkerRunResponse(res, {nonce: parsed.nonce, jobsText, jobPids: [1234]});
+      return;
+    }
+    if (req.url === '/ish/worker/jobs/kill') {
+      assert.equal(parsed.sessionId, sessionId);
+      kills.push(parsed.pid);
+      res.writeHead(200, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({killed: true, pid: parsed.pid}));
+      return;
+    }
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const jobs = await ishWorkerJobs(sessionId, {serviceFile});
+    assert.deepEqual(jobs.map((j) => ({pid: j.pid, state: j.state})), [{pid: 1234, state: 'running'}]);
+    assert.equal(await ishWorkerKillJob(sessionId, 1234, {serviceFile}), true);
+    assert.deepEqual(kills, [1234]);
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => ({pid: j.pid, state: j.state})),
+      [{pid: 1234, state: 'done'}]);
+    // The next snapshot no longer lists the job: it stays done.
+    jobsText = '';
+    const jobs2 = await ishWorkerJobs(sessionId, {serviceFile});
+    assert.deepEqual(jobs2.map((j) => ({pid: j.pid, state: j.state})),
+      [{pid: 1234, state: 'done'}]);
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerKillJob surfaces a 404 as ISH_JOB_NOT_FOUND', async () => {
+  clearWorkerState();
+  const {server, port, close} = await startMockServer((_req, res) => {
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'job_not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishWorkerKillJob('sess-jobs-404', 9999, {serviceFile: writeServiceFile(port)}),
+      (error) => error.code === ISH_JOB_NOT_FOUND);
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerStop clears the worker state (jobs are done)', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-stop';
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (req.url === '/ish/worker/run') {
+      mockWorkerRunResponse(res, {
+        nonce: parsed.nonce,
+        jobsText: '[1]+  1234 Running                 sleep 600 &',
+        jobPids: [1234],
+      });
+      return;
+    }
+    if (req.url === '/ish/worker/stop') {
+      assert.equal(parsed.sessionId, sessionId);
+      res.writeHead(200, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({stopped: true}));
+      return;
+    }
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    await ishWorkerExec({command: 'sleep 600 &', sessionId, serviceFile, onLine: () => {}});
+    assert.equal(getWorkerJobs(sessionId).length, 1);
+    assert.equal(await ishWorkerStop(sessionId, {serviceFile}), true);
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => j.state), ['done']);
+    // The next run resends the cwd (the worker is not known alive).
+    let nextCwd = 'unset';
+    const {server: server2, port: port2, close: close2} = await startMockServer((req, res, body) => {
+      const parsed = JSON.parse(body.toString('utf8'));
+      nextCwd = parsed.cwd ?? null;
+      mockWorkerRunResponse(res, {nonce: parsed.nonce});
+    });
+    try {
+      await ishWorkerExec({command: 'pwd', sessionId, cwd: '/home/workspace', serviceFile: writeServiceFile(port2), onLine: () => {}});
+      assert.equal(nextCwd, '/home/workspace');
+    } finally {
+      await close2();
+    }
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('worker runs of one session serialize (no interleaved stdin writes)', async () => {
+  clearWorkerState();
+  clearExecCwdState();
+  const sessionId = 'sess-serial';
+  const arrivals = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    arrivals.push({command: parsed.command, at: Date.now()});
+    // Hold the first run open for 150 ms; the second request must not
+    // arrive until the first has been answered.
+    setTimeout(() => {
+      mockWorkerRunResponse(res, {nonce: parsed.nonce, stdoutLines: [parsed.command]});
+    }, parsed.command === 'first' ? 150 : 0);
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const outs = [];
+    const p1 = ishWorkerExec({command: 'first', sessionId, serviceFile, onLine: (f) => outs.push(f.line)});
+    const p2 = ishWorkerExec({command: 'second', sessionId, serviceFile, onLine: (f) => outs.push(f.line)});
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.equal(r1.exitCode, 0);
+    assert.equal(r2.exitCode, 0);
+    assert.equal(arrivals.length, 2);
+    assert.ok(arrivals[1].at - arrivals[0].at >= 140,
+      `second run started ${arrivals[1].at - arrivals[0].at}ms after the first (must wait for it)`);
+    assert.deepEqual(outs, ['first', 'second']);
+  } finally {
+    clearWorkerState();
+    clearExecCwdState();
     await close();
   }
 });

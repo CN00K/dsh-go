@@ -61,6 +61,11 @@ static const NSTimeInterval kISHExecStuckThreshold = 30.0;
 static const size_t kISHExecArgvCapacity = 16384;
 static const size_t kISHExecEnvpCapacity = 8192;
 
+// Persistent shell worker (ENV-04): max live workers, and how long
+// workerForSession waits for the shell to start before giving up.
+const NSUInteger ISHWorkerMaxSessions = 8;
+static const NSTimeInterval kISHWorkerStartTimeout = 15.0;
+
 // --- ISHShellExecutionResult -------------------------------------------------
 
 @interface ISHShellExecutionResult ()
@@ -156,6 +161,155 @@ static const size_t kISHExecEnvpCapacity = 8192;
 - (void)cancelRecord:(ISHExecRecord *)record;
 @end
 
+// --- ISHWorkerShell (persistent shell, ENV-04) ------------------------------
+// All mutable state is guarded by _lock (a plain NSLock, held only
+// for ivar access — never across I/O, dispatches, or handler calls —
+// so it cannot deadlock). The stdin write fd is owned by the worker
+// and closed exactly once, in stopWorkerLocked / on death.
+
+@interface ISHWorkerShell ()
+@property (nonatomic, strong) NSLock *lock;
+@property (nonatomic, copy) NSString *sessionIdValue;
+@property (nonatomic) uint64_t fsContextValue;
+@property (nonatomic) int pidValue;
+@property (nonatomic) BOOL aliveValue;
+@property (nonatomic, strong) NSDate *lastUsedAtValue;
+@property (nonatomic, strong, nullable) NSNumber *exitCodeValue;
+@property (nonatomic, strong) NSSet<NSNumber *> *jobPidsValue;
+@property (nonatomic, copy, nullable) void (^outputHandlerValue)(BOOL isStderr, NSData *chunk);
+@property (nonatomic, copy, nullable) void (^onDeathValue)(NSNumber * _Nullable exitCode);
+@property (nonatomic) BOOL deathNotified;
+/// Host write end of the worker's stdin pipe. -1 when closed.
+@property (nonatomic) int stdinWriteFd;
+/// Streams that have hit EOF (stdout / stderr reader done).
+@property (nonatomic) BOOL stdoutDone;
+@property (nonatomic) BOOL stderrDone;
+- (instancetype)initWithSessionId:(NSString *)sessionId fsContext:(uint64_t)fsContext;
+// Compound operations below are all lock-guarded and safe from any
+// queue; the executor (same file) uses them, Swift uses only the
+// public .h properties.
+/// Record a successful start (called once, from the start block).
+- (void)lock_setStartedWithPid:(int)pid stdinFd:(int)fd;
+/// Refresh lastUsedAt (a run started).
+- (void)lock_touchUsed;
+/// Install / clear the per-run output handler.
+- (void)lock_setOutputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))handler;
+/// Copy the current output handler (nil between runs). The caller
+/// invokes it WITHOUT holding the lock.
+- (nullable void (^)(BOOL isStderr, NSData *chunk))lock_copyOutputHandler;
+/// Host write end of the stdin pipe, or -1 when closed.
+- (int)lock_stdinFd;
+/// Close the stdin write fd exactly once; returns the fd closed, or -1.
+- (int)lock_closeStdin;
+/// Record a wait-encoded exit code (exit notification), keeping the
+/// first one seen.
+- (void)lock_noteExitCode:(nullable NSNumber *)code;
+/// Mark one stream done; returns YES when BOTH streams are done.
+- (BOOL)lock_markStreamDone:(BOOL)isStderr;
+/// Mark the shell dead (first caller wins) and return the onDeath
+/// block to invoke (nil when already notified or no handler). The
+/// caller invokes it WITHOUT holding the lock.
+- (nullable void (^)(NSNumber * _Nullable))lock_takeDeathHandlerWithExitCode:(nullable NSNumber *)code;
+@end
+
+@implementation ISHWorkerShell
+
+- (instancetype)initWithSessionId:(NSString *)sessionId fsContext:(uint64_t)fsContext {
+    self = [super init];
+    if (self) {
+        _lock = [[NSLock alloc] init];
+        _sessionIdValue = [sessionId copy];
+        _fsContextValue = fsContext;
+        _pidValue = 0;
+        _aliveValue = NO;
+        _lastUsedAtValue = [NSDate date];
+        _jobPidsValue = [NSSet set];
+        _stdinWriteFd = -1;
+    }
+    return self;
+}
+
+- (NSString *)sessionId { return _sessionIdValue; }
+- (uint64_t)fsContext { return _fsContextValue; }
+
+- (int)pid { [_lock lock]; int v = _pidValue; [_lock unlock]; return v; }
+- (BOOL)isAlive { [_lock lock]; BOOL v = _aliveValue; [_lock unlock]; return v; }
+- (NSDate *)lastUsedAt { [_lock lock]; NSDate *v = _lastUsedAtValue; [_lock unlock]; return v; }
+- (NSNumber *)exitCode { [_lock lock]; NSNumber *v = _exitCodeValue; [_lock unlock]; return v; }
+
+- (NSSet<NSNumber *> *)jobPids {
+    [_lock lock]; NSSet *v = _jobPidsValue; [_lock unlock]; return v;
+}
+- (void)setJobPids:(NSSet<NSNumber *> *)jobPids {
+    [_lock lock]; _jobPidsValue = [jobPids copy] ?: [NSSet set]; [_lock unlock];
+}
+- (void (^)(NSNumber * _Nullable))onDeath {
+    [_lock lock]; void (^v)(NSNumber *) = _onDeathValue; [_lock unlock]; return v;
+}
+- (void)setOnDeath:(void (^)(NSNumber * _Nullable))onDeath {
+    [_lock lock]; _onDeathValue = [onDeath copy]; [_lock unlock];
+}
+
+- (void)lock_setStartedWithPid:(int)pid stdinFd:(int)fd {
+    [_lock lock];
+    _pidValue = pid;
+    _stdinWriteFd = fd;
+    _aliveValue = YES;
+    _lastUsedAtValue = [NSDate date];
+    [_lock unlock];
+}
+
+- (void)lock_touchUsed {
+    [_lock lock]; _lastUsedAtValue = [NSDate date]; [_lock unlock];
+}
+
+- (void)lock_setOutputHandler:(nullable void (^)(BOOL, NSData *))handler {
+    [_lock lock]; _outputHandlerValue = [handler copy]; [_lock unlock];
+}
+
+- (nullable void (^)(BOOL, NSData *))lock_copyOutputHandler {
+    [_lock lock]; void (^h)(BOOL, NSData *) = _outputHandlerValue; [_lock unlock]; return h;
+}
+
+- (int)lock_stdinFd {
+    [_lock lock]; int fd = _stdinWriteFd; [_lock unlock]; return fd;
+}
+
+- (int)lock_closeStdin {
+    [_lock lock];
+    int fd = _stdinWriteFd;
+    _stdinWriteFd = -1;
+    [_lock unlock];
+    if (fd >= 0) close(fd);
+    return fd;
+}
+
+- (void)lock_noteExitCode:(nullable NSNumber *)code {
+    if (!code) return;
+    [_lock lock]; if (!_exitCodeValue) _exitCodeValue = code; [_lock unlock];
+}
+
+- (BOOL)lock_markStreamDone:(BOOL)isStderr {
+    [_lock lock];
+    if (isStderr) _stderrDone = YES; else _stdoutDone = YES;
+    BOOL both = _stdoutDone && _stderrDone;
+    [_lock unlock];
+    return both;
+}
+
+- (nullable void (^)(NSNumber * _Nullable))lock_takeDeathHandlerWithExitCode:(nullable NSNumber *)code {
+    [_lock lock];
+    if (_deathNotified) { [_lock unlock]; return nil; }
+    _deathNotified = YES;
+    _aliveValue = NO;
+    if (code && !_exitCodeValue) _exitCodeValue = code;
+    void (^h)(NSNumber *) = _onDeathValue;
+    [_lock unlock];
+    return h;
+}
+
+@end
+
 // --- ISHShellExecution (handle) ----------------------------------------------
 
 @interface ISHShellExecution ()
@@ -217,6 +371,15 @@ static void ish_executor_close_fd(int fd) {
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ISHExecRecord *> *executions;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *executionsByPid;
+/// Serial queue for worker registry operations + stdin writes (one
+/// queue for all workers: writes are single write() calls, so sharing
+/// it costs nothing and removes a whole class of ordering bugs).
+@property (nonatomic, strong) dispatch_queue_t workerQueue;
+/// Live workers by DSH session id. Guarded by _workerQueue.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, ISHWorkerShell *> *workers;
+/// Worker session id by guest pid (exit-observer routing). Guarded by
+/// _workerQueue.
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *workersByPid;
 
 // Private methods (defined below; declared here so the handle class and
 // the early methods can call them without a warning).
@@ -267,6 +430,17 @@ static void ish_executor_close_fd(int fd) {
 - (void)cancelRecord:(ISHExecRecord *)record;
 - (void)cancelRecordOnStateQueue:(ISHExecRecord *)record;
 - (void)sweepStuckExecutions;
+// Worker internals (ENV-04; the public API is in the header).
+- (void)startWorkerShell:(ISHWorkerShell *)worker
+             baseEnvText:(nullable NSString *)baseEnvText
+                 started:(void (^)(BOOL ok))started;
+- (void)writeWorkerText:(NSString *)text worker:(ISHWorkerShell *)worker;
+- (void)readWorkerPipeFd:(int)fd worker:(ISHWorkerShell *)worker isStderr:(BOOL)isStderr;
+- (void)workerStreamDidEnd:(ISHWorkerShell *)worker isStderr:(BOOL)isStderr;
+- (void)workerNoteDeath:(ISHWorkerShell *)worker exitCode:(nullable NSNumber *)code;
+- (void)stopWorkerLocked:(ISHWorkerShell *)worker;
+- (NSArray<NSNumber *> *)directChildPidsOf:(int)pid;
+- (BOOL)isDescendantOf:(int)pid ancestor:(int)ancestorPid;
 @end
 
 @implementation ISHShellExecutor {
@@ -290,6 +464,10 @@ static void ish_executor_close_fd(int fd) {
                                             DISPATCH_QUEUE_SERIAL);
         _executions = [NSMutableDictionary dictionary];
         _executionsByPid = [NSMutableDictionary dictionary];
+        _workerQueue = dispatch_queue_create("me.zzuu.dsh.ish.executor.worker",
+                                             DISPATCH_QUEUE_SERIAL);
+        _workers = [NSMutableDictionary dictionary];
+        _workersByPid = [NSMutableDictionary dictionary];
         // Host pipe writes must never kill the app with SIGPIPE: a guest
         // that closes stdin early makes write() raise it. Dart/Flutter
         // already ignore SIGPIPE; set it explicitly so the executor is
@@ -312,11 +490,28 @@ static void ish_executor_close_fd(int fd) {
             if (!pid || !code) return;
             dispatch_async(strongSelf.stateQueue, ^{
                 NSString *token = strongSelf.executionsByPid[pid];
-                if (!token) return;
-                ISHExecRecord *record = strongSelf.executions[token];
-                if (!record || record.finished) return;
-                record.exitCode = code;
-                [strongSelf tryFinalizeRecord:record];
+                if (token) {
+                    ISHExecRecord *record = strongSelf.executions[token];
+                    if (!record || record.finished) return;
+                    record.exitCode = code;
+                    [strongSelf tryFinalizeRecord:record];
+                    return;
+                }
+                // Persistent worker (ENV-04): record the exit code and
+                // let the death path (readers EOF or this notification,
+                // whichever is first) complete the pending run.
+                __block NSString *workerSessionId = nil;
+                dispatch_sync(strongSelf.workerQueue, ^{
+                    workerSessionId = strongSelf.workersByPid[pid];
+                });
+                if (!workerSessionId) return;
+                __block ISHWorkerShell *worker = nil;
+                dispatch_sync(strongSelf.workerQueue, ^{
+                    worker = strongSelf.workers[workerSessionId];
+                });
+                if (!worker) return;
+                [worker lock_noteExitCode:code];
+                [strongSelf workerNoteDeath:worker exitCode:code];
             });
         }];
         // Sweeper: every 30 s, log executions live longer than 30 s.
@@ -1164,6 +1359,411 @@ static void ish_executor_close_fd(int fd) {
                          pid:0];
     }
     return result;
+}
+
+// --- Persistent shell worker (ENV-04) --------------------------------------
+// See the header for the design. The worker is a guest /bin/bash
+// --noprofile --norc started like a one-shot exec (same pipe +
+// become_new_init_child + adhoc-fd + do_execve flow), but its stdin
+// stays open and it has no timeout and no exit-notification
+// finalization. Commands are written to its stdin by the loopback
+// service; output streams back through the readers below.
+
+- (nullable ISHWorkerShell *)workerForSessionIfPresent:(NSString *)sessionId {
+    if (sessionId.length == 0) return nil;
+    __block ISHWorkerShell *worker = nil;
+    dispatch_sync(_workerQueue, ^{ worker = self.workers[sessionId]; });
+    return worker;
+}
+
+- (nullable ISHWorkerShell *)workerForSession:(NSString *)sessionId
+                                    fsContext:(uint64_t)fsContext
+                                  baseEnvText:(nullable NSString *)baseEnvText {
+    if (sessionId.length == 0) return nil;
+    __block ISHWorkerShell *existing = nil;
+    dispatch_sync(_workerQueue, ^{ existing = self.workers[sessionId]; });
+    if (existing) {
+        if (existing.isAlive) return existing;
+        // Dead but not yet purged (death notice in flight): drop it so
+        // the caller gets a fresh shell instead of a dead one.
+        dispatch_sync(_workerQueue, ^{
+            if (self.workers[sessionId] == existing) [self.workers removeObjectForKey:sessionId];
+        });
+    }
+    if (![ISHKernel shared].isBooted) return nil;
+    ISHWorkerShell *worker = [[ISHWorkerShell alloc] initWithSessionId:sessionId fsContext:fsContext];
+    dispatch_sync(_workerQueue, ^{
+        // Cap: evict the least-recently-used worker (its jobs die
+        // with it — stopWorkerLocked kills the whole tree).
+        if (self.workers.count >= ISHWorkerMaxSessions) {
+            ISHWorkerShell *lru = nil;
+            for (ISHWorkerShell *w in self.workers.allValues) {
+                if (!lru || [w.lastUsedAt compare:lru.lastUsedAt] == NSOrderedAscending) lru = w;
+            }
+            if (lru) {
+                NSLog(@"ISHShellExecutor: worker cap reached, evicting session %@", lru.sessionId);
+                [self stopWorkerLocked:lru];
+            }
+        }
+        self.workers[sessionId] = worker;
+    });
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block BOOL ok = NO;
+    [self startWorkerShell:worker baseEnvText:baseEnvText started:^(BOOL s) {
+        ok = s;
+        dispatch_semaphore_signal(sem);
+    }];
+    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+        (int64_t)(kISHWorkerStartTimeout * NSEC_PER_SEC)));
+    if (r != 0 || !ok) {
+        dispatch_sync(_workerQueue, ^{
+            if (self.workers[sessionId] == worker) [self.workers removeObjectForKey:sessionId];
+        });
+        return nil;
+    }
+    return worker;
+}
+
+- (void)beginWorkerRun:(ISHWorkerShell *)worker
+           commandText:(NSString *)commandText
+         outputHandler:(void (^)(BOOL isStderr, NSData *chunk))outputHandler {
+    if (!worker.isAlive) return;
+    dispatch_async(_workerQueue, ^{
+        if (!worker.isAlive) return; // died while queued
+        [worker lock_setOutputHandler:outputHandler];
+        [worker lock_touchUsed];
+        [self writeWorkerText:commandText worker:worker];
+    });
+}
+
+- (void)endWorkerRun:(ISHWorkerShell *)worker {
+    dispatch_async(_workerQueue, ^{
+        [worker lock_setOutputHandler:nil];
+    });
+}
+
+- (NSArray<NSNumber *> *)killWorkerForegroundCommand:(ISHWorkerShell *)worker {
+    int pid = worker.pid;
+    if (pid <= 1) return @[];
+    NSSet<NSNumber *> *jobs = worker.jobPids;
+    NSMutableArray<NSNumber *> *killed = [NSMutableArray array];
+    // Direct children of the worker, minus the known background jobs,
+    // are the foreground command's roots (a pipeline's elements are
+    // all direct children of the shell). Each is tree-killed.
+    for (NSNumber *child in [self directChildPidsOf:pid]) {
+        if ([jobs containsObject:child]) continue;
+        [self killProcessGroup:child.intValue];
+        [killed addObject:child];
+    }
+    if (killed.count > 0) {
+        NSLog(@"ISHShellExecutor: killed foreground command of worker %d: %@", pid, killed);
+    }
+    return [killed copy];
+}
+
+- (BOOL)killWorkerJob:(ISHWorkerShell *)worker pid:(int)pid {
+    if (!worker.isAlive) return NO;
+    int workerPid = worker.pid;
+    // Refuse anything that is not a live descendant of the worker —
+    // including the worker itself and pid 1. The bridge only ever
+    // sends pids from the worker's own jobs snapshot, but the check
+    // must not trust the caller.
+    if (![self isDescendantOf:pid ancestor:workerPid]) return NO;
+    [self killProcessGroup:pid];
+    return YES;
+}
+
+- (void)stopWorkerForSession:(NSString *)sessionId {
+    if (sessionId.length == 0) return;
+    dispatch_sync(_workerQueue, ^{
+        ISHWorkerShell *worker = self.workers[sessionId];
+        if (worker) [self stopWorkerLocked:worker];
+    });
+}
+
+- (void)stopAllWorkers {
+    dispatch_sync(_workerQueue, ^{
+        for (ISHWorkerShell *worker in [self.workers.allValues copy]) {
+            [self stopWorkerLocked:worker];
+        }
+    });
+}
+
+// --- Worker start path (runs on a global-queue thread) ----------------------
+// Mirrors runRecord's pipe + spawn setup, but persistent: the stdin
+// write end is kept (owned by the worker), the readers run forever,
+// and there is no timeout / exit-notification finalization. On a
+// failed start the guest ends are closed by hand (same [FIX 1.4a-rev]
+// zombie-marking as runRecord) and started(NO) is reported.
+
+- (void)startWorkerShell:(ISHWorkerShell *)worker
+             baseEnvText:(nullable NSString *)baseEnvText
+                 started:(void (^)(BOOL ok))started {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        int stdinPipe[2] = {-1, -1};
+        int stdoutPipe[2] = {-1, -1};
+        int stderrPipe[2] = {-1, -1};
+        if (pipe(stdinPipe) != 0 || pipe(stdoutPipe) != 0 || pipe(stderrPipe) != 0) {
+            NSLog(@"ISHShellExecutor: worker pipe() failed: %d", errno);
+            ish_executor_close_fd(stdinPipe[0]);
+            ish_executor_close_fd(stdinPipe[1]);
+            ish_executor_close_fd(stdoutPipe[0]);
+            ish_executor_close_fd(stdoutPipe[1]);
+            ish_executor_close_fd(stderrPipe[0]);
+            ish_executor_close_fd(stderrPipe[1]);
+            started(NO);
+            return;
+        }
+        int stdoutReadFd = stdoutPipe[0];
+        int stderrReadFd = stderrPipe[0];
+        int stdinWriteFd = stdinPipe[1];
+        // Readers: start BEFORE task_start so no output is missed.
+        // They run until EOF (the shell exits), then report the stream end.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            [self readWorkerPipeFd:stdoutReadFd worker:worker isStderr:NO];
+            close(stdoutReadFd);
+            [self workerStreamDidEnd:worker isStderr:NO];
+        });
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            [self readWorkerPipeFd:stderrReadFd worker:worker isStderr:YES];
+            close(stderrReadFd);
+            [self workerStreamDidEnd:worker isStderr:YES];
+        });
+        // Spawn as a child of init (pid >= 2). Never on the supervisor
+        // thread, never as pid 1.
+        int err = become_new_init_child();
+        if (err < 0) {
+            NSLog(@"ISHShellExecutor: worker become_new_init_child failed: %d", err);
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe stderrPipe:stderrPipe];
+            close(stdinWriteFd);
+            started(NO);
+            return;
+        }
+        // fs_context for the path-translate hook (inherited verbatim on fork).
+        current->group->fs_context = worker.fsContext;
+        // Wire stdio: adhoc fds over the (dup'd) host pipe fds.
+        struct fd *inFd = ish_executor_fd_from_host_fd(stdinPipe[0]);
+        struct fd *outFd = ish_executor_fd_from_host_fd(stdoutPipe[1]);
+        struct fd *errFd = ish_executor_fd_from_host_fd(stderrPipe[1]);
+        if (!inFd || !outFd || !errFd) {
+            NSLog(@"ISHShellExecutor: worker adhoc fd creation failed");
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe stderrPipe:stderrPipe];
+            close(stdinWriteFd);
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            started(NO);
+            return;
+        }
+        current->files->files[0] = inFd;
+        current->files->files[1] = outFd;
+        current->files->files[2] = errFd;
+        // argv (16 KB) + envp (8 KB), same packing as ISHKernel.
+        // /bin/bash --noprofile --norc: a machine channel, not a login
+        // shell — no profile/rc (ENV-01: bash, not BusyBox ash).
+        char argvBuf[kISHExecArgvCapacity];
+        size_t argvPos = 0;
+        size_t argc = 0;
+        for (NSString *arg in @[@"/bin/bash", @"--noprofile", @"--norc"]) {
+            const char *carg = arg.UTF8String;
+            size_t len = strlen(carg) + 1;
+            if (argvPos + len >= sizeof(argvBuf)) break;
+            memcpy(argvBuf + argvPos, carg, len);
+            argvPos += len;
+            argc++;
+        }
+        argvBuf[argvPos] = '\0';
+        char envpBuf[kISHExecEnvpCapacity];
+        size_t envpPos = 0;
+#define WORKER_ENVP_APPEND(s) do { \
+            const char *_s = (s); \
+            size_t _len = strlen(_s) + 1; \
+            if (envpPos + _len < sizeof(envpBuf) - 256) { \
+                memcpy(envpBuf + envpPos, _s, _len); \
+                envpPos += _len; \
+            } \
+        } while (0)
+        // Same base envp as one-shot execs (ENV-12: no TERM — the
+        // worker has no tty). The session env (PYTHONDONTWRITEBYTECODE
+        // =0, DSH_*) arrives as baseEnvText on stdin, below: a
+        // background job forked from the worker inherits the worker's
+        // environment, not the per-command overlay, so the base env
+        // must carry it.
+        WORKER_ENVP_APPEND("HOME=/root");
+        WORKER_ENVP_APPEND("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        WORKER_ENVP_APPEND("LANG=C.UTF-8");
+        WORKER_ENVP_APPEND("ENV=/etc/profile");
+        for (NSString *key in [ISHKernel shared].customEnvironment) {
+            NSString *value = [ISHKernel shared].customEnvironment[key];
+            if (![key isKindOfClass:[NSString class]] ||
+                ![value isKindOfClass:[NSString class]]) continue;
+            NSString *pair = [NSString stringWithFormat:@"%@=%@", key, value];
+            WORKER_ENVP_APPEND(pair.UTF8String);
+        }
+#undef WORKER_ENVP_APPEND
+        envpBuf[envpPos] = '\0';
+        err = do_execve("/bin/bash", argc, argvBuf, envpBuf);
+        if (err < 0) {
+            NSLog(@"ISHShellExecutor: worker do_execve failed: %d", err);
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe stderrPipe:stderrPipe];
+            close(stdinWriteFd);
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            started(NO);
+            return;
+        }
+        int guestPid = current->pid;
+        // Register the pid, then write the base env BEFORE any command:
+        // this block is enqueued on _workerQueue ahead of
+        // beginWorkerRun's write (started() is only signalled after
+        // this block is enqueued, and the caller writes the command
+        // after started() returns).
+        dispatch_async(_workerQueue, ^{
+            [worker lock_setStartedWithPid:guestPid stdinFd:stdinWriteFd];
+            self.workersByPid[@(guestPid)] = worker.sessionId;
+            if (baseEnvText.length > 0) {
+                [self writeWorkerText:baseEnvText worker:worker];
+            }
+        });
+        NSLog(@"ISHShellExecutor: started worker shell PID %d (session %@)",
+              guestPid, worker.sessionId);
+        // Runs the emulator loop on a REAL pthread spawned by task_start.
+        task_start(current);
+        started(YES);
+    });
+}
+
+/// Write text to the worker's stdin (called on _workerQueue, so writes
+/// serialize in call order). Loops over partial writes; stops silently
+/// on EPIPE (dead shell — the death path completes the run).
+- (void)writeWorkerText:(NSString *)text worker:(ISHWorkerShell *)worker {
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data || data.length == 0) return;
+    int fd = [worker lock_stdinFd];
+    if (fd < 0) return;
+    const uint8_t *bytes = data.bytes;
+    size_t remaining = data.length;
+    size_t offset = 0;
+    while (remaining > 0) {
+        ssize_t n = write(fd, bytes + offset, remaining);
+        if (n > 0) {
+            offset += (size_t)n;
+            remaining -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Blocking read loop for one worker stream: forwards each chunk to the
+/// run's output handler (copied under the worker lock, invoked without
+/// it). Runs on a global-queue thread; the caller closes `fd` when
+/// this returns. Unlike runRecord's readers, nothing is accumulated —
+/// a worker never ends, so buffering its output would leak.
+- (void)readWorkerPipeFd:(int)fd worker:(ISHWorkerShell *)worker isStderr:(BOOL)isStderr {
+    uint8_t chunk[8192];
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n > 0) {
+            NSData *data = [NSData dataWithBytes:chunk length:(NSUInteger)n];
+            void (^handler)(BOOL, NSData *) = [worker lock_copyOutputHandler];
+            if (handler) handler(isStderr, data);
+        } else if (n == 0) {
+            break; // EOF: the shell exited (its fdtable released).
+        } else {
+            if (errno == EINTR) continue;
+            break; // e.g. EBADF — treat as EOF.
+        }
+    }
+}
+
+/// One stream hit EOF. When BOTH are done the shell is gone: prefer
+/// the kernel's recorded exit code (the exit notification may not
+/// have arrived yet) and report the death.
+- (void)workerStreamDidEnd:(ISHWorkerShell *)worker isStderr:(BOOL)isStderr {
+    if (![worker lock_markStreamDone:isStderr]) return;
+    NSNumber *code = nil;
+    int pid = worker.pid;
+    if (pid > 0) code = [[ISHKernel shared] exitCodeForGuestPid:pid];
+    [self workerNoteDeath:worker exitCode:code];
+}
+
+/// Report a worker death (exit notification or both streams EOF):
+/// drop the registry entry and invoke the onDeath block exactly once
+/// (with the wait-encoded exit code, or nil when unknown). Safe from
+/// any queue; the registry work is serialized on _workerQueue.
+- (void)workerNoteDeath:(ISHWorkerShell *)worker exitCode:(nullable NSNumber *)code {
+    dispatch_async(_workerQueue, ^{
+        if (self.workers[worker.sessionId] == worker) {
+            [self.workers removeObjectForKey:worker.sessionId];
+        }
+        int pid = worker.pid;
+        if (pid > 0 && [self.workersByPid[@(pid)] isEqualToString:worker.sessionId]) {
+            [self.workersByPid removeObjectForKey:@(pid)];
+        }
+        if (code) [worker lock_noteExitCode:code];
+        void (^handler)(NSNumber *) = [worker lock_takeDeathHandlerWithExitCode:code];
+        if (handler) handler(worker.exitCode);
+    });
+}
+
+/// Stop one worker (called on _workerQueue): kill its whole process
+/// tree — worker + foreground command + background jobs — close its
+/// stdin, and drop it from the registry. The pending run (if any)
+/// completes via the onDeath block invoked here.
+- (void)stopWorkerLocked:(ISHWorkerShell *)worker {
+    if (self.workers[worker.sessionId] == worker) {
+        [self.workers removeObjectForKey:worker.sessionId];
+    }
+    int pid = worker.pid;
+    if (pid > 0) {
+        if ([self.workersByPid[@(pid)] isEqualToString:worker.sessionId]) {
+            [self.workersByPid removeObjectForKey:@(pid)];
+        }
+        // One call reaps everything: the worker, its foreground
+        // command, and every background job are descendants of the
+        // worker pid (killProcessGroup walks parent pointers).
+        [self killProcessGroup:pid];
+    }
+    [worker lock_closeStdin];
+    void (^handler)(NSNumber *) = [worker lock_takeDeathHandlerWithExitCode:nil];
+    if (handler) handler(worker.exitCode);
+}
+
+/// Direct children of one guest pid (parent-pointer scan under
+/// pids_lock, same shape as killProcessGroup).
+- (NSArray<NSNumber *> *)directChildPidsOf:(int)pid {
+    NSMutableArray<NSNumber *> *out = [NSMutableArray array];
+    if (pid <= 1) return out;
+    lock(&pids_lock);
+    for (int j = 2; j < MAX_PID; j++) {
+        struct task *t = pid_get_task((dword_t)j);
+        if (!t) continue;
+        if (t->parent && t->parent->pid == pid) [out addObject:@(t->pid)];
+    }
+    unlock(&pids_lock);
+    return [out copy];
+}
+
+/// YES when `pid` is a live descendant of `ancestorPid` (parent-chain
+/// walk, bounded at 64). NO for pid == ancestor, pid <= 1, a dead pid,
+/// or a pid outside the ancestor's tree.
+- (BOOL)isDescendantOf:(int)pid ancestor:(int)ancestorPid {
+    if (pid <= 1 || ancestorPid <= 1 || pid == ancestorPid) return NO;
+    BOOL found = NO;
+    lock(&pids_lock);
+    struct task *t = pid_get_task((dword_t)pid);
+    for (int depth = 0; depth < 64 && t; depth++) {
+        if (t->pid == ancestorPid) { found = YES; break; }
+        t = t->parent;
+    }
+    unlock(&pids_lock);
+    return found;
 }
 
 @end

@@ -26,6 +26,48 @@
 //         sessionId} — the kernel session id for this socket. Server
 //         kills the Guest process group when the socket disconnects.
 //
+//  PERSISTENT SHELL WORKER (ENV-04, stage 5.4): one long-lived guest
+//  /bin/bash per DSH session, so agent execs stop paying a fresh
+//  process creation + shell start per command (1–2 s of fixed cost
+//  under emulation). The worker is owned by ISHShellExecutor
+//  (ISHWorkerShell); the loopback only routes commands to it:
+//    POST /ish/worker/run  — run one command on the session worker
+//         body {command, sessionId, cwd?, env?, nonce, timeoutMs?,
+//               fsContext?}
+//         response: NDJSON {stream, line} frames + terminal frame
+//         {exitCode, durationMs, timedOut?, cancelled?, workerDied?}.
+//         The command is wrapped (buildWorkerCommand): per-command env
+//         overlay (saved + restored), `{ cmd; } < /dev/null` so a
+//         stdin-reading command sees EOF instead of eating the next
+//         command off the worker's stdin, an END marker line
+//         (`__DSH_END__<nonce>:<exitCode>:<cwd>`, stderr) and a jobs
+//         snapshot (`jobs -l` + `jobs -p`, nonce-tagged). The bridge
+//         swallows the protocol lines; the terminal frame only arrives
+//         after the marker AND the snapshot, so the bridge's job table
+//         is up to date when the run resolves.
+//         A `&` background job is a job OF THE WORKER SHELL (no
+//         subshell wrapper), so `jobs -l` / `kill %1` work natively in
+//         the worker, and the bridge's ishWorkerJobs reads the same
+//         snapshot (it runs `:` on the worker — no separate control
+//         channel is needed). Timeout is a NO-OUTPUT watchdog (120 s
+//         of silence kills the foreground command; 5 s grace, then the
+//         worker is killed and rebuilt) plus the 600 s wall-clock
+//         backstop. Aborting the request kills the current command,
+//         never the worker. One-shot /ish/exec stays as the fallback
+//         (no session id, stdin data, tty exec, or worker unavailable).
+//    POST /ish/worker/jobs/kill — kill one background job
+//         body {sessionId, pid} → {killed: true} or 404
+//         {error: "job_not_found"} (the pid must be a live descendant
+//         of the worker; the worker itself is never a valid target).
+//    POST /ish/worker/stop — stop one session's worker
+//         body {sessionId} → {stopped: true}; kills the worker's whole
+//         process tree, so no background job survives its session.
+//    GET  /ish/worker/jobs does NOT exist on purpose: the job list is
+//         the in-band snapshot after every run, and ishWorkerJobs just
+//         runs `:` to refresh it — a dedicated endpoint would need a
+//         second control channel into the worker's stdin for zero
+//         benefit (it would queue behind the running command anyway).
+//
 //  BYTE STREAM (the 2.3 log-ring fix, done properly here): guest output
 //  is a byte stream, not lines. /ish/exec accumulates bytes in a
 //  LineBuffer and only emits a line once its terminating \n arrives;
@@ -227,13 +269,16 @@ final class IShLoopbackService {
   }
 
   /// Stop listening, close all PTY sessions (kills their shells),
-  /// remove the token file. Idempotent.
+  /// stop all shell workers (kills their whole process trees, so no
+  /// background job survives the service stop), remove the token file.
+  /// Idempotent.
   func stop() {
     queue.async { [weak self] in
       guard let self else { return }
       for session in self.ptySessions.values {
         session.close(reason: "service stopped")
       }
+      ISHShellExecutor.shared().stopAllWorkers()
       self.listener?.cancel()
       self.listener = nil
       self.token = nil
@@ -383,6 +428,8 @@ private final class HTTPConnection {
   /// Live exec/pty handler while a request is being served.
   private var execSession: ExecSession?
   private var wsSession: WSConnection?
+  /// Live worker run while a /ish/worker/run request is being served.
+  private var workerSession: WorkerSession?
 
   init(connection: NWConnection, service: IShLoopbackService) {
     self.connection = connection
@@ -520,6 +567,12 @@ private final class HTTPConnection {
       handleStatus()
     case ("POST", "/ish/exec"):
       handleExec(request)
+    case ("POST", "/ish/worker/run"):
+      handleWorkerRun(request)
+    case ("POST", "/ish/worker/jobs/kill"):
+      handleWorkerJobKill(request)
+    case ("POST", "/ish/worker/stop"):
+      handleWorkerStop(request)
     case ("GET", "/ish/pty"):
       handlePTYUpgrade(request)
     default:
@@ -613,6 +666,8 @@ private final class HTTPConnection {
     closed = true
     execSession?.cancel()
     execSession = nil
+    workerSession?.cancel()
+    workerSession = nil
     wsSession?.closeLocal()
     wsSession = nil
     connection.cancel()
@@ -941,6 +996,523 @@ private final class ExecSession {
       partialOutput += line + "\n"
     }
     sendJSONFrame(["stream": stream, "line": line])
+  }
+
+  private func sendJSONFrame(_ object: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: object, options: []) else { return }
+    var chunk = data
+    chunk.append(0x0A) // NDJSON: one JSON object per line.
+    connection?.sendChunk(chunk)
+  }
+}
+
+// MARK: - /ish/worker (persistent shell, ENV-04)
+
+/// No-output watchdog: a worker run that produces no output bytes for
+/// this long is assumed stuck (blocked read, deadlock, waiting on
+/// stdin that will never come) and its foreground command is killed.
+/// 120 s: matches the DSH bash executor's default deadline, long
+/// enough for legitimate silent work, and far sooner than the 600 s
+/// wall-clock backstop. A command that keeps producing output is never
+/// killed by it — only the wall clock applies. A silent long task
+/// should print progress (tar -v, periodic echo) to stay alive.
+private let kISHWorkerIdleTimeout: TimeInterval = 120
+/// Grace after killing the foreground command for the END marker to
+/// arrive (the wrapper prints it right after the kill). If nothing
+/// arrives — the command was a builtin with no child to kill, e.g.
+/// `wait` — the worker itself is killed and rebuilt.
+private let kISHWorkerKillGrace: TimeInterval = 5
+/// Grace after the END marker for the jobs snapshot to arrive (it is
+/// printed immediately after the marker by the same wrapper, so this
+/// is only a backstop against a truncated stream).
+private let kISHWorkerJobsTailGrace: TimeInterval = 2
+
+extension HTTPConnection {
+  /// A worker session id is a DSH_SESSION_ID: [A-Za-z0-9][A-Za-z0-9_-]{0,127}.
+  /// Anything else is rejected (it becomes a registry key, so it must
+  /// not contain shell syntax or path separators).
+  static func isValidWorkerSessionId(_ id: String) -> Bool {
+    guard !id.isEmpty, id.count <= 128 else { return false }
+    return id.unicodeScalars.allSatisfy {
+      ($0.value >= 48 && $0.value <= 57) || ($0.value >= 65 && $0.value <= 90)
+        || ($0.value >= 97 && $0.value <= 122) || $0.value == 45 || $0.value == 95
+    }
+  }
+
+  /// A worker nonce: hex only, capped at 64 chars (same rule as the
+  /// ENV-14 cwdNonce — it is interpolated into shell source, so it
+  /// must not contain shell syntax).
+  static func isValidWorkerNonce(_ nonce: String) -> Bool {
+    guard !nonce.isEmpty, nonce.count <= 64 else { return false }
+    return nonce.unicodeScalars.allSatisfy {
+      ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102)
+    }
+  }
+
+  /// Build the base-env export line for a NEW worker: `export K='v'; ...`
+  /// (one line, no save/restore — these persist for the worker's life).
+  /// Keys in the `_dsh_` namespace are reserved for the worker protocol
+  /// and never exported. Only valid shell names are exported.
+  static func buildBaseEnvExports(env: [String: String]?) -> String {
+    guard let env, !env.isEmpty else { return "" }
+    var parts: [String] = []
+    for key in env.keys.sorted() {
+      guard isValidShellName(key), !key.hasPrefix("_dsh_"), let value = env[key] else { continue }
+      parts.append("export \(key)=\(shellQuote(value));")
+    }
+    return parts.joined(separator: " ")
+  }
+
+  /// Build the text written to the worker's stdin for one command.
+  ///
+  /// - Per-command env overlay: each key is saved (`_dsh_sv_<K>` /
+  ///   `_dsh_has_<K>`) and exported; the restore runs after the command,
+  ///   so the overlay never leaks into later commands. The worker's BASE
+  ///   env (set at creation) is untouched by this.
+  /// - The command runs inside a `{ ...; }` group in the CURRENT shell
+  ///   (no subshell: a bare `cd` persists and `&` jobs belong to the
+  ///   worker, so `jobs` sees them), with stdin from /dev/null: a
+  ///   command that reads stdin sees EOF instead of eating the next
+  ///   command's text off the worker's command channel. Well-formed
+  ///   multi-line commands (if/for/function/heredoc) parse fine inside
+  ///   the group; a syntactically incomplete command swallows the
+  ///   closing lines and the watchdog rebuilds the worker.
+  /// - The END marker (`__DSH_END__<nonce>:<exitCode>:<cwd>`, stderr)
+  ///   and the jobs snapshot (`jobs -l` for the bridge's job table,
+  ///   `jobs -p` for the executor's kill-exclusion set) follow. The
+  ///   bridge swallows all protocol lines (same split as the ENV-14
+  ///   cwd marker: the server forwards, the client owns the protocol).
+  static func buildWorkerCommand(command: String, cwd: String?, env: [String: String]?,
+                                 nonce: String) -> String {
+    var lines: [String] = []
+    var savedKeys: [String] = []
+    if let env, !env.isEmpty {
+      for key in env.keys.sorted() {
+        guard isValidShellName(key), !key.hasPrefix("_dsh_"), let value = env[key] else { continue }
+        savedKeys.append(key)
+        lines.append("_dsh_sv_\(key)=\"${\(key)-}\"; _dsh_has_\(key)=\"${\(key)+x}\"; export \(key)=\(shellQuote(value));")
+      }
+    }
+    if let cwd, !cwd.isEmpty {
+      // `;` (not `&&`): a failed cd must not skip the command — the
+      // marker below reports the ACTUAL cwd, so the bridge's memory
+      // self-heals. The bridge only sends cwd when it changed (or the
+      // worker was rebuilt), so this is normally a no-op cd.
+      lines.append("cd -- \(shellQuote(cwd));")
+    }
+    lines.append("{ \(command)")
+    // `}` and the exit-code capture are separate lines so a group that
+    // parses but whose command fails (e.g. `false`) still reaches the
+    // marker with the right exit code. A group that FAILS TO PARSE
+    // (e.g. a comment-only command is an empty list) is fatal: a
+    // non-interactive bash exits on the syntax error (verified:
+    // `bash --noprofile --norc` exits 2, the marker never runs) and
+    // the worker dies — the run then completes via onWorkerDeath with
+    // the shell's exit code, and the next run rebuilds the worker.
+    // That is the designed recovery path; it costs one worker restart.
+    lines.append("} < /dev/null")
+    lines.append("_dsh_ec=$?;")
+    for key in savedKeys {
+      lines.append("if [ -n \"$_dsh_has_\(key)\" ]; then export \(key)=\"$_dsh_sv_\(key)\"; else unset \(key); fi; unset _dsh_sv_\(key) _dsh_has_\(key);")
+    }
+    lines.append("printf '__DSH_END__\(nonce):%s:%s\\n' \"$_dsh_ec\" \"$PWD\" >&2")
+    lines.append("printf '__DSH_JOBS_BEGIN__\(nonce)\\n' >&2")
+    lines.append("jobs -l >&2")
+    lines.append("printf '__DSH_JOBS_END__\(nonce)\\n' >&2")
+    lines.append("printf '__DSH_JOBPIDS_BEGIN__\(nonce)\\n' >&2")
+    lines.append("jobs -p >&2")
+    lines.append("printf '__DSH_JOBPIDS_END__\(nonce)\\n' >&2")
+    return lines.joined(separator: "\n") + "\n"
+  }
+
+  func handleWorkerRun(_ request: HTTPRequest) {
+    guard service != nil else { close(); return }
+    guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+          let command = json["command"] as? String, !command.isEmpty,
+          let sessionId = json["sessionId"] as? String, Self.isValidWorkerSessionId(sessionId),
+          let nonce = json["nonce"] as? String, Self.isValidWorkerNonce(nonce) else {
+      sendJSON(status: 400, reason: "Bad Request",
+               object: ["error": "command, sessionId and nonce are required"])
+      return
+    }
+    var fsContext: UInt64 = 0
+    if let n = json["fsContext"] as? NSNumber { fsContext = n.uint64Value }
+    var timeoutMs = 600_000
+    if let n = json["timeoutMs"] as? NSNumber { timeoutMs = n.intValue }
+    timeoutMs = max(1_000, min(timeoutMs, 900_000))
+    let env = json["env"] as? [String: String]
+    let cwd = json["cwd"] as? String
+    guard ISHKernel.shared.isBooted else {
+      sendJSON(status: 503, reason: "Service Unavailable", object: ["error": "ish_not_booted"])
+      return
+    }
+    // Register the session NOW (service queue), before the possibly
+    // blocking worker creation: close() must be able to cancel a run
+    // that is still starting, or a command aborted mid-start would run
+    // to completion on the worker and block the session.
+    let session = WorkerSession(connection: self, nonce: nonce)
+    workerSession = session
+    let shellCommand = Self.buildWorkerCommand(command: command, cwd: cwd, env: env, nonce: nonce)
+    let baseEnvText = Self.buildBaseEnvExports(env: env)
+    // Worker creation can block up to 15 s (shell start under
+    // emulation): do it off the service queue so other requests
+    // (status, pty upgrade) are not stalled behind it.
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      var worker = ISHShellExecutor.shared().workerForSession(sessionId, fsContext: fsContext,
+                                                             baseEnvText: baseEnvText)
+      if worker == nil {
+        // The bridge falls back to one-shot /ish/exec for this command.
+        self.sendJSON(status: 503, reason: "Service Unavailable",
+                      object: ["error": "worker_start_failed"])
+        return
+      }
+      // fs_context is per agent run: a worker started under a different
+      // context is rebuilt (its jobs die with it — a context change
+      // means a new agent run, whose jobs belong to the old run).
+      if worker!.fsContext != fsContext {
+        ISHShellExecutor.shared().stopWorkerForSession(sessionId)
+        worker = ISHShellExecutor.shared().workerForSession(sessionId, fsContext: fsContext,
+                                                           baseEnvText: baseEnvText)
+        if worker == nil {
+          self.sendJSON(status: 503, reason: "Service Unavailable",
+                        object: ["error": "worker_start_failed"])
+          return
+        }
+      }
+      session.attachWorker(worker!, commandText: shellCommand,
+                           timeout: TimeInterval(timeoutMs) / 1000.0)
+    }
+  }
+
+  func handleWorkerJobKill(_ request: HTTPRequest) {
+    guard service != nil else { close(); return }
+    guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+          let sessionId = json["sessionId"] as? String, Self.isValidWorkerSessionId(sessionId),
+          let pidNumber = json["pid"] as? NSNumber else {
+      sendJSON(status: 400, reason: "Bad Request",
+               object: ["error": "sessionId and pid are required"])
+      return
+    }
+    let pid = pidNumber.intValue
+    guard let worker = ISHShellExecutor.shared().workerForSessionIfPresent(sessionId),
+          worker.isAlive else {
+      sendJSON(status: 404, reason: "Not Found", object: ["error": "job_not_found"])
+      return
+    }
+    // killWorkerJob validates the pid is a live descendant of the
+    // worker (anything else — including the worker itself — is refused).
+    if ISHShellExecutor.shared().killWorkerJob(worker, pid: Int32(pid)) {
+      sendJSON(status: 200, reason: "OK", object: ["killed": true, "pid": pid])
+    } else {
+      sendJSON(status: 404, reason: "Not Found", object: ["error": "job_not_found"])
+    }
+  }
+
+  func handleWorkerStop(_ request: HTTPRequest) {
+    guard service != nil else { close(); return }
+    guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+          let sessionId = json["sessionId"] as? String, Self.isValidWorkerSessionId(sessionId) else {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "sessionId is required"])
+      return
+    }
+    // Idempotent: stopping a session with no worker still reports stopped.
+    ISHShellExecutor.shared().stopWorkerForSession(sessionId)
+    sendJSON(status: 200, reason: "OK", object: ["stopped": true])
+  }
+}
+
+/// One POST /ish/worker/run request: streams the worker's output as
+/// chunked NDJSON and ends with a terminal frame. All state is owned
+/// by a private serial queue (the executor's outputHandler arrives on
+/// arbitrary queues). The run completes when the END marker AND the
+/// jobs snapshot have arrived, the worker dies, the client disconnects,
+/// the no-output watchdog fires, or the wall-clock timeout fires.
+/// One run per worker at a time — the bridge serializes runs per
+/// session (its per-session queue), so two WorkerSessions never share
+/// a worker concurrently.
+private final class WorkerSession {
+  private weak var connection: HTTPConnection?
+  private let queue = DispatchQueue(label: "me.zzuu.ish.loopback.worker")
+  private var stdoutBuffer = LineBuffer()
+  private var stderrBuffer = LineBuffer()
+  /// Decoded output text so far (for the timeout frame's partialOutput).
+  /// Protocol lines never enter it.
+  private var partialOutput = ""
+  private var finished = false
+  private var cancelled = false
+  private var timedOut = false
+  private let nonce: String
+  private var worker: ISHWorkerShell?
+  private var startedAt = Date()
+  private var wallClockTimeout: TimeInterval = 600
+  private var lastOutputAt = Date()
+  /// END marker seen (exit code + final cwd parsed).
+  private var sawEndMarker = false
+  private var markerExitCode: Int?
+  private var markerCwd: String?
+  /// Jobs snapshot complete (JOBPIDS_END seen).
+  private var sawJobsEnd = false
+  /// The worker died mid-run (its shell exited: `exit`, `exec`, kill).
+  private var workerDied = false
+  /// Wait-decoded exit code of the dead worker shell, if known.
+  private var workerExitCode: Int?
+  /// Inside a `jobs -l` block (lines are protocol, not output).
+  private var inJobsBlock = false
+  /// Inside a `jobs -p` block (pids for the kill-exclusion set).
+  private var inJobpidsBlock = false
+  private var collectedJobPids: [Int] = []
+  /// Watchdog re-arm token: a stale timer block (from an earlier
+  /// arming) is ignored.
+  private var watchdogToken = 0
+
+  init(connection: HTTPConnection, nonce: String) {
+    self.connection = connection
+    self.nonce = nonce
+  }
+
+  /// Attach the (possibly newly created) worker and start the run.
+  /// Called once, from any queue. If the client already disconnected,
+  /// the command is never written (a cancelled command must not run
+  /// and block the worker).
+  func attachWorker(_ worker: ISHWorkerShell, commandText: String, timeout: TimeInterval) {
+    queue.async { [weak self] in
+      guard let self, !self.finished, !self.cancelled else { return }
+      self.worker = worker
+      self.startedAt = Date()
+      self.lastOutputAt = Date()
+      self.wallClockTimeout = timeout
+      self.connection?.sendChunkedHeaders()
+      // Death: the shell exited mid-run (`exit`, `exec`, eviction,
+      // guest stop). Complete with the shell's exit code when known.
+      worker.onDeath = { [weak self] exitCode in
+        self?.queue.async { [weak self] in self?.onWorkerDeath(exitCode: exitCode) }
+      }
+      ISHShellExecutor.shared().beginWorkerRun(worker, commandText: commandText) { [weak self] isStderr, chunk in
+        self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
+      }
+      self.armWatchdog()
+      self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.wallClockFired() }
+    }
+  }
+
+  /// Cancel (client disconnected): kill the foreground command, never
+  /// the worker — the session stays usable for the next command. The
+  /// completion still fires but the connection is closed, so sends are
+  /// no-ops. A builtin with no child escalates to a worker kill.
+  func cancel() {
+    queue.async { [weak self] in
+      guard let self, !self.finished else { return }
+      self.cancelled = true
+      if let worker = self.worker {
+        self.killCurrentCommandOrEscalate(worker: worker)
+      } else {
+        // No worker yet (still starting): the command was never
+        // written, and attachWorker will see cancelled and skip it.
+        self.finished = true
+      }
+    }
+  }
+
+  private func onChunk(isStderr: Bool, chunk: Data) {
+    guard !finished else { return }
+    lastOutputAt = Date()
+    let stream = isStderr ? "stderr" : "stdout"
+    let buffer = isStderr ? stderrBuffer : stdoutBuffer
+    for line in buffer.append(chunk) {
+      sendLine(stream: stream, lineData: line)
+    }
+  }
+
+  /// Encode one NDJSON line ({stream, line}) and send it as a chunk.
+  /// Protocol lines (stderr only, exact nonce) are still forwarded —
+  /// the bridge parses them (same split as the ENV-14 cwd marker) —
+  /// but never enter partialOutput. The `jobs -l` / `jobs -p` lines
+  /// inside a snapshot block are protocol too.
+  private func sendLine(stream: String, lineData: Data) {
+    let line = String(decoding: lineData, as: UTF8.self)
+    var isProtocol = false
+    if stream == "stderr" {
+      if line.hasPrefix("__DSH_END__\(nonce):") {
+        isProtocol = true
+        parseEndMarker(line)
+      } else if line == "__DSH_JOBS_BEGIN__\(nonce)" {
+        isProtocol = true
+        inJobsBlock = true
+      } else if line == "__DSH_JOBS_END__\(nonce)" {
+        isProtocol = true
+        inJobsBlock = false
+      } else if line == "__DSH_JOBPIDS_BEGIN__\(nonce)" {
+        isProtocol = true
+        inJobpidsBlock = true
+      } else if line == "__DSH_JOBPIDS_END__\(nonce)" {
+        isProtocol = true
+        inJobpidsBlock = false
+        sawJobsEnd = true
+        worker?.jobPids = Set(collectedJobPids.map { NSNumber(value: $0) })
+        collectedJobPids.removeAll()
+        tryCompleteFromMarker()
+      } else if inJobsBlock {
+        isProtocol = true
+      } else if inJobpidsBlock {
+        isProtocol = true
+        if let pid = Int(line.trimmingCharacters(in: .whitespaces)), pid > 0 {
+          collectedJobPids.append(pid)
+        }
+      }
+    }
+    if !isProtocol {
+      partialOutput += line + "\n"
+    }
+    sendJSONFrame(["stream": stream, "line": line])
+  }
+
+  /// Parse `__DSH_END__<nonce>:<exitCode>:<cwd>` (stderr). A malformed
+  /// line is ordinary output (the bridge applies the same rule, so a
+  /// command that prints a look-alike line cannot corrupt the run).
+  private func parseEndMarker(_ line: String) {
+    let rest = line.dropFirst("__DSH_END__\(nonce):".count)
+    guard let colon = rest.firstIndex(of: ":"),
+          let code = Int(rest[..<colon]), code >= 0, code <= 255 else { return }
+    let cwd = rest[rest.index(after: colon)...]
+    guard cwd.hasPrefix("/") else { return }
+    markerExitCode = code
+    markerCwd = String(cwd)
+    sawEndMarker = true
+    // Tail grace: the jobs snapshot is printed immediately after the
+    // marker by the same wrapper; if it never arrives, complete anyway
+    // rather than hanging the run.
+    queue.asyncAfter(deadline: .now() + kISHWorkerJobsTailGrace) { [weak self] in
+      guard let self, !self.finished, self.sawEndMarker, !self.sawJobsEnd else { return }
+      NSLog("ish-loopback: worker run END marker without jobs snapshot; completing anyway")
+      self.tryCompleteFromMarker(forceJobs: true)
+    }
+    tryCompleteFromMarker()
+  }
+
+  private func tryCompleteFromMarker(forceJobs: Bool = false) {
+    guard !finished, sawEndMarker, let code = markerExitCode,
+          sawJobsEnd || forceJobs else { return }
+    completeRun(exitCode: code, timedOut: timedOut, cancelled: cancelled, workerDied: false)
+  }
+
+  private func onWorkerDeath(exitCode: NSNumber?) {
+    guard !finished else { return }
+    workerDied = true
+    // The shell's exit code, wait-decoded (`exit 3` → 3; killed by a
+    // signal → 128 + signal). Nil when the shell was killed without a
+    // notification — the run then reports -1 (unknown).
+    if let code = exitCode {
+      workerExitCode = Int(ISHDecodeWaitStatus(Int32(code.intValue)))
+    }
+    completeRun(exitCode: workerExitCode ?? -1, timedOut: timedOut,
+                cancelled: cancelled, workerDied: true)
+  }
+
+  private func wallClockFired() {
+    guard !finished else { return }
+    timedOut = true
+    NSLog("ish-loopback: worker run hit the %.0fs wall clock; killing foreground command",
+          wallClockTimeout)
+    if let worker { killCurrentCommandOrEscalate(worker: worker) }
+  }
+
+  private func armWatchdog() {
+    watchdogToken += 1
+    let token = watchdogToken
+    queue.asyncAfter(deadline: .now() + kISHWorkerIdleTimeout) { [weak self] in
+      guard let self, !self.finished, token == self.watchdogToken else { return }
+      self.watchdogFired()
+    }
+  }
+
+  private func watchdogFired() {
+    guard !finished, !cancelled else { return }
+    if Date().timeIntervalSince(lastOutputAt) < kISHWorkerIdleTimeout {
+      armWatchdog() // output arrived since the last arming; re-arm
+      return
+    }
+    // Silent for 120 s: kill the foreground command. The wrapper
+    // prints the END marker right after the kill, which completes the run.
+    timedOut = true
+    if let worker {
+      NSLog("ish-loopback: worker run silent %.0fs, killing foreground command",
+            kISHWorkerIdleTimeout)
+      killCurrentCommandOrEscalate(worker: worker)
+    }
+  }
+
+  /// Kill the foreground command; if there is no child to kill (a
+  /// builtin such as `wait`), or the END marker still has not arrived
+  /// after the grace, kill the worker itself (the run then completes
+  /// via onWorkerDeath).
+  private func killCurrentCommandOrEscalate(worker: ISHWorkerShell) {
+    let killed = ISHShellExecutor.shared().killWorkerForegroundCommand(worker)
+    if killed.isEmpty {
+      escalateToWorkerKill(worker: worker)
+      return
+    }
+    queue.asyncAfter(deadline: .now() + kISHWorkerKillGrace) { [weak self] in
+      guard let self, !self.finished else { return }
+      self.escalateToWorkerKill(worker: worker)
+    }
+  }
+
+  private func escalateToWorkerKill(worker: ISHWorkerShell) {
+    guard !finished else { return }
+    NSLog("ish-loopback: worker run stuck, killing worker session %@", worker.sessionId)
+    ISHShellExecutor.shared().stopWorkerForSession(worker.sessionId)
+    // Backstop: if the death notice does not complete the run within
+    // 2 s, complete directly (the run must never hang the session).
+    queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+      guard let self, !self.finished else { return }
+      self.completeRun(exitCode: self.cancelled ? -4 : -3, timedOut: self.timedOut,
+                       cancelled: self.cancelled, workerDied: true)
+    }
+  }
+
+  /// The single completion point. No-op if already finished. Releases
+  /// the worker (clears the death handler + the output handler) before
+  /// sending the terminal frame, so the next run can start.
+  private func completeRun(exitCode: Int, timedOut: Bool = false,
+                           cancelled: Bool = false, workerDied: Bool = false) {
+    guard !finished else { return }
+    finished = true
+    // Flush trailing partial lines (if any) as final lines.
+    if let line = stdoutBuffer.flush() { sendLine(stream: "stdout", lineData: line) }
+    if let line = stderrBuffer.flush() { sendLine(stream: "stderr", lineData: line) }
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+    var frame: [String: Any] = [
+      "exitCode": exitCode,
+      "durationMs": durationMs,
+    ]
+    if timedOut {
+      frame["timedOut"] = true
+      frame["partialOutput"] = partialOutput
+    }
+    if cancelled {
+      frame["cancelled"] = true
+    }
+    if workerDied {
+      frame["workerDied"] = true
+    }
+    if let cwd = markerCwd {
+      // The bridge already learns the cwd from the marker frame; this
+      // copy is for debugging (a frame that arrives without its marker
+      // still names the directory the run ended in).
+      frame["cwd"] = cwd
+    }
+    if let worker {
+      worker.onDeath = nil
+      ISHShellExecutor.shared().endWorkerRun(worker)
+      self.worker = nil
+    }
+    sendJSONFrame(frame)
+    // Close only after the terminating chunk has been handed to the
+    // network stack (same reason as ExecSession.onComplete).
+    connection?.sendChunkEnd { [weak self] in
+      self?.connection?.closeFromAnyQueue()
+    }
   }
 
   private func sendJSONFrame(_ object: [String: Any]) {

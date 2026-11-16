@@ -195,6 +195,124 @@ typedef NS_ENUM(NSInteger, ISHShellExecutionError) {
 /// halt_system() == _exit(0) and kills the app).
 - (void)killProcessGroup:(int)pid;
 
+// --- Persistent shell worker (ENV-04) --------------------------------------
+// A long-lived guest /bin/bash per DSH session, so agent execs stop
+// paying a fresh process creation + shell start per command. The
+// worker is started exactly like a one-shot exec (become_new_init_child
+// + adhoc-fd pipes + do_execve of /bin/bash --noprofile --norc), but
+// its stdin stays open and it has no timeout and no exit-notification
+// finalization: commands are written to its stdin by the loopback
+// service (see IShLoopbackService.buildWorkerCommand for the wrapper:
+// per-command env overlay, `{ cmd; } < /dev/null` stdin guard, END
+// marker + jobs snapshot), and output streams back through the same
+// pipe readers as one-shot execs.
+//
+// LIFECYCLE: created lazily by workerForSession (at most
+// ISHWorkerMaxSessions live workers; creating one more evicts the
+// least-recently-used, killing its jobs first). The worker dies when
+// its shell exits (e.g. the command was `exit`), when it is stopped,
+// or when the guest stops; a dead worker is dropped from the registry
+// and the next run recreates it (the bridge resends the remembered
+// cwd, so the rebuild lands in the same directory). stopAllWorkers is
+// the teardown path (service stop); stopGuest kills the guest pids
+// directly, and the exit observer drops the records.
+//
+// JOBS: a command's `&` children are jobs of the worker shell (they
+// are NOT wrapped in a subshell, so `jobs -l` sees them). The loopback
+// service reports the last `jobs -p` snapshot into jobPids; killing
+// the foreground command excludes those pids, killing a job validates
+// it is a descendant of the worker first. Stopping a worker kills its
+// whole process tree (killProcessGroup on the worker pid), so no
+// background job survives its session.
+
+/// Max live workers (same cap as the PTY sessions: one guest task +
+/// three host pipe fds each, and the agent is serial per session, so
+/// more would only be idle shells).
+extern const NSUInteger ISHWorkerMaxSessions;
+
+/// A live (or recently dead) worker shell.
+@interface ISHWorkerShell : NSObject
+/// DSH session id this worker belongs to.
+@property (nonatomic, readonly, copy) NSString *sessionId;
+/// Guest pid of the bash process, 0 until it has started.
+@property (nonatomic, readonly) int pid;
+/// NO once the shell has exited (readers hit EOF or the exit
+/// notification arrived). A dead worker is dropped from the registry.
+@property (nonatomic, readonly, getter=isAlive) BOOL alive;
+/// fs_context the worker was started with (0 = none). A run with a
+/// different fsContext rebuilds the worker (checked loopback-side).
+@property (nonatomic, readonly) uint64_t fsContext;
+/// Last time a run started on this worker (LRU eviction).
+@property (nonatomic, readonly, strong) NSDate *lastUsedAt;
+/// Wait-encoded exit code (ISHDecodeWaitStatus decodes it), or nil
+/// when the shell has not exited yet / died without a notification.
+@property (nonatomic, readonly, strong, nullable) NSNumber *exitCode;
+/// Pids of the worker's background jobs, from the last `jobs -p`
+/// snapshot the loopback service reported. Used to exclude jobs when
+/// killing the foreground command.
+@property (nonatomic, copy) NSSet<NSNumber *> *jobPids;
+/// Invoked exactly once when the shell dies (readers EOF or exit
+/// notification), with the wait-encoded exit code or nil. Set by the
+/// loopback service per run; cleared when the run ends.
+@property (nonatomic, copy, nullable) void (^onDeath)(NSNumber * _Nullable exitCode);
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+/// The registered worker for a session, if one exists (alive or
+/// recently dead). Does NOT create one. Used by the jobs-kill endpoint,
+/// which must not start a shell just to answer "no such job".
+- (nullable ISHWorkerShell *)workerForSessionIfPresent:(NSString *)sessionId;
+
+/// Get (or start) the worker for a session. Starts /bin/bash
+/// --noprofile --norc with host pipes; `baseEnvText` (e.g.
+/// "export FOO='bar'; ...", may be nil/empty) is written to the
+/// worker's stdin before any command, so the worker's base environment
+/// holds the session env (PYTHONDONTWRITEBYTECODE=0, DSH_* — a
+/// background job forked from the worker inherits this, not the
+/// per-command overlay). Returns nil when the kernel is not booted or
+/// the start fails / times out (15 s). May evict the LRU worker.
+/// Thread-safe; blocks the caller while the worker starts.
+- (nullable ISHWorkerShell *)workerForSession:(NSString *)sessionId
+                                    fsContext:(uint64_t)fsContext
+                                  baseEnvText:(nullable NSString *)baseEnvText;
+
+/// Start one run on the worker: set the output handler (called with
+/// (isStderr, chunk) on the worker queue as pipe reads return) and
+/// write the (already wrapped) command text to the worker's stdin.
+/// The handler stays installed until endWorkerRun. No-op when the
+/// worker is dead (the caller then rebuilds via workerForSession).
+- (void)beginWorkerRun:(ISHWorkerShell *)worker
+           commandText:(NSString *)commandText
+         outputHandler:(void (^)(BOOL isStderr, NSData *chunk))outputHandler;
+
+/// End a run: clear the output handler (output arriving between runs —
+/// e.g. a background job printing while idle — is dropped). Safe to
+/// call twice.
+- (void)endWorkerRun:(ISHWorkerShell *)worker;
+
+/// Kill the foreground command of a worker run: every direct child of
+/// the worker pid EXCEPT the known background-job pids, each with its
+/// whole descendant tree (killProcessGroup). Returns the pids killed.
+/// Empty when the foreground command is a shell builtin (no child —
+/// e.g. `wait`): the caller must then escalate (kill the worker) if
+/// the run still does not complete.
+- (NSArray<NSNumber *> *)killWorkerForegroundCommand:(ISHWorkerShell *)worker;
+
+/// Kill one background job (and its descendants). The pid must be a
+/// live descendant of the worker (anything else — including the worker
+/// itself — is refused). Returns YES when the kill was issued.
+- (BOOL)killWorkerJob:(ISHWorkerShell *)worker pid:(int)pid;
+
+/// Stop one session's worker: kill its whole process tree (worker +
+/// foreground command + background jobs), close its stdin, drop it
+/// from the registry. Idempotent; no-op when there is no worker.
+- (void)stopWorkerForSession:(NSString *)sessionId;
+
+/// Stop every live worker (teardown path; the loopback service calls
+/// this from stop()). Each worker's process tree is killed, so no
+/// background job survives the service stop.
+- (void)stopAllWorkers;
+
 /// Kill every live execution (teardown path). Each result completes
 /// with exitCode -4.
 - (void)cancelAll;
