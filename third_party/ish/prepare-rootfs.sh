@@ -16,9 +16,15 @@
 #     the prototype App). The intermediate fakefs tree is kept under
 #     third_party/ish/.work/alpine-rootfs/ for inspection, not in the bundle.
 #   - Branding changed from MinisApp to dsh-go (/etc/profile PS1, /etc/motd).
+#   - Extra packages (bash, python3, ripgrep, curl) are installed into the
+#     fakefs tree by install-rootfs-packages.py (see rootfs-packages.txt)
+#     AFTER fakefsify and BEFORE the zip, so the shipped sandbox has them
+#     preinstalled. The helper also updates the apk db and the fakefs
+#     meta.db — both are required for the guest to see the new files.
 #   - Idempotent: if IShArtifacts/rootfs-manifest.json already records the
-#     same Alpine tarball SHA256 + the same iSH commit and the zip exists,
-#     the rebuild is skipped (use --force to rebuild anyway).
+#     same Alpine tarball SHA256 + the same iSH commit + the same package
+#     list SHA256 and the zip exists, the rebuild is skipped (use --force
+#     to rebuild anyway).
 #
 # ORDERING — run build-ish.sh FIRST:
 #   fakefsify is built from the iSH source tree (third_party/ish-src) with a
@@ -87,6 +93,14 @@ ALPINE_URL="${ALPINE_MIRROR}/v3.21/releases/${ALPINE_ARCH}/${ALPINE_FILE}"
 # and a direct download (3,851,686 bytes). Both agree.
 ALPINE_SHA256="f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
 
+# --- Extra rootfs packages (bash, python3, ripgrep, curl) ---
+# Pinned top-level list + the helper that installs them into the fakefs
+# tree. The list SHA256 is recorded in the manifest and checked by the
+# skip guard, so editing the list forces a rebuild.
+PACKAGES_FILE="$SCRIPT_DIR/rootfs-packages.txt"
+PACKAGES_HELPER="$SCRIPT_DIR/install-rootfs-packages.py"
+PACKAGES_LOCK="$ARTIFACTS/rootfs-packages.lock"
+
 # --- Deterministic zip epoch ---
 # Every mtime in the fakefs tree is normalised to this instant before
 # zipping (touch -t format, POSIX — works on GNU and BSD/macOS touch).
@@ -143,10 +157,7 @@ check_prerequisites() {
         log_error "iSH source not found at $ISH_SRC. Run third_party/ish/build-ish.sh FIRST (it downloads + extracts the pinned iSH tarball), then re-run this script."
     fi
     local marker="$ISH_SRC/.ish-source-commit"
-    # build-ish.sh writes "<commit> <patch-sha>" (the patch set is part of
-    # the marker since the P0/P1 kernel patch landed); compare only the
-    # commit field — a changed patch already forces a fresh extract there.
-    if [ -f "$marker" ] && [ "$(awk '{print $1}' "$marker")" != "$ISH_COMMIT" ]; then
+    if [ -f "$marker" ] && [ "$(cat "$marker")" != "$ISH_COMMIT" ]; then
         log_error "iSH source on disk is at $(cat "$marker"), but this script pins $ISH_COMMIT. Re-run build-ish.sh to re-extract the pinned source first."
     fi
 
@@ -302,6 +313,10 @@ EOF
 nameserver 8.8.8.8
 nameserver 8.8.4.4
 EOF
+    # Deterministic mode (cat > uses the caller's umask, which varies);
+    # the guest reads the mode from meta.db, and the indexer below
+    # records it — so the mode must be fixed here, not left to umask.
+    chmod 644 "$rootfs_data/etc/resolv.conf"
 
     # APK repositories for the pinned Alpine version.
     cat > "$rootfs_data/etc/apk/repositories" << EOF
@@ -310,6 +325,103 @@ https://dl-cdn.alpinelinux.org/alpine/v3.21/community
 EOF
 
     log_success "Rootfs configured"
+}
+
+# ============================================================================
+# Install extra packages (bash, python3, ripgrep, curl) into the fakefs tree
+# ============================================================================
+install_rootfs_packages() {
+    log_info "Installing extra rootfs packages (see rootfs-packages.txt)..."
+    [ -f "$PACKAGES_FILE" ] || log_error "Package list not found: $PACKAGES_FILE"
+    [ -f "$PACKAGES_HELPER" ] || log_error "Package installer not found: $PACKAGES_HELPER"
+    [ -d "$WORK_DIR/alpine-rootfs/data" ] || log_error "fakefs data tree missing — run create_fakefs first"
+    python3 "$PACKAGES_HELPER" \
+        --data-dir "$WORK_DIR/alpine-rootfs/data" \
+        --packages "$PACKAGES_FILE" \
+        --mirror "$ALPINE_MIRROR" \
+        --version "3.21" \
+        --arch "$ALPINE_ARCH" \
+        --cache-dir "$CACHE_DIR/rootfs-packages" \
+        --lock-file "$PACKAGES_LOCK"
+    log_success "Extra packages installed (lock: $PACKAGES_LOCK)"
+}
+
+# ============================================================================
+# Index files that exist on disk but have no meta.db row
+# ============================================================================
+# configure_rootfs() creates /etc/resolv.conf on disk, but the Alpine
+# minirootfs tarball does not ship it, so fakefsify never indexed it and
+# the package installer (which only indexes package files) never sees it.
+# A file on disk with no meta.db row is invisible to the guest's fakefs:
+# the device showed an empty /etc/resolv.conf and could not resolve DNS
+# even though the file (8.8.8.8/8.8.4.4) was in the zip. This step scans
+# data/ for any path missing from meta.db and inserts a paths+stats row
+# for it, using the file's actual mode from disk (configure_rootfs sets it
+# explicitly) and root ownership (uid 0, gid 0 — the build machine's
+# uid/gid would make meta.db non-deterministic) and the next free
+# inode (continuing from the current max, in deterministic path-sorted
+# order, matching the installer's convention). It runs after
+# install_rootfs_packages and before create_zip_archive, so it applies to
+# every build (base rootfs included), not just the package batch. Files
+# already in meta.db are skipped. The WAL is checkpointed back into the
+# main db file (the zip step excludes *.db-wal/*.db-shm).
+index_missing_rootfs_files() {
+    log_info "Indexing files missing from meta.db (e.g. /etc/resolv.conf)..."
+    python3 - "$WORK_DIR/alpine-rootfs/meta.db" "$WORK_DIR/alpine-rootfs/data" << 'PYEOF'
+import os, sqlite3, stat as statmod, struct, sys
+meta_db, data_dir = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(meta_db)
+try:
+    cur = con.cursor()
+    existing = {row[0] for row in cur.execute("SELECT path FROM paths")}
+    max_inode = cur.execute("SELECT COALESCE(MAX(inode), 0) FROM stats").fetchone()[0]
+    missing = []
+    for dirpath, dirnames, filenames in os.walk(data_dir):
+        dirnames.sort()
+        for name in sorted(dirnames) + sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, data_dir)
+            abs_path = ("/" + rel).encode()
+            if abs_path in existing:
+                continue
+            st = os.lstat(full)
+            if statmod.S_ISDIR(st.st_mode):
+                mode = 0o040000 | (st.st_mode & 0o7777)
+            elif statmod.S_ISLNK(st.st_mode):
+                mode = 0o120000 | (st.st_mode & 0o7777)
+            elif statmod.S_ISREG(st.st_mode):
+                mode = 0o100000 | (st.st_mode & 0o7777)
+            else:
+                print(f"warning: skipping non-regular entry {abs_path!r}", file=sys.stderr)
+                continue
+            missing.append((abs_path, mode))
+    missing.sort(key=lambda t: t[0])
+    if not missing:
+        print("meta.db: no unindexed files found")
+        sys.exit(0)
+    rows_stat, rows_path = [], []
+    for i, (abs_path, mode) in enumerate(missing):
+        # Owner is always root in the guest (uid 0, gid 0): the file's
+        # on-disk uid/gid are the build machine's, which vary between
+        # machines and would make meta.db (and the zip SHA) non-
+        # deterministic. The mode comes from the file (configure_rootfs
+        # sets it explicitly, e.g. chmod 644 for resolv.conf).
+        uid, gid = 0, 0
+        inode = max_inode + 1 + i
+        blob = struct.pack("<IIII", mode, uid, gid, 0)
+        rows_stat.append((inode, blob))
+        rows_path.append((abs_path, inode))
+        print(f"indexing {abs_path.decode()} mode={oct(mode)} uid={uid} gid={gid} inode={inode}")
+    cur.executemany("INSERT INTO stats (inode, stat) VALUES (?, ?)", rows_stat)
+    cur.executemany("INSERT INTO paths (path, inode) VALUES (?, ?)", rows_path)
+    con.commit()
+    cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.commit()
+    print(f"meta.db: {len(rows_path)} previously-unindexed path(s) added")
+finally:
+    con.close()
+PYEOF
+    log_success "Unindexed files indexed into meta.db"
 }
 
 # ============================================================================
@@ -376,8 +488,15 @@ PYEOF
     echo "alpine-rootfs.zip SHA256: $zip_sha"
     echo "alpine-rootfs.zip bytes:  $zip_bytes"
 
+    # The package list hash + the resolved lock are recorded so the skip
+    # guard can tell a package-list change from an unchanged rebuild, and
+    # so a later build can show exactly which package versions shipped.
+    local lock_sha packages_sha
+    lock_sha="$(shasum -a 256 "$PACKAGES_LOCK" | cut -d' ' -f1)"
+    packages_sha="$(shasum -a 256 "$PACKAGES_FILE" | cut -d' ' -f1)"
     python3 - "$ARTIFACTS/rootfs-manifest.json" << PYEOF
 import json, sys
+lock = [l.strip() for l in open("$PACKAGES_LOCK") if l.strip() and not l.startswith("#")]
 manifest = {
     "alpine_version": "$ALPINE_VERSION",
     "alpine_arch": "$ALPINE_ARCH",
@@ -385,6 +504,9 @@ manifest = {
     "alpine_tarball_sha256": "$ALPINE_SHA256",
     "alpine_tarball_bytes": 3851686,
     "ish_commit": "$ISH_COMMIT",
+    "rootfs_packages_sha256": "$packages_sha",
+    "rootfs_packages_lock_sha256": "$lock_sha",
+    "rootfs_packages": lock,
     "rootfs_zip": "alpine-rootfs.zip",
     "rootfs_zip_sha256": "$zip_sha",
     "rootfs_zip_bytes": $zip_bytes,
@@ -425,7 +547,7 @@ clean() {
     log_info "Cleaning..."
     rm -rf "$WORK_DIR/alpine-rootfs"
     rm -rf "$ISH_SRC/build-native"
-    rm -f "$ARTIFACTS/alpine-rootfs.zip" "$ARTIFACTS/rootfs-manifest.json"
+    rm -f "$ARTIFACTS/alpine-rootfs.zip" "$ARTIFACTS/rootfs-manifest.json" "$PACKAGES_LOCK"
     log_success "Clean completed (Alpine tarball cache kept in $CACHE_DIR)"
 }
 
@@ -451,22 +573,28 @@ main() {
     build_fakefsify
     create_fakefs
     configure_rootfs
+    install_rootfs_packages
+    index_missing_rootfs_files
     create_zip_archive
     print_summary
 }
 
-# Skip guard: same Alpine input + same iSH commit + zip present = skip.
-# Compares the staged manifest against this script's pinned constants.
+# Skip guard: same Alpine input + same iSH commit + same package list + zip
+# present = skip. Compares the staged manifest against this script's pinned
+# constants and the package list hash.
 already_staged() {
     local manifest="$ARTIFACTS/rootfs-manifest.json"
     local zip="$ARTIFACTS/alpine-rootfs.zip"
     [ "$FORCE" -eq 0 ] || return 1
     [ -f "$manifest" ] && [ -f "$zip" ] || return 1
-    python3 - "$manifest" "$ALPINE_SHA256" "$ISH_COMMIT" << 'PYEOF'
+    local packages_sha
+    packages_sha="$(shasum -a 256 "$PACKAGES_FILE" | cut -d' ' -f1)"
+    python3 - "$manifest" "$ALPINE_SHA256" "$ISH_COMMIT" "$packages_sha" << 'PYEOF'
 import json, sys
 m = json.load(open(sys.argv[1]))
 ok = (m.get("alpine_tarball_sha256") == sys.argv[2]
-      and m.get("ish_commit") == sys.argv[3])
+      and m.get("ish_commit") == sys.argv[3]
+      and m.get("rootfs_packages_sha256") == sys.argv[4])
 sys.exit(0 if ok else 1)
 PYEOF
 }
@@ -497,3 +625,4 @@ case "${1:-}" in
         log_error "Unknown argument: $1 (expected: --force, clean, --help)"
         ;;
 esac
+
