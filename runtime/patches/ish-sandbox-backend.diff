@@ -104,3 +104,23 @@
  		detached: platform !== "win32",
  		windowsHide: platform === "win32"
  	});
+--- a/node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js
+@@ -65,11 +65,10 @@
+ 	async execute(spec) {
+ 		const policy = spec.sandboxPolicy;
+ 		const { mode } = policy;
+-		if (mode === "danger-full-access") return SandboxBashExecutor.decorateResult(await super.execute(spec), (result) => ({
+-			...result,
+-			sandbox: {
+-				mode,
+-				denied: false
+-			}
+-		}));
++		// iSH Linux sandbox (Stage 5.3, dsh-go): on iOS there is no host
++		// process to spawn (fork()/exec() is forbidden), so even
++		// danger-full-access must go through confine(): the /ish-runner
++		// sentinel routes the command to the iSH guest via the bridge.
++		// The old early return ran super.execute() unconfined, which
++		// always fails on iOS with spawn EPERM (device test, build 52).
+ 		let confined;
