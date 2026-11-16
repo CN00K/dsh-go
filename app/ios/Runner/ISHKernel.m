@@ -26,6 +26,7 @@
 #import "ISHCrashHandler.h"
 #import "ISHFakefsMeta.h"
 #import "ISHResourceGovernor.h"
+#import "ISHShellExecutor.h" // killProcessGroup (stage 5.3 session close)
 
 #include "ish/kernel/init.h"
 #include "ish/kernel/task.h"
@@ -52,6 +53,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/syslimits.h>
+#include <sys/resource.h>  // setrlimit (ENV-05 host fd cap)
 #include <execinfo.h>
 #include <resolv.h>
 #include <netdb.h>
@@ -60,6 +62,8 @@
 
 NSNotificationName const ISHGuestExitedNotification =
     @"ISHGuestExitedNotification";
+
+const NSInteger ISHPtyMaxSessions = 8;
 
 int ISHDecodeWaitStatus(int status) {
     if (status < 0) return status; // executor sentinel, pass through
@@ -75,12 +79,202 @@ static ISHKernel *g_sharedKernel = nil;
 // handle_process_exit, L1085–1100: exit_hook never blocks on a lock).
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_guestExits = nil;
 
-// Captured PTY/console output since the last drain.
+// Captured PTY/console output since the last drain (CONSOLE tty only
+// now — see below).
 static NSMutableData *g_ptyOutput = nil;
 static NSLock *g_ptyOutputLock = nil;
 // YES while a batched outputCallback drain is already queued on the
 // main queue. Guarded by g_ptyOutputLock. See ish_proto_tty_write.
 static BOOL g_outputDispatchPending = NO;
+
+// --- Per-session PTY routing (stage 5.3, multi-terminal) ------------------
+//
+// WHY: the old code had ONE shared buffer + ONE outputCallback for
+// every guest PTY write, so a second terminal could only be refused
+// (close 1008). iSH itself already gives every shell its own tty:
+// pty_open_fake() reserves a fresh pty number (pty_reserve_next,
+// fs/pty.c) and allocates a distinct `struct tty` (own input buffer,
+// termios, winsize), and the driver's .write op receives that tty
+// pointer — so routing by tty pointer is sound. Each session owns one
+// record (buffer + handler + tty pointer); writes are fanned out to
+// the owning session AND to the legacy outputCallback (log ring).
+//
+// LOCKING (read before touching — two lock orders, never mixed):
+// - Registry lock (_ptySessionsLock): guards the session dictionary
+//   only. Taken briefly for lookup/insert/remove. NEVER held while
+//   calling into tty functions.
+// - Record lock (per-record NSLock): guards that record's tty pointer,
+//   closed flag, buffer and pending flag. Taken for append/drain and
+//   for the ttyForInput snapshot. NEVER held while calling into tty
+//   functions either: sendInput snapshots the tty pointer under the
+//   record lock, releases it, and only then calls tty_input().
+// - ish_proto_tty_write takes the registry lock (lookup + retain),
+//   releases it, then takes the record lock (append). Order is always
+//   registry -> record, never the reverse, and neither nests with the
+//   guest tty->lock (tty_input takes tty->lock only after all our
+//   locks are released).
+// - ish_proto_tty_cleanup runs under the guest tty->lock (tty_release
+//   holds it), so it takes NO lock at all: it only does an atomic
+//   store into g_ptyDead[]. Taking any NSLock there would invert the
+//   order against sendInput (record lock -> tty->lock) and deadlock.
+//
+// TTY LIFETIME (residual race, same shape as the shipped single-
+// terminal code — narrowed, not eliminated): the kernel frees a tty
+// in tty_release() when its last fd closes (guest exit). A sendInput
+// that snapshots the pointer a moment before the free can still touch
+// freed memory. The closed flag (set synchronously by
+// closePtySession:) + the pid-exit check in sendInput:sessionId: /
+// setTerminalSize:rows:sessionId: close the window for every
+// programmatic close; the dead flag below closes it for the
+// cleanup ran. A host-side refcount on the tty would be needed to
+// close it fully (deferred — see VERIFY.md).
+//
+// g_ptyDead[ptyNum]: set by ish_proto_tty_cleanup when a tty is
+// freed, cleared when a session claims that number. Indexed by
+// tty->num (0..MAX_PTYS-1, 4096 in fs/pty.c). A number can be reused
+// after its tty is freed, but reuse only happens after the old
+// session is closed (its sendInput is already gated off by `closed`),
+// so a stale `true` can never misroute a live session. The console
+// tty (PID 1 stdio, nums 0..7 in its own driver table) never consults
+// this array — only session sendInput/resize do, after a registry
+// lookup has already matched the record.
+static _Atomic bool g_ptyDead[4096];
+
+/// One live PTY session: an interactive terminal shell or a tty exec.
+/// Owned by the ISHKernel session registry (strong); the tty pointer
+/// is NOT owned — the iSH kernel frees it on guest exit (see above).
+@interface ISHPtySessionRecord : NSObject
+@property (nonatomic, readonly) NSString *sessionId;
+@property (nonatomic) int guestPid;
+- (instancetype)initWithSessionId:(NSString *)sessionId;
+/// The guest tty (struct tty *), or NULL before the spawn block
+/// assigns it / after the session is closed. Guarded by _lock.
+- (struct tty *)ttySnapshot;
+- (void)setTty:(struct tty *)tty num:(int)num;
+/// The tty number captured with the pointer (for g_ptyDead), or -1.
+@property (nonatomic, readonly) int ttyNum;
+/// YES once closePtySession: ran. Further input/resize is dropped.
+@property (nonatomic, readonly) BOOL closed;
+- (void)markClosed;
+/// True when the session is open AND its tty is (as far as we know)
+/// still alive. Callers snapshot the tty with this check, release
+/// the lock, and only then call tty_input()/tty_set_winsize().
+- (nullable struct tty *)ttyForInput;
+/// Append guest output; returns YES when a batched dispatch should be
+/// scheduled (a sink exists — session handler or legacy outputCallback
+/// — and no dispatch is already pending).
+- (BOOL)appendOutput:(NSData *)data;
+/// Drain for a scheduled dispatch: clears the pending flag BEFORE
+/// draining (same ordering as the legacy global path — a write that
+/// lands after the clear but before the drain schedules a second
+/// dispatch, so no data is lost).
+- (NSData *)drainForDispatch;
+/// Drain for a synchronous consumer (drainOutputForSession: / the
+/// executor's final tail-drain). Does not touch the pending flag; a
+/// pending dispatch block later drains empty.
+- (NSData *)drain;
+/// The per-session output handler (atomic copy property; nil = none).
+@property (atomic, copy, nullable) void (^outputHandler)(NSData *data);
+@end
+
+@implementation ISHPtySessionRecord {
+    NSLock *_lock;
+    struct tty *_tty;
+    int _ttyNum;
+    BOOL _closed;
+    NSMutableData *_buffer;
+    BOOL _dispatchPending;
+}
+
+- (instancetype)initWithSessionId:(NSString *)sessionId {
+    self = [super init];
+    if (self) {
+        _sessionId = [sessionId copy];
+        _guestPid = 0;
+        _lock = [[NSLock alloc] init];
+        _tty = NULL;
+        _ttyNum = -1;
+        _closed = NO;
+        _buffer = [[NSMutableData alloc] init];
+        _dispatchPending = NO;
+    }
+    return self;
+}
+
+- (struct tty *)ttySnapshot {
+    [_lock lock];
+    struct tty *tty = _tty;
+    [_lock unlock];
+    return tty;
+}
+
+- (void)setTty:(struct tty *)tty num:(int)num {
+    [_lock lock];
+    _tty = tty;
+    _ttyNum = num;
+    [_lock unlock];
+}
+
+- (int)ttyNum {
+    [_lock lock];
+    int num = _ttyNum;
+    [_lock unlock];
+    return num;
+}
+
+- (BOOL)closed {
+    [_lock lock];
+    BOOL closed = _closed;
+    [_lock unlock];
+    return closed;
+}
+
+- (void)markClosed {
+    [_lock lock];
+    _closed = YES;
+    [_lock unlock];
+}
+
+- (nullable struct tty *)ttyForInput {
+    [_lock lock];
+    struct tty *tty = NULL;
+    if (!_closed && _tty != NULL && _ttyNum >= 0 && _ttyNum < 4096 &&
+        !atomic_load(&g_ptyDead[_ttyNum])) {
+        tty = _tty;
+    }
+    [_lock unlock];
+    return tty;
+}
+
+- (BOOL)appendOutput:(NSData *)data {
+    [_lock lock];
+    [_buffer appendData:data];
+    BOOL hasSink = (self.outputHandler != nil) ||
+        (g_sharedKernel.outputCallback != nil);
+    BOOL needsDispatch = hasSink && !_dispatchPending;
+    if (needsDispatch) _dispatchPending = YES;
+    [_lock unlock];
+    return needsDispatch;
+}
+
+- (NSData *)drainForDispatch {
+    [_lock lock];
+    _dispatchPending = NO;
+    NSData *batch = [_buffer copy];
+    [_buffer setLength:0];
+    [_lock unlock];
+    return batch;
+}
+
+- (NSData *)drain {
+    [_lock lock];
+    NSData *out = [_buffer copy];
+    [_buffer setLength:0];
+    [_lock unlock];
+    return out;
+}
+
+@end
 
 // Path-translate hooks (design §2.4(b)). Stored blocks, called from C
 // trampolines installed with fakefs_set_path_translate_hook /
@@ -124,22 +318,66 @@ static bool ish_reverse_translate_trampoline(const char *host_path,
     return true;
 }
 
-// --- TTY driver: guest output -> host buffer + callback -------------------
+// Forward declarations for the session registry (defined on
+// ISHKernel below; the C TTY callbacks above the @implementation need
+// them). ptySessionRecordForTty: returns a retained record (or nil);
+// drainConsoleOutput drains the legacy console/global buffer.
+@interface ISHKernel (PtySessions)
+- (nullable ISHPtySessionRecord *)ptySessionRecordForTty:(struct tty *)tty;
+- (NSData *)drainConsoleOutput;
+@end
+
+// --- TTY driver: guest output -> per-session buffer + callback --------
 // Same shape as OpenMinis ish_console_ops / ish_console_driver (L1055–1096).
+// MULTI-SESSION (stage 5.3): the `tty` parameter is the routing key —
+// it is NOT ignored any more. pty_open_fake() gives every session a
+// distinct `struct tty`, so a write is appended to exactly that
+// session's buffer and dispatched to exactly that session's handler.
+// A tty with no session (the console tty PID 1 writes to, or a tty
+// whose session was already closed) falls back to the legacy global
+// buffer + outputCallback, so PID 1 output and the log ring keep
+// working exactly as before.
 // OUTPUT BATCHING (design §1.6): the guest can write thousands of tiny
 // chunks per millisecond. The callback is invoked on the main queue at
 // most once per burst: a pending flag coalesces the writes, and the
-// dispatched block drains the whole buffer in one go. When no
-// outputCallback is set, nothing is dispatched and the data simply
-// accumulates for drainOutput (polling consumers). outputCallback and
-// drainOutput are two views of the same buffer — use ONE at a time; on
-// attach, a callback consumer should drainOutput once to catch data
-// buffered before the callback was set.
+// dispatched block drains the whole buffer in one go. A session's
+// batch is ALSO fanned out to the legacy outputCallback (same batch,
+// same call) so the dsh/ish log ring keeps seeing every terminal's
+// output. When no sink is set, nothing is dispatched and the data
+// simply accumulates for drainOutputForSession: (polling consumers).
+// A byte is delivered exactly once: the handler batch and the drain
+// are two views of the same buffer — whoever drains first takes it.
 static int ish_proto_tty_write(struct tty *tty, const void *buf, size_t len,
                                bool blocking) {
-    (void)tty; (void)blocking;
+    (void)blocking;
     if (len == 0) return 0;
     NSData *data = [NSData dataWithBytes:buf length:len];
+    ISHPtySessionRecord *record =
+        [g_sharedKernel ptySessionRecordForTty:tty];
+    if (record) {
+        if (![record appendOutput:data]) return (int)len;
+        // STRONG capture (not weak): the block is one-shot and the
+        // record does not own it, so there is no cycle — but a weak
+        // capture would let closePtySession: deallocate the record
+        // before this block runs, silently dropping the buffered
+        // batch (e.g. a shell's last lines before `exit`).
+        ISHPtySessionRecord *strongRecord = record;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Clear the flag BEFORE draining: a write that lands after
+            // the clear but before the drain schedules a second dispatch
+            // (which drains empty — harmless), so no data is ever lost.
+            NSData *batch = [strongRecord drainForDispatch];
+            if (batch.length == 0) return;
+            void (^handler)(NSData *) = strongRecord.outputHandler;
+            if (handler) handler(batch);
+            // Fan-out to the log ring (legacy outputCallback).
+            if (g_sharedKernel.outputCallback) {
+                g_sharedKernel.outputCallback(batch);
+            }
+        });
+        return (int)len;
+    }
+    // Unregistered tty (console / stale): legacy global buffer.
     [g_ptyOutputLock lock];
     [g_ptyOutput appendData:data];
     BOOL hasCallback = (g_sharedKernel.outputCallback != nil);
@@ -154,7 +392,7 @@ static int ish_proto_tty_write(struct tty *tty, const void *buf, size_t len,
             [g_ptyOutputLock lock];
             g_outputDispatchPending = NO;
             [g_ptyOutputLock unlock];
-            NSData *batch = [g_sharedKernel drainOutput];
+            NSData *batch = [g_sharedKernel drainConsoleOutput];
             if (batch.length > 0 && g_sharedKernel.outputCallback) {
                 g_sharedKernel.outputCallback(batch);
             }
@@ -163,7 +401,13 @@ static int ish_proto_tty_write(struct tty *tty, const void *buf, size_t len,
     return (int)len;
 }
 static int ish_proto_tty_init(struct tty *tty) { (void)tty; return 0; }
-static void ish_proto_tty_cleanup(struct tty *tty) { (void)tty; }
+// Runs under the guest tty->lock (tty_release holds it): take NO lock
+// here — only an atomic store. See the locking note above the record.
+static void ish_proto_tty_cleanup(struct tty *tty) {
+    if (tty && tty->num >= 0 && tty->num < 4096) {
+        atomic_store(&g_ptyDead[tty->num], true);
+    }
+}
 
 static struct tty_driver_ops ish_proto_console_ops = {
     .init = ish_proto_tty_init,
@@ -205,12 +449,17 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 
 @implementation ISHKernel {
     BOOL _isBooted;
-    struct tty *_consoleTTY;
     NSString *_rootPath;
     NSString *_dataPath;
     dispatch_semaphore_t _bootSemaphore;
     int _bootResult;
     dispatch_queue_t _inputQueue; // serial queue for sendInput (tty_input blocks)
+    // PTY session registry (stage 5.3): sessionId -> record. Guarded by
+    // _ptySessionsLock; see the locking note above ISHPtySessionRecord.
+    // _consoleTTY is gone: there is no single shared tty any more.
+    NSMutableDictionary<NSString *, ISHPtySessionRecord *> *_ptySessions;
+    NSLock *_ptySessionsLock;
+    NSString *_defaultSessionId; // most recent legacy executeCommand:pid:
 }
 
 + (ISHKernel *)shared {
@@ -238,18 +487,138 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
     if (self) {
         _inputQueue = dispatch_queue_create("me.zzuu.dsh.ish.input",
                                             DISPATCH_QUEUE_SERIAL);
+        _ptySessions = [[NSMutableDictionary alloc] init];
+        _ptySessionsLock = [[NSLock alloc] init];
     }
     return self;
 }
 
 - (BOOL)isBooted { return _isBooted; }
 
-- (NSData *)drainOutput {
+- (NSString *)defaultPtySessionId {
+    [_ptySessionsLock lock];
+    NSString *sessionId = _defaultSessionId;
+    [_ptySessionsLock unlock];
+    return sessionId;
+}
+
+/// Drain the legacy console/global buffer (unregistered-tty output
+/// only). Used by the TTY driver's fallback path.
+- (NSData *)drainConsoleOutput {
     [g_ptyOutputLock lock];
     NSData *out = [g_ptyOutput copy];
     [g_ptyOutput setLength:0];
     [g_ptyOutputLock unlock];
     return out;
+}
+
+- (NSData *)drainOutput {
+    // LEGACY: default session first, then the console buffer.
+    NSMutableData *out = [[NSMutableData alloc] init];
+    NSString *defaultId = self.defaultPtySessionId;
+    if (defaultId) [out appendData:[self drainOutputForSession:defaultId]];
+    [out appendData:[self drainConsoleOutput]];
+    return [out copy];
+}
+
+// --- PTY session registry (stage 5.3) --------------------------------------
+
+/// Retained record for a tty pointer (linear scan; <= ISHPtyMaxSessions
+/// live sessions). Called from ish_proto_tty_write on guest threads:
+/// takes only the registry lock, retains under it, releases it — the
+/// caller then uses the record without holding the lock, so no guest
+/// lock is ever nested under ours.
+- (nullable ISHPtySessionRecord *)ptySessionRecordForTty:(struct tty *)tty {
+    if (!tty) return nil;
+    [_ptySessionsLock lock];
+    ISHPtySessionRecord *found = nil;
+    for (ISHPtySessionRecord *record in _ptySessions.allValues) {
+        if ([record ttySnapshot] == tty) { found = record; break; }
+    }
+    [_ptySessionsLock unlock];
+    return found;
+}
+
+/// Retained record for a session id (or nil). Same locking as above.
+- (nullable ISHPtySessionRecord *)ptySessionRecordForId:(NSString *)sessionId {
+    if (!sessionId) return nil;
+    [_ptySessionsLock lock];
+    ISHPtySessionRecord *record = _ptySessions[sessionId];
+    [_ptySessionsLock unlock];
+    return record;
+}
+
+- (void)setPtyOutputHandler:(nullable void (^)(NSData *data))handler
+                 forSession:(NSString *)sessionId {
+    ISHPtySessionRecord *record = [self ptySessionRecordForId:sessionId];
+    if (!record) return;
+    record.outputHandler = handler;
+}
+
+- (NSData *)drainOutputForSession:(NSString *)sessionId {
+    ISHPtySessionRecord *record = [self ptySessionRecordForId:sessionId];
+    if (!record) return [NSData data];
+    return [record drain];
+}
+
+- (NSUInteger)ptySessionCount {
+    [_ptySessionsLock lock];
+    NSUInteger count = _ptySessions.count;
+    [_ptySessionsLock unlock];
+    return count;
+}
+
+/// Remove a session record WITHOUT killing anything: for spawn
+/// failures inside executeCommand:sessionId:... (pty/create_stdio/
+/// do_execve failed — no guest is running, so there is nothing to
+/// kill). Only removes when the registry still maps the id to this
+/// exact record. The tty itself is left to the kernel (same leak
+/// profile as the old code on these paths: one orphaned tty struct
+/// per failed spawn, no task behind it).
+- (void)discardPtySessionRecord:(ISHPtySessionRecord *)record {
+    if (!record) return;
+    [_ptySessionsLock lock];
+    if (_ptySessions[record.sessionId] == record) {
+        [_ptySessions removeObjectForKey:record.sessionId];
+    }
+    [_ptySessionsLock unlock];
+    [record markClosed];
+    record.outputHandler = nil;
+}
+
+- (void)closePtySession:(NSString *)sessionId {
+    if (!sessionId) return;
+    ISHPtySessionRecord *record = nil;
+    [_ptySessionsLock lock];
+    record = _ptySessions[sessionId];
+    if (record) {
+        [_ptySessions removeObjectForKey:sessionId];
+        if ([_defaultSessionId isEqualToString:sessionId]) {
+            _defaultSessionId = nil;
+        }
+    }
+    [_ptySessionsLock unlock];
+    if (!record) return; // unknown id: idempotent no-op
+    // Mark closed FIRST (drops further input/resize at the gate),
+    // then kill the group. Never dereference record.tty here: the
+    // guest may already have exited and the kernel may have freed it
+    // (tty_release); the kill is by pid, which is always safe.
+    [record markClosed];
+    record.outputHandler = nil;
+    if (record.guestPid > 0) {
+        [[ISHShellExecutor shared] killProcessGroup:record.guestPid];
+    }
+    NSLog(@"ISHKernel: pty session %@ closed (guest pid %d)",
+          sessionId, record.guestPid);
+}
+
+- (void)closeAllPtySessions {
+    [_ptySessionsLock lock];
+    NSArray<NSString *> *ids = [_ptySessions.allKeys copy];
+    [_ptySessionsLock unlock];
+    for (NSString *sessionId in ids) {
+        [self closePtySession:sessionId];
+    }
 }
 
 - (nullable NSNumber *)exitCodeForGuestPid:(int)pid {
@@ -402,6 +771,21 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
               @"bind-mount cycle guard disabled", errno);
     }
 
+    // Step 1.5 (ENV-05): raise the HOST process's RLIMIT_NOFILE before
+    // the guest boots. The kernel's init_rlimits sets the guest soft
+    // limit to 4096 (hard 8192), but the host limit is the outer bound:
+    // if the host is capped lower, the guest cannot exceed it and `ulimit
+    // -n` would still show the host value. 8192/8192 matches the guest
+    // hard limit; failure only logs (the guest still boots with the
+    // kernel's own limits, and fd exhaustion then fails gracefully).
+    {
+        struct rlimit rl = { .rlim_cur = 8192, .rlim_max = 8192 };
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            NSLog(@"ISHKernel: setrlimit(RLIMIT_NOFILE, 8192) failed: %d "
+                  @"(guest keeps kernel init_rlimits)", errno);
+        }
+    }
+
     // Step 2: become PID 1. From here on, `current` is the init task and
     // this thread is its host thread. Nothing after this point may exec a
     // shell on this thread or return from the supervisor (see below).
@@ -549,6 +933,25 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 
 - (int)executeCommand:(NSArray<NSString *> *)command
                   pid:(int *)outPid {
+    // LEGACY: one fresh session, remembered as the default for the
+    // legacy sendInput: / setTerminalSize:rows: / drainOutput shims.
+    NSString *sessionId = [[NSUUID UUID] UUIDString];
+    int rc = [self executeCommand:command pid:outPid sessionId:sessionId
+                        fsContext:0 cols:0 rows:0];
+    if (rc == 0) {
+        [_ptySessionsLock lock];
+        _defaultSessionId = sessionId;
+        [_ptySessionsLock unlock];
+    }
+    return rc;
+}
+
+- (int)executeCommand:(NSArray<NSString *> *)command
+                  pid:(int *)outPid
+            sessionId:(NSString *)sessionId
+            fsContext:(uint64_t)fsContext
+                 cols:(int)cols
+                 rows:(int)rows {
     if (!_isBooted) {
         NSLog(@"ISHKernel: kernel not booted");
         return -1;
@@ -556,9 +959,30 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
     // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
     // See resetRootfsWhileBooted.)
     if (command.count == 0) return -2;
+    if (!sessionId || sessionId.length == 0) return -2;
+    // Session cap (stage 5.3): refuse before spawning anything, so a
+    // refused open never leaks a shell or a tty.
+    ISHPtySessionRecord *record =
+        [[ISHPtySessionRecord alloc] initWithSessionId:sessionId];
+    [_ptySessionsLock lock];
+    BOOL duplicate = (_ptySessions[sessionId] != nil);
+    BOOL atCap = (_ptySessions.count >= (NSUInteger)ISHPtyMaxSessions);
+    if (!duplicate && !atCap) _ptySessions[sessionId] = record;
+    [_ptySessionsLock unlock];
+    if (duplicate) {
+        NSLog(@"ISHKernel: duplicate pty session id %@", sessionId);
+        return -4;
+    }
+    if (atCap) {
+        NSLog(@"ISHKernel: pty session cap reached (%ld)",
+              (long)ISHPtyMaxSessions);
+        return -5;
+    }
     NSArray<NSString *> *commandCopy = [command copy];
     NSDictionary<NSString *, NSString *> *customEnv = self.customEnvironment;
-    [self drainOutput]; // fresh capture for this run
+    // NOTE: no [self drainOutput] here any more (the old "fresh
+    // capture"): draining would steal OTHER sessions' buffered output.
+    // A new session starts with an empty buffer by construction.
     __block int guestPid = -1;
     __block int startResult = -4; // 0 only after do_execve succeeded
     dispatch_semaphore_t started = dispatch_semaphore_create(0);
@@ -572,18 +996,35 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
             return;
         }
         guestPid = current->pid;
+        // fs_context for the path-translate hook (inherited verbatim
+        // on fork; same line as ISHShellExecutor's pipe path). The
+        // interactive path passes 0; the tty executor passes the
+        // agent run's context.
+        current->group->fs_context = fsContext;
         struct tty *tty = pty_open_fake(&ish_proto_pty_driver);
         if (tty == NULL || IS_ERR(tty)) {
             NSLog(@"ISHKernel: pty_open_fake failed: %ld",
                   (long)PTR_ERR(tty));
+            [self discardPtySessionRecord:record];
             dispatch_semaphore_signal(started);
             return;
         }
-        self->_consoleTTY = tty;
-        // OpenMinis default: 24 rows x 200 cols. The UI corrects this
-        // to the real size on first layout via setTerminalSize:rows:.
+        // Register the tty on the record (routing key for
+        // ish_proto_tty_write) and clear its death flag: the number
+        // may have been used by an earlier, already-freed session.
+        record.guestPid = guestPid;
+        [record setTty:tty num:tty->num];
+        if (tty->num >= 0 && tty->num < 4096) {
+            atomic_store(&g_ptyDead[tty->num], false);
+        }
+        // OpenMinis default: 24 rows x 200 cols (when the caller
+        // passes no size). The UI corrects this to the real size on
+        // first layout via setTerminalSize:rows:. A tty exec passes
+        // its size up front so `stty size` is right from the start.
         struct winsize_ winsize = {
-            .row = 24, .col = 200, .xpixel = 0, .ypixel = 0 };
+            .row = (word_t)(rows > 0 ? rows : 24),
+            .col = (word_t)(cols > 0 ? cols : 200),
+            .xpixel = 0, .ypixel = 0 };
         tty_set_winsize(tty, winsize);
         NSString *stdioFile = [NSString stringWithFormat:@"/dev/pts/%d",
                                tty->num];
@@ -591,6 +1032,7 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
                            TTY_PSEUDO_SLAVE_MAJOR, tty->num);
         if (err < 0) {
             NSLog(@"ISHKernel: create_stdio failed: %d", err);
+            [self discardPtySessionRecord:record];
             dispatch_semaphore_signal(started);
             return;
         }
@@ -638,6 +1080,7 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         err = do_execve(exec_path, exec_argc, argv, envp_buf);
         if (err < 0) {
             NSLog(@"ISHKernel: do_execve failed: %d", err);
+            [self discardPtySessionRecord:record];
             dispatch_semaphore_signal(started);
             // [FIX 1.4a-rev] The child task was created by become_new_init_child
             // but exec failed, so it never ran task_start and never exited.
@@ -669,7 +1112,8 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
             unlock(&pids_lock);
             return;
         }
-        NSLog(@"ISHKernel: started guest process PID %d", current->pid);
+        NSLog(@"ISHKernel: started guest process PID %d (pty session %@)",
+              current->pid, sessionId);
         startResult = 0;
         dispatch_semaphore_signal(started);
         // Runs the emulator loop on a REAL pthread spawned by task_start
@@ -714,6 +1158,13 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 }
 
 - (void)stopGuest {
+    // (Stage 5.3) Close the PTY sessions first: a guest stop kills
+    // every shell anyway, and leaving their records behind would leak
+    // registry slots (and let a stale record's handler fire). The
+    // Swift PTY sessions observe the shell-exit notification and close
+    // their WebSockets as usual; their closePtySession: calls then
+    // hit unknown ids and no-op.
+    [self closeAllPtySessions];
     // Kill every guest task with pid >= 2. NEVER pid 1: an ancestry sweep
     // rooted at init would match every task and tear the kernel down,
     // and pid 1's death calls halt_system() == _exit(0) (kernel/exit.c),
@@ -792,34 +1243,69 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
 
 // --- Input / resize ----------------------------------------------------------
 
-- (void)sendInput:(NSData *)data {
+- (void)sendInput:(NSData *)data sessionId:(NSString *)sessionId {
     if (!data || data.length == 0) return;
+    ISHPtySessionRecord *record = [self ptySessionRecordForId:sessionId];
+    if (!record) return;
     // tty_input() takes a pthread mutex and blocks while the kernel is
     // busy — never call it on the main thread or on a caller thread
     // that must stay responsive. A dedicated serial queue preserves
-    // input order (design §1.6).
+    // input order (design §1.6). The tty pointer is snapshotted under
+    // the record lock and used only after the lock is released (see
+    // the locking note above ISHPtySessionRecord); a closed session
+    // or a dead tty drops the input.
     dispatch_async(_inputQueue, ^{
-        struct tty *tty = self->_consoleTTY;
+        // Re-check liveness at write time, not at enqueue time: the
+        // session may have closed while this block waited in the
+        // queue (e.g. the user closed the tab). Also refuse input
+        // once the guest pid has exited — its tty may already be
+        // freed (tty_release), and tty_input would touch freed memory.
+        if (record.closed) return;
+        if (record.guestPid > 0 &&
+            [self exitCodeForGuestPid:record.guestPid] != nil) return;
+        struct tty *tty = [record ttyForInput];
         if (!tty) return;
         tty_input(tty, data.bytes, data.length, false);
     });
 }
 
-- (void)sendInputString:(NSString *)string {
+- (void)sendInputString:(NSString *)string sessionId:(NSString *)sessionId {
     if (!string) return;
     NSData *data = [string dataUsingEncoding:NSUTF8StringEncoding];
-    [self sendInput:data];
+    [self sendInput:data sessionId:sessionId];
 }
 
-- (void)setTerminalSize:(int)cols rows:(int)rows {
+- (void)setTerminalSize:(int)cols rows:(int)rows sessionId:(NSString *)sessionId {
     if (cols <= 0 || rows <= 0) return;
-    struct tty *tty = _consoleTTY;
+    ISHPtySessionRecord *record = [self ptySessionRecordForId:sessionId];
+    if (!record || record.closed) return;
+    if (record.guestPid > 0 &&
+        [self exitCodeForGuestPid:record.guestPid] != nil) return;
+    struct tty *tty = [record ttyForInput];
     if (!tty) return;
     struct winsize_ winsize = {
         .row = (word_t)rows, .col = (word_t)cols, .xpixel = 0, .ypixel = 0 };
     tty_set_winsize(tty, winsize);
     // The kernel sends SIGWINCH to the foreground process group on a
     // winsize change (standard semantics).
+}
+
+- (void)sendInput:(NSData *)data {
+    NSString *defaultId = self.defaultPtySessionId;
+    if (!defaultId) return;
+    [self sendInput:data sessionId:defaultId];
+}
+
+- (void)sendInputString:(NSString *)string {
+    NSString *defaultId = self.defaultPtySessionId;
+    if (!defaultId) return;
+    [self sendInputString:string sessionId:defaultId];
+}
+
+- (void)setTerminalSize:(int)cols rows:(int)rows {
+    NSString *defaultId = self.defaultPtySessionId;
+    if (!defaultId) return;
+    [self setTerminalSize:cols rows:rows sessionId:defaultId];
 }
 
 // --- Mounts / path translation -----------------------------------------------

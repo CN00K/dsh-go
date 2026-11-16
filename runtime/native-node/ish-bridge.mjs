@@ -33,6 +33,30 @@
  *   between the host workspace (<root>/home/workspace) and the guest
  *   workspace (/home/workspace), plus <root>/tmp <-> /tmp.
  *
+ * Env / cwd contract for the exec path (ENV-12/13/14, 2026-11-17):
+ * - The guest shell for /ish/exec is /bin/bash (GUEST_EXEC_SHELL,
+ *   enforced in ISHShellExecutor.executeCommand), not /bin/sh.
+ * - TERM is forwarded only when the exec runs with a pty
+ *   (guestEnv opts.hasPty, set from spawn options.pty — see the
+ *   interface note on spawnIshExec). A piped exec has no TERM at all:
+ *   the old code defaulted it to xterm-256color and forwarded the
+ *   engine's TERM=dumb, both of which lie about the terminal.
+ * - PYTHONDONTWRITEBYTECODE=0 is set so .pyc files are written (the
+ *   kernel used to force =1, which made every pip import recompile
+ *   from source; see the kernel patch for the matching removal).
+ *   GOMAXPROCS / UV_THREADPOOL_SIZE are NOT set here: the kernel
+ *   patch deletes their hardcoded values so Go/libuv use their own
+ *   per-CPU defaults. PIP_PROGRESS_BAR=off is kept by the kernel
+ *   injection (deliberate: keeps tool output clean).
+ * - Session cwd (ENV-14): each exec is a fresh shell, so a bare `cd`
+ *   inside one exec is invisible to the engine — the engine's workdir
+ *   (options.cwd) is the only cwd the bridge is given, and it only
+ *   changes when the model uses the working-directory cd tool. The
+ *   bridge therefore remembers the guest's final cwd per session from
+ *   a nonce-tagged marker line the Swift wrapper prints on stderr
+ *   (see resolveExecCwd / ishExec opts.cwdNonce), and reuses it while
+ *   the engine cwd is unchanged. See the REPORT for the full contract.
+ *
  * What this file does NOT do:
  * - It does not change the sandbox policy. The guest only sees the
  *   bind-mounted workspace (and /tmp); the DSH token never enters the
@@ -81,8 +105,19 @@ export const DSH_DIRECT_SYMBOL = Symbol.for('dsh.go.direct');
 export const GUEST_WORKSPACE = '/home/workspace';
 /** Guest temp dir (bind-mounted to the host tmp dir). */
 export const GUEST_TMP = '/tmp';
-/** Guest shell the loopback service spawns for /ish/pty (hardcoded Swift-side). */
+/**
+ * Guest shell the loopback service spawns for /ish/pty (hardcoded
+ * Swift-side in ISHKernel.executeCommand). PTY ONLY — it does not govern
+ * the agent exec path. The exec shell is /bin/bash, enforced Swift-side
+ * in ISHShellExecutor.executeCommand (ENV-01: the guest ships bash
+ * 5.2.37; /bin/sh is BusyBox ash, whose missing bash syntax broke
+ * commands that the bash tool advertises as "bash -c"). Do not change
+ * this constant for ENV-01; the PTY shell is the multi-terminal owner's
+ * scope.
+ */
 export const GUEST_SHELL = '/bin/sh';
+/** Guest shell for the agent exec path (/ish/exec). See GUEST_SHELL. */
+export const GUEST_EXEC_SHELL = '/bin/bash';
 
 /**
  * A pid no run in the app owns (same idea as pnpm-ios.mjs, different base
@@ -302,8 +337,24 @@ export function invalidateServiceInfo() {
  * @param opts.env env vars to export in the guest (already sanitised) or undefined.
  * @param opts.stdinData Buffer of stdin bytes or undefined.
  * @param opts.timeoutMs exec timeout (server clamps 1s-15min).
+ * @param opts.tty when true, run on a fresh fake PTY (merged stream,
+ *   TERM=xterm-256color) instead of host pipes; the terminal frame
+ *   echoes {tty: true} so the caller can confirm the exec had a pty.
+ *   Default false (pipe path, unchanged). This is the "has pty"
+ *   flag of the ENV-02 contract: the bridge sets it, the server
+ *   (IShLoopbackService /ish/exec) honors it, and the frame reports
+ *   it back. The bridge does NOT decide TERM here — the env/executor
+ *   workstream owns the "set TERM only when tty" rule in guestEnv;
+ *   this flag is the input it keys on.
  * @param opts.serviceFile override for tests.
  * @param opts.onLine({stream, line}) called per NDJSON output line.
+ * @param opts.cwdNonce per-exec nonce (hex) for the session-cwd marker:
+ *   the Swift wrapper appends `__DSH_CWD__<nonce>:<cwd>` on stderr
+ *   after the command; lines matching exactly this nonce are swallowed
+ *   here (never delivered to onLine) and reported via onSessionCwd.
+ *   A line with any other nonce-shaped text is ordinary output.
+ * @param opts.onSessionCwd(cwd) called with the guest's final cwd
+ *   (guest absolute path) when a valid marker line arrives.
  * @param opts.signal AbortSignal; aborting closes the connection, which
  *   makes the Swift side cancel the exec and kill the guest process group.
  * @returns {exitCode, durationMs, timedOut?, cancelled?} from the final frame.
@@ -315,8 +366,24 @@ export async function ishExec(opts) {
     ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
     ...(opts.stdinData && opts.stdinData.length > 0
       ? {stdinData: Buffer.from(opts.stdinData).toString('base64')} : {}),
+    ...(opts.cwdNonce ? {cwdNonce: opts.cwdNonce} : {}),
+    ...(opts.tty ? {tty: true} : {}),
     timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
   });
+  // Session-cwd marker filter (ENV-14): the Swift wrapper prints one
+  // `__DSH_CWD__<nonce>:<cwd>` line on stderr after the command. It is
+  // protocol, not command output: swallow it and report the cwd via
+  // onSessionCwd. Only the exact nonce for this exec matches, so a
+  // command that prints a look-alike line cannot corrupt the
+  // remembered cwd (a wrong-nonce marker is delivered as normal output).
+  const execOpts = opts.cwdNonce ? {...opts, onLine: (frame) => {
+    const marker = parseCwdMarker(frame, opts.cwdNonce);
+    if (marker !== null) {
+      opts.onSessionCwd?.(marker);
+      return;
+    }
+    opts.onLine?.(frame);
+  }} : opts;
   // Retry once with a fresh read of ish-service.json (same stale-cache
   // fix as the WS path, build 37): postExec invalidates on
   // ECONNREFUSED/ECONNRESET, and a 401 means the token rotated, so a
@@ -328,12 +395,12 @@ export async function ishExec(opts) {
     const service = await getServiceInfo(opts);
     if (!service) throw bridgeUnavailableError(opts);
     try {
-      return await postExec(service, body, opts);
+      return await postExec(service, body, execOpts);
     } catch (error) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
       const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
-        || error?.code === 'ISH_HTTP_ERROR';
+        || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
       if (retryable && attempt === 0) continue;
       throw lastError;
     }
@@ -368,6 +435,7 @@ function postExec(service, body, opts) {
       if (res.statusCode !== 200) {
         const error = new Error(`ish exec failed: HTTP ${res.statusCode}`);
         error.code = 'ISH_HTTP_ERROR';
+        error.statusCode = res.statusCode;
         settleReject(error);
         res.resume();
         return;
@@ -616,9 +684,16 @@ export function ishWebSocket(opts) {
   function handleFrame(fin, opcode, payload) {
     if (opcode === 0x8) { // Close: echo the code, then close.
       let code = 1000;
-      if (payload.length >= 2) code = (payload[0] << 8) | payload[1];
+      let reason = 'server closed';
+      if (payload.length >= 2) {
+        code = (payload[0] << 8) | payload[1];
+        // The server's close reason (e.g. the 1008 cap message) is
+        // UTF-8 after the code; propagate it so the PTY shim can
+        // print it instead of a bare code.
+        if (payload.length > 2) reason = payload.subarray(2).toString('utf8');
+      }
       sendFrame(0x8, payload.subarray(0, 2));
-      closeSocket(code, 'server closed');
+      closeSocket(code, reason);
       return;
     }
     if (opcode === 0x9) { // Ping: reply pong with the same payload.
@@ -681,6 +756,89 @@ export function ishWebSocket(opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Session cwd memory (ENV-14)
+// ---------------------------------------------------------------------------
+
+/**
+ * Marker the Swift wrapper prints on stderr after each command:
+ * `__DSH_CWD__<nonce>:<guest absolute path>`. The nonce is generated
+ * per exec by spawnIshExec and echoed back by the wrapper, so only a
+ * marker from this exec can update the remembered cwd.
+ */
+export const CWD_MARKER_PREFIX = '__DSH_CWD__';
+
+/**
+ * Parse a cwd marker frame. Returns the guest cwd, or null when the
+ * frame is not a marker for this nonce. The cwd must be an absolute
+ * guest path with no control characters; anything else is treated as
+ * ordinary output (a command that prints a look-alike line, or a cwd
+ * with a newline in it, degrades to "no update" instead of corrupting
+ * the remembered cwd).
+ */
+export function parseCwdMarker(frame, nonce) {
+  if (!nonce || frame?.stream !== 'stderr' || typeof frame?.line !== 'string') return null;
+  const prefix = `${CWD_MARKER_PREFIX}${nonce}:`;
+  if (!frame.line.startsWith(prefix)) return null;
+  const cwd = frame.line.slice(prefix.length);
+  if (!cwd.startsWith('/') || /[\0-\x1f\x7f]/.test(cwd)) return null;
+  return cwd;
+}
+
+/**
+ * Per-session exec cwd state, keyed by DSH_SESSION_ID:
+ * - engineCwd: the last guest cwd the engine asked for (options.cwd
+ *   translated). The engine only changes this when the model uses the
+ *   working-directory cd tool, so it is the model-visible source of
+ *   truth — when it changes, it wins over the remembered cwd.
+ * - rememberedCwd: the guest shell's final cwd after the last exec
+ *   (from the marker line), i.e. where a bare `cd` inside bash left it.
+ *   Used while the engine cwd is unchanged.
+ */
+const sessionCwdState = new Map();
+
+/**
+ * Resolve the guest cwd for one exec (ENV-14).
+ * @param sessionId DSH_SESSION_ID, or null when unknown (no memory).
+ * @param engineCwdGuest the engine-requested guest cwd (already
+ *   translated), or null/undefined when the engine gave none.
+ * @returns the guest cwd to send to /ish/exec (or undefined).
+ */
+export function resolveExecCwd(sessionId, engineCwdGuest) {
+  if (!sessionId) return engineCwdGuest ?? undefined;
+  const state = sessionCwdState.get(sessionId);
+  if (!state) {
+    if (engineCwdGuest) sessionCwdState.set(sessionId, {engineCwd: engineCwdGuest, rememberedCwd: null});
+    return engineCwdGuest ?? undefined;
+  }
+  if (engineCwdGuest && state.engineCwd && engineCwdGuest !== state.engineCwd) {
+    // The engine moved the session (working-directory cd tool, or a
+    // new workdir): the engine is the source of truth; forget the
+    // bare-`cd` memory, which belonged to the old directory.
+    // (state.engineCwd null means the memory was recorded before any
+    // engine cwd was seen — e.g. a direct ishExec call — so there is
+    // no "move" to detect and the memory stands.)
+    state.engineCwd = engineCwdGuest;
+    state.rememberedCwd = null;
+    return engineCwdGuest;
+  }
+  if (engineCwdGuest) state.engineCwd = engineCwdGuest;
+  return state.rememberedCwd ?? engineCwdGuest ?? undefined;
+}
+
+/** Record the guest's final cwd for a session (from a marker line). */
+export function noteExecCwd(sessionId, cwd) {
+  if (!sessionId || !cwd) return;
+  const state = sessionCwdState.get(sessionId) ?? {engineCwd: null, rememberedCwd: null};
+  state.rememberedCwd = cwd;
+  sessionCwdState.set(sessionId, state);
+}
+
+/** Drop all remembered session cwds (tests; also bounds the map). */
+export function clearExecCwdState() {
+  sessionCwdState.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Env sanitising (guest must not inherit host paths)
 // ---------------------------------------------------------------------------
 
@@ -698,18 +856,54 @@ export function ishWebSocket(opts) {
  */
 const GUEST_ENV_DSH_ALLOW = new Set(['DSH_SESSION_ID', 'DSH_SHELL', 'DSH_PTY_SESSION_ID']);
 
-export function guestEnv(hostEnv = {}) {
+/**
+ * Build the env to export in the guest. Host filesystem paths (PATH, HOME,
+ * TMPDIR, DSH_HOME, ...) are never forwarded: the guest has its own
+ * layout. Only DSH_* context vars, locale/terminal hints and an explicit
+ * guest PATH/HOME are passed.
+ *
+ * @param hostEnv the spawn's env (engine + caller).
+ * @param opts.hasPty true when this exec runs with a pty (ENV-12): only
+ *   then is TERM forwarded. A piped exec has no tty, so TERM is dropped
+ *   entirely — the old code forwarded the engine's TERM=dumb and
+ *   defaulted to xterm-256color, both of which lie about the terminal
+ *   (and the executor base envp no longer sets TERM for the exec path
+ *   either; the PTY path sets it in ISHKernel.executeCommand).
+ * @param opts.ptyTerm TERM value for a pty exec when the host env has
+ *   none (default 'xterm-256color', matching /etc/profile).
+ *
+ * ENV-13: PYTHONDONTWRITEBYTECODE=0 is always set (unless the caller
+ * explicitly passes a value, which wins) so guest Python writes .pyc
+ * files — the old forced =1 made every pip import recompile from
+ * source (ENV-03). The kernel patch removes the matching injection;
+ * this also neutralises kernels built before that patch, whose
+ * sys_execve injection is mode-0 ("only if absent"). GOMAXPROCS /
+ * UV_THREADPOOL_SIZE are deliberately NOT set here: the kernel patch
+ * deletes their hardcoded values so Go uses runtime.NumCPU and libuv
+ * its default. PIP_PROGRESS_BAR stays off via the kernel injection.
+ */
+export function guestEnv(hostEnv = {}, opts = {}) {
+  const hasPty = opts.hasPty === true;
   const env = {};
   for (const [key, value] of Object.entries(hostEnv ?? {})) {
     if (typeof value !== 'string') continue;
-    if (GUEST_ENV_DSH_ALLOW.has(key) || key === 'TERM' || key === 'LANG' || key.startsWith('LC_') || key === 'TZ') {
+    if (key === 'TERM') {
+      // TERM only means something with a tty; without one it is
+      // dropped (see opts.hasPty). With one, the host value wins.
+      if (hasPty) env[key] = value;
+      continue;
+    }
+    if (GUEST_ENV_DSH_ALLOW.has(key) || key === 'LANG' || key.startsWith('LC_') || key === 'TZ'
+      || key === 'PYTHONDONTWRITEBYTECODE') {
       env[key] = value;
     }
   }
   // Guest layout (matches the rootfs /etc/profile): never the host PATH/HOME.
   env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
   env.HOME = '/root';
-  env.TERM = env.TERM ?? 'xterm-256color';
+  if (hasPty) env.TERM = env.TERM ?? opts.ptyTerm ?? 'xterm-256color';
+  // ENV-13/ENV-03: allow .pyc caching (caller value wins when given).
+  env.PYTHONDONTWRITEBYTECODE = env.PYTHONDONTWRITEBYTECODE ?? '0';
   return env;
 }
 
@@ -775,6 +969,33 @@ export function extractBashCommand(argv) {
  * the DSH-side terminate() cannot reach the guest directly — the
  * abort-through-disconnect is the kill path, and the server-side
  * timeout is the backstop.
+ *
+ * PTY exec: options.tty === true runs the command on a fresh fake
+ * PTY instead of pipes (ENV-02): stdin is fed chunked + EOT, the
+ * stream is merged (stderr arrives as stdout), TERM is
+ * xterm-256color. The child reports it as child.ishTty (true when
+ * the server's terminal frame echoed {tty: true}). The DSH-side
+ * trigger that sets options.tty is outside this file (the bash tool
+ * does not pass it today); the plumbing is here so a caller can opt
+ * in per command.
+ *
+ * PTY interface (ENV-12): the piped exec path has no pty, so TERM is
+ * not forwarded by default. When a PTY-backed exec calls this shim,
+ * pass options.pty === true (and optionally options.ptyTerm, default
+ * 'xterm-256color'); the bridge then forwards TERM, and the Swift
+ * side still just exports what it is sent. Do not set options.pty
+ * for the piped /ish/exec path.
+ *
+ * Cwd (ENV-14): options.cwd is the engine's workdir (spec.workdir,
+ * from the bash executor's config.cwd) and is forwarded via toGuest
+ * — the bridge never ignores it. What the bridge adds is memory: a
+ * bare `cd` inside the guest shell is invisible to the engine, so
+ * the Swift wrapper reports the shell's final cwd in a nonce-tagged
+ * marker line and the bridge reuses it for the next exec of the same
+ * session while the engine cwd is unchanged (resolveExecCwd). If the
+ * engine cwd changes (working-directory cd tool), the engine wins
+ * and the memory is forgotten. Without a DSH_SESSION_ID in the env
+ * there is no memory (stateless, as before).
  */
 export function spawnIshExec(argv, options = {}) {
   const command = extractBashCommand(argv);
@@ -797,6 +1018,9 @@ export function spawnIshExec(argv, options = {}) {
   child.stdin = input;
   child.stdout = out.stream;
   child.stderr = err.stream;
+  // Whether this exec ran on a PTY (options.tty, confirmed by the
+  // server's terminal frame). False until the frame says otherwise.
+  child.ishTty = false;
   // stdio[7] is the subprocess control fd; the shim has no control
   // channel, so stdio is exactly 3 entries and controlPipe() yields
   // undefined (the managed handle works without it).
@@ -863,12 +1087,26 @@ export function spawnIshExec(argv, options = {}) {
       if (settled) return; // killed while waiting for stdin
       if (abortController.signal.aborted) { finish(null, 'SIGTERM'); return; } // aborted while waiting for stdin
       const stdinData = stdinChunks.length > 0 ? Buffer.concat(stdinChunks) : undefined;
-      const guestCwd = toGuest(options.cwd ?? process.cwd());
+      // ENV-14: the engine's cwd (spec.workdir) is the only cwd the
+      // bridge is given, and it only changes via the working-directory
+      // cd tool — a bare `cd` inside the guest shell never reaches it.
+      // resolveExecCwd reuses the guest's final cwd from the previous
+      // exec while the engine cwd is unchanged (see the marker below).
+      const sessionId = typeof options.env?.DSH_SESSION_ID === 'string'
+        ? options.env.DSH_SESSION_ID : null;
+      const engineCwd = toGuest(options.cwd ?? process.cwd());
+      const guestCwd = resolveExecCwd(sessionId, engineCwd);
+      // One nonce per exec: the Swift wrapper echoes it in the cwd
+      // marker, so only this exec's marker can update the memory.
+      const cwdNonce = sessionId ? randomBytes(8).toString('hex') : null;
       const result = await ishExec({
         command,
         cwd: guestCwd ?? undefined,
-        env: guestEnv(options.env ?? {}),
+        env: guestEnv(options.env ?? {}, {hasPty: options.pty === true, ptyTerm: options.ptyTerm}),
         stdinData,
+        ...(cwdNonce ? {cwdNonce} : {}),
+        onSessionCwd: (cwd) => noteExecCwd(sessionId, cwd),
+        tty: options.tty === true,
         timeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
         signal: abortController.signal,
         onLine: ({stream, line}) => {
@@ -880,6 +1118,9 @@ export function spawnIshExec(argv, options = {}) {
         finish(null, 'SIGTERM');
         return;
       }
+      // Confirm the PTY from the server side (the frame echoes
+      // {tty: true} for a PTY exec); a plain pipe exec reports false.
+      child.ishTty = result.tty === true;
       finish(typeof result.exitCode === 'number' ? result.exitCode : 1, null);
     } catch (error) {
       if (settled) return;
@@ -941,6 +1182,12 @@ export function installSpawnPatch() {
  * Only one PTY session can exist at a time (single shared _consoleTTY
  * Swift-side); a second open is refused with close 1008, which surfaces
  * here as an onExit with an explanatory line on the output stream.
+ * (Stage 5.3: MULTI-SESSION — the kernel routes each socket to its own
+ * PTY session, so any number of IshPtyTerminal instances up to the
+ * kernel cap (8) can be live at once; close 1008 now only fires at the
+ * cap, and the server's reason is printed. Each instance owns its WS
+ * connection, its decoder, its pause buffer and its exit state — no
+ * shared mutable state between instances.)
  */
 export class IshPtyTerminal {
   constructor(file, args, options = {}) {
@@ -957,6 +1204,12 @@ export class IshPtyTerminal {
     this._pausedBuffers = [];
     this._exited = false;
     this._ws = null;
+    // Kernel session id, learned from the server's session hello
+    // ({"type":"session","sessionId":"..."}) right after the upgrade.
+    // Null until the hello arrives (older servers never send it).
+    // Diagnostics only — routing is by socket, the client never has
+    // to send the id anywhere.
+    this.sessionId = null;
     this._ready = this._open();
   }
 
@@ -1018,11 +1271,24 @@ export class IshPtyTerminal {
         const text = this._decoder.write(data);
         if (text) this._emitData(text);
       },
-      onText: () => {}, // The service sends no text messages to the client.
+      onText: (text) => {
+        // Session hello ({"type":"session","sessionId":"..."}), sent
+        // by the server right after the upgrade. Stored for
+        // diagnostics; anything else is ignored (the server sends no
+        // other text messages).
+        try {
+          const msg = JSON.parse(text);
+          if (msg?.type === 'session' && typeof msg.sessionId === 'string') {
+            this.sessionId = msg.sessionId;
+          }
+        } catch {}
+      },
       onClose: ({code, reason}) => {
         if (this._exited) return;
         if (code === 1008) {
-          this._emitData(`ish: another terminal session is already active (close 1008)\r\n`);
+          // Session cap (stage 5.3): the server's reason names it
+          // ("too many pty sessions are active (max 8)").
+          this._emitData(`ish: terminal refused (close 1008${reason ? `: ${reason}` : ''})\r\n`);
         } else if (code === 1011) {
           this._emitData(`ish: the guest shell failed to start (close 1011)\r\n`);
         }

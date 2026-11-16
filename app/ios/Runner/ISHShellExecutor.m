@@ -120,6 +120,12 @@ static const size_t kISHExecEnvpCapacity = 8192;
 @property (nonatomic) BOOL timedOut;
 @property (nonatomic) BOOL cancelled;
 @property (nonatomic) BOOL pipesDone;
+/// YES for a PTY execution (no pipes: pipesDone is set at start and
+/// completion waits only for the exit notification + the final
+/// session-buffer drain in finishRecord).
+@property (nonatomic) BOOL isTty;
+/// ISHKernel PTY session id for a PTY execution (nil for pipe runs).
+@property (nonatomic, strong, nullable) NSString *ptySessionId;
 /// Wait-encoded exit status from ISHGuestExitedNotification, nil until
 /// the guest exits.
 @property (nonatomic, strong, nullable) NSNumber *exitCode;
@@ -220,10 +226,28 @@ static void ish_executor_close_fd(int fd) {
                                       timeout:(NSTimeInterval)timeout
                                 outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                                    completion:(void (^)(ISHShellExecutionResult *result))completion;
+- (ISHShellExecution *)startExecutionWithArgv:(NSArray<NSString *> *)argv
+                                    stdinData:(nullable NSData *)stdinData
+                                    fsContext:(uint64_t)fsContext
+                                      timeout:(NSTimeInterval)timeout
+                                         isTty:(BOOL)isTty
+                                          cols:(int)cols
+                                          rows:(int)rows
+                                outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                                   completion:(void (^)(ISHShellExecutionResult *result))completion;
 - (void)runRecord:(ISHExecRecord *)record
              argv:(NSArray<NSString *> *)argv
         stdinData:(nullable NSData *)stdinData
         fsContext:(uint64_t)fsContext;
+- (void)runTtyRecord:(ISHExecRecord *)record
+                argv:(NSArray<NSString *> *)argv
+           stdinData:(nullable NSData *)stdinData
+           fsContext:(uint64_t)fsContext
+                cols:(int)cols
+                rows:(int)rows;
+- (void)feedTtyStdin:(nullable NSData *)data
+           sessionId:(NSString *)sessionId;
+- (void)drainTtyTailForRecord:(ISHExecRecord *)record;
 - (void)readPipeFd:(int)fd into:(NSMutableData *)buffer lock:(NSLock *)lock
             record:(ISHExecRecord *)record isStderr:(BOOL)isStderr;
 - (void)writeStdinData:(nullable NSData *)data
@@ -345,18 +369,63 @@ static void ish_executor_close_fd(int fd) {
 /// chunks are delivered to `outputHandler` as they arrive (arbitrary
 /// queue, raw bytes, per-stream arrival order). The completion still
 /// fires at the end with the full result.
+///
+/// ENV-01: the exec shell is /bin/bash (the guest ships bash 5.2.37;
+/// /bin/sh is BusyBox ash, whose missing bash syntax broke commands
+/// the bash tool advertises as "bash -c"). This is the ONLY place the
+/// exec shell is chosen: the loopback service passes a ready-made
+/// command string, and the PTY path uses ISHKernel.executeCommand
+/// (not this method), so this change cannot affect interactive
+/// terminals.
 - (ISHShellExecution *)executeCommand:(NSString *)command
                             stdinData:(nullable NSData *)stdinData
                             fsContext:(uint64_t)fsContext
                               timeout:(NSTimeInterval)timeout
                         outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                            completion:(void (^)(ISHShellExecutionResult *result))completion {
-    return [self startExecutionWithArgv:@[@"/bin/sh", @"-c", command ?: @""]
+    return [self startExecutionWithArgv:@[@"/bin/bash", @"-c", command ?: @""]
                               stdinData:stdinData
                               fsContext:fsContext
                                 timeout:timeout
                           outputHandler:outputHandler
                              completion:completion];
+}
+
+/// PTY variant (stage 5.3, ENV-02). Same one-shot shape as
+/// executeCommand: but the command runs on a fresh fake PTY (see the
+/// header). Output is merged (isStderr is always NO); the result's
+/// stderrData is empty. Shell is /bin/bash, same ENV-01 rule as the
+/// pipe exec: the command string is built for bash, and /bin/sh is
+/// BusyBox ash.
+- (ISHShellExecution *)executeCommandTty:(NSString *)command
+                               stdinData:(nullable NSData *)stdinData
+                               fsContext:(uint64_t)fsContext
+                                 timeout:(NSTimeInterval)timeout
+                                    cols:(int)cols
+                                    rows:(int)rows
+                           outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                              completion:(void (^)(ISHShellExecutionResult *result))completion {
+    return [self startExecutionWithArgv:@[@"/bin/bash", @"-c", command ?: @""]
+                              stdinData:stdinData
+                              fsContext:fsContext
+                                timeout:timeout
+                                  isTty:YES
+                                   cols:cols
+                                   rows:rows
+                          outputHandler:outputHandler
+                             completion:completion];
+}
+
+- (ISHShellExecution *)executeCommandTty:(NSString *)command
+                               stdinData:(nullable NSData *)stdinData
+                               fsContext:(uint64_t)fsContext
+                                 timeout:(NSTimeInterval)timeout
+                                    cols:(int)cols
+                                    rows:(int)rows
+                              completion:(void (^)(ISHShellExecutionResult *result))completion {
+    return [self executeCommandTty:command stdinData:stdinData fsContext:fsContext
+                           timeout:timeout cols:cols rows:rows
+                     outputHandler:nil completion:completion];
 }
 
 - (ISHShellExecution *)startExecutionWithArgv:(NSArray<NSString *> *)argv
@@ -365,10 +434,32 @@ static void ish_executor_close_fd(int fd) {
                                       timeout:(NSTimeInterval)timeout
                                 outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                                    completion:(void (^)(ISHShellExecutionResult *result))completion {
+    return [self startExecutionWithArgv:argv stdinData:stdinData fsContext:fsContext
+                                timeout:timeout isTty:NO cols:0 rows:0
+                          outputHandler:outputHandler completion:completion];
+}
+
+- (ISHShellExecution *)startExecutionWithArgv:(NSArray<NSString *> *)argv
+                                    stdinData:(nullable NSData *)stdinData
+                                    fsContext:(uint64_t)fsContext
+                                      timeout:(NSTimeInterval)timeout
+                                         isTty:(BOOL)isTty
+                                          cols:(int)cols
+                                          rows:(int)rows
+                                outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                                   completion:(void (^)(ISHShellExecutionResult *result))completion {
     ISHExecRecord *record = [[ISHExecRecord alloc] init];
     record.completion = completion;
     record.outputHandler = outputHandler;
     record.timeout = (timeout > 0 ? timeout : kISHExecDefaultTimeout);
+    record.isTty = isTty;
+    if (isTty) {
+        // No pipes to wait for: the only completion gate is the exit
+        // notification (plus the final session-buffer drain in
+        // finishRecord). The PTY session id is the kernel routing key.
+        record.pipesDone = YES;
+        record.ptySessionId = [[NSUUID UUID] UUIDString];
+    }
     ISHShellExecution *handle = [[ISHShellExecution alloc] initWithRecord:record];
     // Register synchronously so the handle is usable immediately.
     dispatch_sync(_stateQueue, ^{
@@ -383,10 +474,180 @@ static void ish_executor_close_fd(int fd) {
         });
         return handle;
     }
+    if (isTty) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            [self runTtyRecord:record argv:argv stdinData:stdinData
+                     fsContext:fsContext cols:cols rows:rows];
+        });
+        return handle;
+    }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         [self runRecord:record argv:argv stdinData:stdinData fsContext:fsContext];
     });
     return handle;
+}
+
+// --- PTY start path (stage 5.3, ENV-02; runs on a global-queue thread) -----
+
+- (void)runTtyRecord:(ISHExecRecord *)record
+                argv:(NSArray<NSString *> *)argv
+           stdinData:(nullable NSData *)stdinData
+           fsContext:(uint64_t)fsContext
+                cols:(int)cols
+                rows:(int)rows {
+    // Cancelled before we even started? (cancel / cancelAll raced us.)
+    if (record.cancelled) {
+        [self failRecord:record withCode:ISHShellExecutionErrorCancelled];
+        return;
+    }
+    // Register the kernel session handler FIRST, so no output can be
+    // missed. Output can only start after task_start, which runs after
+    // executeCommand returns — but registering first costs nothing.
+    // The handler appends to stdoutData UNCONDITIONALLY (under the
+    // record lock) and only gates the STREAMING forward on finished:
+    // finishRecord snapshots stdoutData, so an append that lands after
+    // the snapshot would otherwise be lost from the result even
+    // though the kernel buffer already gave it up. (Same shape as the
+    // pipe readers: append first, stream second.)
+    void (^handler)(NSData *) = ^(NSData *chunk) {
+        [record.outputLock lock];
+        [record.stdoutData appendData:chunk];
+        [record.outputLock unlock];
+        if (record.finished) return;
+        void (^outHandler)(BOOL, NSData *) = record.outputHandler;
+        if (outHandler) outHandler(NO, chunk);
+    };
+    [[ISHKernel shared] setPtyOutputHandler:handler forSession:record.ptySessionId];
+    int guestPid = 0;
+    int rc = [[ISHKernel shared] executeCommand:argv pid:&guestPid
+                                       sessionId:record.ptySessionId
+                                       fsContext:fsContext
+                                            cols:cols rows:rows];
+    if (rc != 0 || guestPid <= 0) {
+        NSLog(@"ISHShellExecutor: tty exec start failed (rc=%d)", rc);
+        [[ISHKernel shared] setPtyOutputHandler:nil forSession:record.ptySessionId];
+        if (rc != -3) {
+            // Release the registry slot. (-3 = the spawn block is
+            // still stuck after 10 s; the record stays registered so
+            // a late success still routes, and stopGuest purges it.)
+            [[ISHKernel shared] closePtySession:record.ptySessionId];
+        } else {
+            NSLog(@"ISHShellExecutor: tty exec start timed out; session %@ stays registered until stopGuest",
+                  record.ptySessionId);
+        }
+        [self failRecord:record withCode:ISHShellExecutionErrorCreationFailed];
+        return;
+    }
+    // Cancelled while exec was running? Do not start a task we were
+    // asked to kill (same check as runRecord, after do_execve).
+    if (record.cancelled) {
+        [[ISHKernel shared] closePtySession:record.ptySessionId];
+        [self failRecord:record withCode:ISHShellExecutionErrorCancelled];
+        return;
+    }
+    // Stdin: feed in <= 2 KiB chunks (paced), then EOT (0x04) so the
+    // guest sees EOF — the same end-of-input semantics as the pipe
+    // path closing stdin. See feedTtyStdin:sessionId: for why chunks.
+    [self feedTtyStdin:stdinData sessionId:record.ptySessionId];
+    // Record the pid + start the timeout, serialized on the state queue
+    // with any concurrent cancel. (Same block as runRecord.)
+    dispatch_async(_stateQueue, ^{
+        record.pid = guestPid;
+        self.executionsByPid[@(guestPid)] = record.token;
+        if (record.cancelled) {
+            [self killProcessGroup:guestPid];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                (int64_t)(kISHExecKillGrace * NSEC_PER_SEC)),
+                self.stateQueue, ^{
+                [self forceFinalizeRecord:record
+                             withExitCode:ISHShellExecutionErrorCancelled];
+            });
+            return;
+        }
+        // FAST-EXIT GUARD (tty only): executeCommand hides task_start,
+        // so — unlike runRecord, which enqueues this block BEFORE
+        // task_start — the guest can exit before this block runs, and
+        // the exit observer drops notifications for pids it cannot
+        // map yet. Re-read the recorded exit code via an ASYNC hop to
+        // the main queue (exitCodeForGuestPid does dispatch_sync to
+        // main when called off-main — never call it directly from
+        // this queue: a main-thread caller blocked in dispatch_sync
+        // on _stateQueue would deadlock). If the guest already
+        // exited, finalize through the normal path. (If the
+        // observer's dispatch lands first instead, this is a no-op:
+        // tryFinalizeRecord returns early once finished.)
+        __weak ISHShellExecutor *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSNumber *earlyExit = [[ISHKernel shared] exitCodeForGuestPid:guestPid];
+            if (!earlyExit) return;
+            ISHShellExecutor *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf.stateQueue, ^{
+                if (record.finished) return;
+                record.exitCode = earlyExit;
+                [strongSelf tryFinalizeRecord:record];
+            });
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+            (int64_t)(record.timeout * NSEC_PER_SEC)),
+            self.stateQueue, ^{
+            [self timeoutRecord:record];
+        });
+    });
+    NSLog(@"ISHShellExecutor: started tty guest process PID %d (%s)",
+          guestPid, argv[0].UTF8String);
+}
+
+/// Feed stdin to a PTY session in <= 2 KiB chunks, 20 ms apart, then
+/// an EOT byte (0x04). The tty input buffer is 4 KiB and a
+/// non-blocking tty_input drops what does not fit, so one bulk write
+/// would silently truncate large stdin; pacing lets the guest drain
+/// between chunks. A nil/empty stdin still gets the EOT (an
+/// interactive command with no stdin must see EOF, e.g. a bare
+/// `python3` REPL must exit instead of blocking until timeout).
+/// Chunks go through the kernel's serial input queue, so order is
+/// preserved. Each send is best-effort: if the session closed or the
+/// guest exited mid-feed, later chunks are dropped by the kernel.
+- (void)feedTtyStdin:(nullable NSData *)data
+           sessionId:(NSString *)sessionId {
+    static const NSUInteger kISHExecTtyStdinChunk = 2048;
+    static const NSTimeInterval kISHExecTtyStdinPace = 0.02; // 20 ms
+    NSUInteger total = data.length;
+    NSUInteger chunks = (total + kISHExecTtyStdinChunk - 1) / kISHExecTtyStdinChunk;
+    for (NSUInteger i = 0; i < chunks; i++) {
+        NSUInteger offset = i * kISHExecTtyStdinChunk;
+        NSUInteger len = MIN(kISHExecTtyStdinChunk, total - offset);
+        NSData *chunk = [data subdataWithRange:NSMakeRange(offset, len)];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+            (int64_t)((i * kISHExecTtyStdinPace) * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            [[ISHKernel shared] sendInput:chunk sessionId:sessionId];
+        });
+    }
+    const uint8_t eot = 0x04;
+    NSData *eotData = [NSData dataWithBytes:&eot length:1];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+        (int64_t)((chunks * kISHExecTtyStdinPace) * NSEC_PER_SEC)),
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        [[ISHKernel shared] sendInput:eotData sessionId:sessionId];
+    });
+}
+
+/// Final tail-drain for a PTY execution: pull any bytes still sitting
+/// in the session buffer (not yet dispatched) into stdoutData and
+/// stream them, BEFORE finishRecord snapshots the result. Called from
+/// finishRecord (single completion point) while `finished` is still
+/// NO, so the streaming forward always lands. The kernel session is
+/// closed by finishRecord right after (see below).
+- (void)drainTtyTailForRecord:(ISHExecRecord *)record {
+    if (!record.ptySessionId) return;
+    NSData *tail = [[ISHKernel shared] drainOutputForSession:record.ptySessionId];
+    if (tail.length == 0) return;
+    [record.outputLock lock];
+    [record.stdoutData appendData:tail];
+    [record.outputLock unlock];
+    void (^outHandler)(BOOL, NSData *) = record.outputHandler;
+    if (outHandler) outHandler(NO, tail);
 }
 
 // --- Start path (runs on a global-queue thread) -------------------------------
@@ -505,7 +766,11 @@ static void ish_executor_close_fd(int fd) {
             envpPos += _len; \
         } \
     } while (0)
-    EXEC_ENVP_APPEND("TERM=xterm-256color");
+    // ENV-12: no TERM here. An exec has no tty (pipes only); faking
+    // TERM=xterm-256color made non-tty tools believe a terminal was
+    // present. TERM is set only when a pty is present: the PTY path
+    // sets it in ISHKernel.executeCommand, and the bridge forwards it
+    // only when the exec is pty-backed (guestEnv opts.hasPty).
     EXEC_ENVP_APPEND("HOME=/root");
     EXEC_ENVP_APPEND("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     EXEC_ENVP_APPEND("LANG=C.UTF-8");
@@ -671,14 +936,24 @@ static void ish_executor_close_fd(int fd) {
 // The single completion point. No-op if already finished. Removes the
 // record from both indexes and invokes the completion OFF the state
 // queue (it may call back into the executor, e.g. to start the next
-// command).
+// command). For a PTY execution the session-buffer tail is drained
+// BEFORE `finished` is set (so the streaming forward lands) and the
+// kernel session is closed AFTER the result is built (kills the
+// group — a no-op when the guest already exited — removes the
+// handler, frees the registry slot). The close must happen here, in
+// the single completion point, not in tryFinalize: a timeout / cancel
+// that finalizes via forceFinalizeRecord must free the slot too.
 - (void)finishRecord:(ISHExecRecord *)record withExitCode:(int)exitCode {
     if (record.finished) return;
+    if (record.isTty) [self drainTtyTailForRecord:record];
     record.finished = YES;
     [self.executions removeObjectForKey:record.token];
     if (record.pid > 0) [self.executionsByPid removeObjectForKey:@(record.pid)];
     ISHShellExecutionResult *result =
         [self buildResultForRecord:record exitCode:exitCode];
+    if (record.isTty && record.ptySessionId) {
+        [[ISHKernel shared] closePtySession:record.ptySessionId];
+    }
     void (^completion)(ISHShellExecutionResult *) = record.completion;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         if (completion) completion(result);

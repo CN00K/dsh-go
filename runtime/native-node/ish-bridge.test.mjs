@@ -23,6 +23,7 @@ import {
   DEFAULT_EXEC_TIMEOUT_MS,
   ISH_PTY_COMMAND,
   ISH_RUNNER_COMMAND,
+  clearExecCwdState,
   extractBashCommand,
   getServiceInfo,
   guestEnv,
@@ -30,6 +31,9 @@ import {
   ishExec,
   ishPtySpawn,
   ishWebSocket,
+  noteExecCwd,
+  parseCwdMarker,
+  resolveExecCwd,
   spawnIshExec,
   splitConfinedArgv,
   toGuest,
@@ -130,6 +134,9 @@ test('extractBashCommand only accepts ["bash", "-c", command]', () => {
 // ---------------------------------------------------------------------------
 
 test('guestEnv never forwards host paths', () => {
+  // Piped exec (no pty): TERM is dropped entirely (ENV-12) — the old
+  // test asserted the xterm-256color default here; that default now
+  // only applies to pty execs (see the hasPty test below).
   const env = guestEnv({
     PATH: '/usr/local/bin:/bin',
     HOME: '/var/mobile/Containers/Data/Application/UUID',
@@ -145,11 +152,70 @@ test('guestEnv never forwards host paths', () => {
   assert.equal(env.HOME, '/root');
   assert.equal(env.DSH_SESSION_ID, 'sess-1');
   assert.equal(env.DSH_SHELL, '1');
-  assert.equal(env.TERM, 'xterm-256color');
+  assert.equal(env.TERM, undefined);
   assert.equal(env.LANG, 'en_US.UTF-8');
   assert.equal(env.TMPDIR, undefined);
   assert.equal(env.DSH_HOME, undefined);
   assert.equal(env.FOO, undefined);
+  // ENV-13: .pyc caching is enabled unless the caller says otherwise.
+  assert.equal(env.PYTHONDONTWRITEBYTECODE, '0');
+});
+
+test('guestEnv forwards TERM only with a pty (ENV-12)', () => {
+  // The engine's model-friendly TERM=dumb must not reach a piped exec.
+  assert.equal(guestEnv({TERM: 'dumb'}).TERM, undefined);
+  // No host TERM and no pty: no TERM is invented either.
+  assert.equal(guestEnv({}).TERM, undefined);
+  // With a pty: the host value wins; without one the profile default
+  // (xterm-256color) applies, overridable via ptyTerm.
+  assert.equal(guestEnv({TERM: 'xterm-256color'}, {hasPty: true}).TERM, 'xterm-256color');
+  assert.equal(guestEnv({}, {hasPty: true}).TERM, 'xterm-256color');
+  assert.equal(guestEnv({}, {hasPty: true, ptyTerm: 'screen-256color'}).TERM, 'screen-256color');
+});
+
+test('guestEnv honours an explicit PYTHONDONTWRITEBYTECODE (ENV-13)', () => {
+  assert.equal(guestEnv({PYTHONDONTWRITEBYTECODE: '1'}).PYTHONDONTWRITEBYTECODE, '1');
+  assert.equal(guestEnv({PYTHONDONTWRITEBYTECODE: '0'}).PYTHONDONTWRITEBYTECODE, '0');
+});
+
+// ---------------------------------------------------------------------------
+// Session cwd memory (ENV-14)
+// ---------------------------------------------------------------------------
+
+test('parseCwdMarker only accepts the exact nonce and a clean path', () => {
+  const frame = (line) => ({stream: 'stderr', line});
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:/tmp/foo'), 'abc123'), '/tmp/foo');
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:/tmp/foo'), 'deadbeef'), null);
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:relative'), 'abc123'), null);
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:/tmp/a\nb'), 'abc123'), null);
+  assert.equal(parseCwdMarker({stream: 'stdout', line: '__DSH_CWD__abc123:/tmp'}, 'abc123'), null);
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:'), 'abc123'), null);
+  assert.equal(parseCwdMarker(frame('plain output'), 'abc123'), null);
+  assert.equal(parseCwdMarker(frame('__DSH_CWD__abc123:/tmp'), null), null);
+});
+
+test('resolveExecCwd reuses the remembered cwd until the engine moves', () => {
+  clearExecCwdState();
+  const sess = 'sess-cwd-1';
+  // No memory yet: the engine cwd passes through.
+  assert.equal(resolveExecCwd(sess, '/home/workspace'), '/home/workspace');
+  // A bare `cd /tmp` in the guest is remembered; the next exec reuses it
+  // while the engine keeps asking for the same directory.
+  noteExecCwd(sess, '/tmp');
+  assert.equal(resolveExecCwd(sess, '/home/workspace'), '/tmp');
+  assert.equal(resolveExecCwd(sess, '/home/workspace'), '/tmp');
+  // The model uses the working-directory cd tool: the engine cwd
+  // changes, the engine wins, and the old memory is forgotten.
+  assert.equal(resolveExecCwd(sess, '/home/workspace/sub'), '/home/workspace/sub');
+  assert.equal(resolveExecCwd(sess, '/home/workspace/sub'), '/home/workspace/sub');
+  // No session id: stateless, as before.
+  assert.equal(resolveExecCwd(null, '/home/workspace'), '/home/workspace');
+  assert.equal(resolveExecCwd(null, undefined), undefined);
+  // Memory recorded before any engine cwd was seen (direct ishExec
+  // use) is not discarded as an engine "move" — there is no move.
+  noteExecCwd('sess-cwd-2', '/tmp/early');
+  assert.equal(resolveExecCwd('sess-cwd-2', '/home/workspace'), '/tmp/early');
+  clearExecCwdState();
 });
 
 // ---------------------------------------------------------------------------
@@ -185,6 +251,43 @@ test('ishExec streams NDJSON lines and returns the final frame', async () => {
     assert.deepEqual(lines, [
       {stream: 'stdout', line: 'hi'},
       {stream: 'stderr', line: 'err'},
+    ]);
+  } finally {
+    await close();
+  }
+});
+
+test('ishExec swallows the exact-nonce cwd marker and reports the cwd (ENV-14)', async () => {
+  const nonce = '0123456789abcdef';
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    assert.equal(parsed.cwdNonce, nonce);
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'hello'}) + '\n');
+    // The Swift wrapper's marker: swallowed, never shown to the caller.
+    res.write(JSON.stringify({stream: 'stderr', line: `__DSH_CWD__${nonce}:/tmp/work`}) + '\n');
+    // A look-alike with a different nonce is ordinary output.
+    res.write(JSON.stringify({stream: 'stderr', line: '__DSH_CWD__ffffffffffffffff:/etc'}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 3}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    const lines = [];
+    const cwds = [];
+    const result = await ishExec({
+      command: 'cd /tmp/work',
+      cwd: '/home/workspace',
+      cwdNonce: nonce,
+      serviceFile: writeServiceFile(port),
+      onLine: (frame) => lines.push(frame),
+      onSessionCwd: (cwd) => cwds.push(cwd),
+    });
+    assert.deepEqual(result, {exitCode: 0, durationMs: 3});
+    assert.deepEqual(cwds, ['/tmp/work']);
+    assert.deepEqual(lines, [
+      {stream: 'stdout', line: 'hello'},
+      {stream: 'stderr', line: '__DSH_CWD__ffffffffffffffff:/etc'},
     ]);
   } finally {
     await close();
@@ -262,7 +365,7 @@ test('bridge unavailable error names the missing service file', async () => {
 // ---------------------------------------------------------------------------
 
 /** Minimal mock WS server: validates the upgrade + Authorization, then echoes. */
-async function startMockWsServer({closeCode = null} = {}) {
+async function startMockWsServer({closeCode = null, closeReason = null, sessionHello = false, onSocket = null} = {}) {
   const server = createServer();
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
@@ -281,12 +384,22 @@ async function startMockWsServer({closeCode = null} = {}) {
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
       + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
     if (closeCode !== null) {
-      // Refuse with a close frame (like the 1008 second-session refusal).
-      const payload = Buffer.from([(closeCode >> 8) & 0xff, closeCode & 0xff]);
+      // Refuse with a close frame (like the 1008 session-cap refusal);
+      // an optional reason follows the 2-byte code, as the real server sends.
+      const reasonBytes = closeReason ? Buffer.from(closeReason, 'utf8') : Buffer.alloc(0);
+      const payload = Buffer.concat([
+        Buffer.from([(closeCode >> 8) & 0xff, closeCode & 0xff]), reasonBytes]);
       socket.write(Buffer.from([0x88, payload.length, ...payload]));
       socket.end();
       return;
     }
+    if (sessionHello) {
+      // Session hello, like the real server sends right after the upgrade.
+      const hello = JSON.stringify({type: 'session', sessionId: `mock-session-${sockets.size}`});
+      const payload = Buffer.from(hello, 'utf8');
+      socket.write(Buffer.concat([Buffer.from([0x81, payload.length]), payload]));
+    }
+    if (onSocket) onSocket(socket);
     let buffer = Buffer.alloc(0);
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -439,6 +552,63 @@ test('spawnIshExec returns a ChildProcess-shaped handle with streamed output', a
   }
 });
 
+test('spawnIshExec remembers a bare cd across execs of one session (ENV-14)', async () => {
+  clearExecCwdState();
+  const seenCwds = [];
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.ok(bearerOk(req));
+    const parsed = JSON.parse(body.toString('utf8'));
+    seenCwds.push(parsed.cwd);
+    // The Swift wrapper sends the cwd nonce; emulate its marker line.
+    assert.equal(typeof parsed.cwdNonce, 'string');
+    assert.match(parsed.cwdNonce, /^[0-9a-f]{16}$/);
+    // No TERM on a piped exec (ENV-12), .pyc caching on (ENV-13).
+    assert.equal(parsed.env.TERM, undefined);
+    assert.equal(parsed.env.PYTHONDONTWRITEBYTECODE, '0');
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'ok'}) + '\n');
+    res.write(JSON.stringify({stream: 'stderr', line: `__DSH_CWD__${parsed.cwdNonce}:/tmp`}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 5}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const opts = {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: 'sess-cwd-e2e'}};
+    const run = async (command) => {
+      const child = spawnIshExec([ISH_RUNNER_COMMAND, '--', 'bash', '-c', command], opts);
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (c) => { stdout += c.toString('utf8'); });
+      child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+      const outcome = await new Promise((done) => child.once('exit', (code) => done(code)));
+      return {outcome, stdout, stderr};
+    };
+    // First exec: engine cwd; the marker reports the shell ended in /tmp.
+    const first = await run('cd /tmp && pwd');
+    assert.equal(first.outcome, 0);
+    assert.equal(first.stdout, 'ok\n');
+    assert.equal(first.stderr, '', 'the cwd marker must never reach tool output');
+    // Second exec, same session, same engine cwd: the bridge reuses /tmp.
+    const second = await run('pwd');
+    assert.equal(second.outcome, 0);
+    assert.deepEqual(seenCwds, ['/home/workspace', '/tmp']);
+    // A different session starts fresh (no cross-session leakage).
+    const other = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'pwd'],
+      {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: 'sess-other'}});
+    let otherOut = '';
+    other.stdout.on('data', (c) => { otherOut += c.toString('utf8'); });
+    await new Promise((done) => other.once('exit', done));
+    assert.equal(otherOut, 'ok\n');
+    assert.deepEqual(seenCwds, ['/home/workspace', '/tmp', '/home/workspace']);
+  } finally {
+    clearExecCwdState();
+    await close();
+  }
+});
+
 test('spawnIshExec fails closed when the bridge is down', async () => {
   invalidateServiceInfo();
   // The getServiceInfo test above already did the one ~30s wait for a
@@ -550,6 +720,187 @@ test('ishPtySpawn forwards input and output as raw bytes', async () => {
       term.kill('SIGTERM');
     });
     assert.deepEqual(exit, {exitCode: null, signal: null});
+  } finally {
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PTY exec (stage 5.3, ENV-02) + multi-session PTY shim
+// ---------------------------------------------------------------------------
+
+test('ishExec sends tty:true and returns the server tty:true frame', async () => {
+  let sawBody = null;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    assert.ok(bearerOk(req));
+    sawBody = JSON.parse(body.toString('utf8'));
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'tty'}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 3, tty: true}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    const lines = [];
+    const result = await ishExec({
+      command: '[ -t 1 ] && echo tty', tty: true,
+      serviceFile: writeServiceFile(port),
+      onLine: (frame) => lines.push(frame),
+    });
+    assert.equal(sawBody.tty, true);
+    assert.deepEqual(result, {exitCode: 0, durationMs: 3, tty: true});
+    assert.deepEqual(lines, [{stream: 'stdout', line: 'tty'}]);
+  } finally {
+    await close();
+  }
+});
+
+test('ishExec omits tty when not requested (pipe path unchanged)', async () => {
+  let sawBody = null;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    sawBody = JSON.parse(body.toString('utf8'));
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({exitCode: 0, durationMs: 3}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    const result = await ishExec({command: 'echo hi', serviceFile: writeServiceFile(port)});
+    assert.ok(!('tty' in sawBody));
+    assert.deepEqual(result, {exitCode: 0, durationMs: 3});
+  } finally {
+    await close();
+  }
+});
+
+test('spawnIshExec passes options.tty through and sets child.ishTty', async () => {
+  let sawBody = null;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    sawBody = JSON.parse(body.toString('utf8'));
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({stream: 'stdout', line: 'tty'}) + '\n');
+    res.write(JSON.stringify({exitCode: 0, durationMs: 3, tty: true}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', '[ -t 1 ] && echo tty'],
+      {cwd: join(fakeHome, 'workspace'), env: {}, tty: true});
+    assert.equal(child.ishTty, false); // not confirmed until the frame arrives
+    const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    assert.deepEqual(outcome, {code: 0, signal: null});
+    assert.equal(sawBody.tty, true);
+    assert.equal(child.ishTty, true);
+  } finally {
+    await close();
+  }
+});
+
+test('spawnIshExec leaves child.ishTty false for a plain exec', async () => {
+  let sawBody = null;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    sawBody = JSON.parse(body.toString('utf8'));
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.write(JSON.stringify({exitCode: 0, durationMs: 3}) + '\n');
+    res.end();
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'echo hi'],
+      {cwd: join(fakeHome, 'workspace'), env: {}});
+    const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    assert.deepEqual(outcome, {code: 0, signal: null});
+    assert.ok(!('tty' in sawBody));
+    assert.equal(child.ishTty, false);
+  } finally {
+    await close();
+  }
+});
+
+test('ishWebSocket propagates the server close reason (1008 cap message)', async () => {
+  const {server, port, close} = await startMockWsServer({
+    closeCode: 1008, closeReason: 'too many pty sessions are active (max 8)',
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const closes = [];
+    const ws = ishWebSocket({
+      path: '/ish/pty',
+      serviceFile,
+      onClose: (info) => closes.push(info),
+    });
+    await ws.ready;
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(closes.length, 1);
+    assert.equal(closes[0].code, 1008);
+    assert.match(closes[0].reason, /too many pty sessions are active \(max 8\)/);
+  } finally {
+    await close();
+  }
+});
+
+/** Send one unmasked binary frame on a mock server socket. */
+function mockSendBinary(socket, text) {
+  const payload = Buffer.from(text, 'utf8');
+  socket.write(Buffer.concat([Buffer.from([0x82, payload.length]), payload]));
+}
+
+test('two IshPtyTerminal instances keep separate streams and record sessionIds', async () => {
+  const sockets = [];
+  const {server, port, close} = await startMockWsServer({
+    sessionHello: true,
+    onSocket: (socket) => sockets.push(socket),
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const termA = ishPtySpawn(ISH_PTY_COMMAND, ['-i'], {
+      cols: 80, rows: 24, cwd: join(fakeHome, 'workspace'), env: {},
+    });
+    const termB = ishPtySpawn(ISH_PTY_COMMAND, ['-i'], {
+      cols: 80, rows: 24, cwd: join(fakeHome, 'workspace'), env: {},
+    });
+    const outA = [];
+    const outB = [];
+    termA.onData((data) => outA.push(data));
+    termB.onData((data) => outB.push(data));
+    await Promise.all([termA.ready, termB.ready]);
+    // The session hello arrives right after the upgrade; give it a
+    // moment to be parsed before asserting.
+    await new Promise((done) => setTimeout(done, 200));
+    assert.ok(termA.sessionId && termA.sessionId.startsWith('mock-session-'), `A sessionId: ${termA.sessionId}`);
+    assert.ok(termB.sessionId && termB.sessionId.startsWith('mock-session-'), `B sessionId: ${termB.sessionId}`);
+    assert.notEqual(termA.sessionId, termB.sessionId);
+    assert.equal(sockets.length, 2);
+    // Distinct bytes pushed to each socket arrive only on that terminal.
+    mockSendBinary(sockets[0], 'A-only');
+    mockSendBinary(sockets[1], 'B-only');
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(outA.join(''), 'A-only');
+    assert.equal(outB.join(''), 'B-only');
+    // Closing A does not affect B's stream.
+    const exitA = await new Promise((done) => {
+      termA.onExit((outcome) => done(outcome));
+      termA.kill('SIGTERM');
+    });
+    assert.deepEqual(exitA, {exitCode: null, signal: null});
+    mockSendBinary(sockets[1], 'B-still-alive');
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(outA.join(''), 'A-only');
+    assert.equal(outB.join(''), 'B-onlyB-still-alive');
+    const exitB = await new Promise((done) => {
+      termB.onExit((outcome) => done(outcome));
+      termB.kill('SIGTERM');
+    });
+    assert.deepEqual(exitB, {exitCode: null, signal: null});
   } finally {
     await close();
   }

@@ -19,6 +19,7 @@ import 'hosts_state.dart';
 import 'models_state.dart';
 import 'notify_state.dart' show appForegroundProvider;
 import 'run_pulse.dart';
+import 'schedule_editor_state.dart';
 import 'sessions_state.dart';
 
 /// How a message sent while a turn is running reaches the agent.
@@ -1593,6 +1594,15 @@ class ChatController extends Notifier<ChatState> {
       final content = paths.isEmpty
           ? text
           : [if (text.isNotEmpty) text, '${appL10n.stateWorkspaceFilesHint}\n$paths'].join('\n\n');
+      // ENV-10: send the phone's IANA zone. The engine renders its
+      // runtime-context timestamp from clientTimeZone when present, and
+      // otherwise falls back to the embedded Node process zone, which on
+      // iOS reports a zone name whose offset does not match (observed
+      // +08:00[America/Chicago]). Dart can provide the IANA name via
+      // detectDeviceTimeZone (offset-table fallback on iOS); a null value
+      // simply omits clientTimeZone until the provider resolves, and the
+      // pinned time-context fallback (Asia/Shanghai) covers that gap.
+      final deviceTimeZone = ref.read(deviceTimeZoneProvider).value;
       return client.prompt(
         sessionId,
         content,
@@ -1600,8 +1610,7 @@ class ChatController extends Notifier<ChatState> {
         fileReceiptIds: files.receipts,
         requestId: requestId,
         mode: mode,
-        // No clientTimeZone: DSH needs an IANA name, which Dart can't provide; the
-        // local process already runs with TZ set from the device (RuntimeController).
+        timeZone: deviceTimeZone,
       );
     }
 

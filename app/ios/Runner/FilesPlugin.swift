@@ -4,8 +4,12 @@
 //  Files the agent made for the user (chat deliverables / artifacts).
 //
 //  - `resolveGuest {path}` → host path of a local-engine (iSH guest) file,
-//    or null. The guest root maps onto the rootfs data dir
-//    (`RootfsManager.dataURL` = Application Support/iSH/rootfs/data).
+//    or null. The guest root is NOT one host directory: `/home/workspace`
+//    is bind-mounted to `ISHRuntime.hostWorkspaceURL` (Application
+//    Support/NativeNode/home/workspace), outside the rootfs data dir;
+//    everything else (`/root`, `/tmp`, `/etc`, …) lives under
+//    `RootfsManager.dataURL` (Application Support/iSH/rootfs/data).
+//    `resolveGuest` maps each guest prefix to its host location.
 //  - `listOutputs {depth}` → always [] on iOS: the outputs folder
 //    (Documents/DSH-Go) is not part of the guest filesystem, so there is
 //    no guest path for it. Saved files are visible in the Files app instead.
@@ -86,12 +90,28 @@ public final class FilesPlugin: NSObject, FlutterPlugin, UIDocumentInteractionCo
 
     /// Host file for an absolute guest [path]; null when it is not a
     /// readable regular file. Mirrors Android GuestFiles.resolve: walks
-    /// the path segment by segment under the rootfs data dir, following
-    /// symlinks in the guest namespace (up to 16 links).
+    /// the path segment by segment, following symlinks in the guest
+    /// namespace (up to 16 links).
+    ///
+    /// The guest root is NOT one host directory (build 29 device test):
+    /// `/home/workspace` is bind-mounted to
+    /// `ISHRuntime.hostWorkspaceURL` (Application
+    /// Support/NativeNode/home/workspace), outside the rootfs data dir,
+    /// while everything else (`/root`, `/tmp`, `/etc`, …) lives under
+    /// `RootfsManager.dataURL`. The walk therefore stays in guest
+    /// coordinates and maps each prefix to its host location
+    /// (`hostCandidates`), instead of joining every path onto the
+    /// data dir. The old code looked for `/home/workspace/<file>` at
+    /// `…/iSH/rootfs/data/home/workspace/<file>`, which does not
+    /// exist — so every workspace file failed share/save as "missing"
+    /// even though the file list (read through the guest, where the
+    /// bind mount is visible) showed it. When the workspace mount
+    /// failed at boot the guest wrote into `data/home/workspace`
+    /// instead; that location is the second candidate, so those
+    /// files still resolve.
     private static func resolveGuest(_ path: String) -> URL? {
         guard path.hasPrefix("/") else { return nil }
         let fm = FileManager.default
-        let root = guestDataURL
         var segments = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         var resolved: [String] = []
         var links = 0
@@ -107,32 +127,59 @@ public final class FilesPlugin: NSObject, FlutterPlugin, UIDocumentInteractionCo
                 break
             }
             resolved.append(segment)
-            var host = root
-            for part in resolved { host.appendPathComponent(part) }
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: host.path, isDirectory: &isDir) else { continue }
-            // A symlink in the guest world: follow it in the guest namespace.
+            // First host location that exists; a symlink there is
+            // followed in the guest namespace (see below).
+            let hosts = hostCandidates(forGuestSegments: resolved)
+            guard let host = hosts.first(where: { fm.fileExists(atPath: $0.path) }) else { continue }
             guard (try? host.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true else { continue }
             links += 1
             guard links <= 16 else { return nil }
             guard var target = try? fm.destinationOfSymbolicLink(atPath: host.path) else { return nil }
             resolved.removeLast()
             if target.hasPrefix("/") {
-                // Absolute guest target: restart from the guest root.
+                // Absolute guest target: restart from the guest root
+                // (the target may live under a different host root,
+                // e.g. a workspace link to /etc/hostname).
                 resolved.removeAll()
             } else {
                 // Relative target: splice it in place of the symlink.
+                // ".." segments stay in the guest namespace and clamp
+                // at the guest root, so they can never escape into the
+                // wrong host tree.
                 target = target.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             }
             let targetSegments = target.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
             segments = targetSegments + segments
         }
-        var host = root
-        for part in resolved { host.appendPathComponent(part) }
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: host.path, isDirectory: &isDir), !isDir.boolValue,
-              fm.isReadableFile(atPath: host.path) else { return nil }
-        return host
+        // Final file: first candidate that is a readable regular file.
+        for host in hostCandidates(forGuestSegments: resolved) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: host.path, isDirectory: &isDir), !isDir.boolValue,
+               fm.isReadableFile(atPath: host.path) {
+                return host
+            }
+        }
+        return nil
+    }
+
+    /// Host locations for a guest path ([segments] from the guest root),
+    /// best first. `/home/workspace/…` is bind-mounted to the host
+    /// workspace dir; when that mount failed at boot the guest wrote
+    /// into `data/home/workspace` instead, so both are candidates.
+    /// Any other guest path has exactly one location, under the
+    /// rootfs data dir. A path like `/home/workspace2/…` is NOT a
+    /// workspace path (exact second segment required).
+    private static func hostCandidates(forGuestSegments segments: [String]) -> [URL] {
+        if segments.count >= 2, segments[0] == "home", segments[1] == "workspace" {
+            var workspace = ISHRuntime.hostWorkspaceURL
+            for part in segments.dropFirst(2) { workspace.appendPathComponent(part) }
+            var data = guestDataURL
+            for part in segments { data.appendPathComponent(part) }
+            return [workspace, data]
+        }
+        var data = guestDataURL
+        for part in segments { data.appendPathComponent(part) }
+        return [data]
     }
 
     // MARK: - saveToDownloads

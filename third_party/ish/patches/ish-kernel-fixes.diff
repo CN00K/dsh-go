@@ -9,12 +9,58 @@
 #   writable container dir (NSTemporaryDirectory); the default
 #   "/tmp/ishsock" is outside the iOS sandbox. Also hardens the
 #   sun_path sprintf to snprintf (ENAMETOOLONG on truncation).
-# P1 (proc-fd magic link): kernel/fs.c — sys_openat intercepts
+# P1 (proc-fd magic link, open path): kernel/fs.c — sys_openat intercepts
 #   /proc/<pid>/fd/<n>, /dev/fd/<n> and /dev/std{in,out,err} and dups the
 #   target fd, instead of resolving procfs's "anon_inode:[...]"
 #   readlink string as a path (which always ENOENTs for pipes/ttys).
 #   The /dev/fd + /dev/std* symlinks themselves are created by the app
 #   in ISHKernel.m createDeviceNodes (not in the kernel source).
+# ENV-09 (proc-fd magic link, stat path): fs/stat.c + kernel/fs.c +
+#   kernel/fs.h — the open-path resolver is factored out as
+#   proc_fd_magic_link_target() and reused by generic_statat: stat /
+#   fstatat / statx with follow now fstats the target fd directly, so
+#   `stat -L /proc/self/fd/0` returns fifo / char device instead of
+#   ENOENT (lstat is untouched — it still reports the link itself).
+#   Also adds /proc/<pid>/comm (fs/proc/pid.c, from task->comm).
+#   /proc/1/cmdline stays empty by design: pid 1 never execs in dsh-go
+#   (ISHKernel.m creates it with become_first_process; every command runs
+#   as a become_new_init_child + do_execve child), so there is no argv
+#   to report and none is fabricated.
+# ENV-08 (df hides the root fs): fs/fake.c — fakefs_statfs() reports the
+#   host volume backing the rootfs directory (fstatvfs on the mount's
+#   root_fd, statvfs on the source path as fallback), checks the return
+#   value, and only accepts results with real blocks; if both probes
+#   fail it returns the host errno instead of fabricating numbers.
+#   Replaces the old reuse of realfs_statfs, which ignored fstatvfs
+#   failures and returned all zeros — and df skips zero-block filesystems.
+# ENV-05 (ulimit -n 1024): kernel/init.c — init_rlimits RLIMIT_NOFILE
+#   {1024, 4096} -> {4096, 8192}. The soft limit is what `ulimit -n`
+#   reports and what the fd table enforces (f_install_start /
+#   fdtable_expand in fs/fd.c refuse new fds at the soft limit). The host
+#   process's own RLIMIT_NOFILE is the outer bound and must be raised by
+#   the app at startup (ISHKernel.m, before the kernel starts); without
+#   it, guest opens past the host limit fail with EMFILE — graceful,
+#   never a crash.
+#
+# ENV-13 (dsh-go env fix, 2026-11-17): kernel/exec.c + xX_main_Xx.h —
+#   the sys_execve force-injection table and the initial-exec table
+#   injected PYTHONMALLOC=malloc (mode=1: always replaced, so no
+#   user value could override it), PYTHONDONTWRITEBYTECODE=1 (blocked
+#   all .pyc caching — ENV-03: pip recompiled ~100 modules from
+#   source on every run and routinely exceeded the 60s timeout),
+#   GOMAXPROCS=2 and UV_THREADPOOL_SIZE=1 into EVERY guest process.
+#   All four are REMOVED here. Go then defaults to runtime.NumCPU
+#   and libuv to its default pool; the bridge sets
+#   PYTHONDONTWRITEBYTECODE=0 (guestEnv), which also neutralises
+#   kernels built before this patch (mode-0: only if absent).
+#   KEPT: NO_COLOR=1, PIP_PROGRESS_BAR=off (deliberate — clean tool
+#   output), GODEBUG=asyncpreemptoff=1 (correctness: the JIT delivers
+#   signals at gadget boundaries, so async preemption is unsafe).
+#   KNOWN RISK: the old GOMAXPROCS=2 cap also suppressed TLB
+#   stale-pointer crashes from concurrent page-table writes. If Go
+#   multi-thread crashes reappear after this lands, re-add a cap —
+#   scaled to the CPU count, not 2 — instead of reverting wholesale.
+#
 #
 # NOT fixed here (see the 2026-11-16 defect report): signalfd4 /
 # memfd_create need real implementations (not stubs); clone3 already
@@ -22,6 +68,123 @@
 # openat2 / epoll_pwait2 / io_uring_setup are deliberate stubs with
 # working libc fallbacks; the pty question is app-layer (agent exec
 # uses pipes by design; the interactive terminal already has a pty).
+diff --git a/fs/fake.c b/fs/fake.c
+index ab3f82b7..e6c2d1e0 100644
+--- a/fs/fake.c
++++ b/fs/fake.c
+@@ -5,6 +5,7 @@
+ #include <string.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <sys/statvfs.h>
+ #include <sys/file.h>
+ #include <sqlite3.h>
+ #include <unistd.h>
+@@ -1453,11 +1454,64 @@ static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
+     db_commit(fs);
+ }
+ 
++// ENV-08: statfs for the fake root filesystem.
++//
++// fakefs has no block device of its own — its files live in the host
++// directory the mount's root_fd points at (see fakefs_mount, which opens
++// it via realfs.mount) — so report the host volume backing that directory.
++// This matters because df only lists filesystems with f_blocks > 0
++// (BusyBox df.c: a mount is printed only if f_blocks > 0, unless it was
++// named on the command line or -a was given): the old code reused
++// realfs_statfs, which IGNORED fstatvfs's return value, so a failed
++// fstatvfs silently produced an all-zero result and `df` hid the root
++// filesystem entirely.
++//
++// Two probes, best-effort: fstatvfs on the mount's root_fd first (no path
++// lookup, works even if the source path has since moved), then statvfs on
++// the mount source path as a fallback. A result only counts if it carries
++// real blocks; a zero-block success is treated the same as a failure, so a
++// degenerate host volume cannot hide the row again. If both probes fail,
++// return the host errno instead of fabricating numbers — a visible error
++// beats a df row that lies about free space. The type field is filled in
++// by mount_statfs from the fs magic (0x66616b65, "fake").
++static int fakefs_statfs(struct mount *mount, struct statfsbuf *stat) {
++    struct statvfs vfs = {};
++    int saved_errno = 0;
++    int ok = 0;
++    if (fstatvfs(mount->root_fd, &vfs) == 0 && vfs.f_blocks > 0)
++        ok = 1;
++    else
++        saved_errno = errno;
++    if (!ok) {
++        if (statvfs(mount->source, &vfs) == 0 && vfs.f_blocks > 0)
++            ok = 1;
++        else
++            saved_errno = errno;
++    }
++    if (!ok) {
++        errno = saved_errno != 0 ? saved_errno : EIO;
++        return errno_map();
++    }
++
++    // Defensive clamps: the host numbers should already be consistent, but
++    // a zero block size or an avail/free count above the total would make df
++    // print nonsense (or divide by zero downstream).
++    stat->bsize = vfs.f_bsize != 0 ? (long) vfs.f_bsize : 4096;
++    stat->frsize = vfs.f_frsize != 0 ? (long) vfs.f_frsize : stat->bsize;
++    stat->blocks = vfs.f_blocks;
++    stat->bfree = vfs.f_bfree > vfs.f_blocks ? vfs.f_blocks : vfs.f_bfree;
++    stat->bavail = vfs.f_bavail > stat->bfree ? stat->bfree : vfs.f_bavail;
++    stat->files = vfs.f_files;
++    stat->ffree = vfs.f_ffree > vfs.f_files ? vfs.f_files : vfs.f_ffree;
++    stat->namelen = vfs.f_namemax;
++    return 0;
++}
++
+ const struct fs_ops fakefs = {
+     .name = "fake", .magic = 0x66616b65,
+     .mount = fakefs_mount,
+     .umount = fakefs_umount,
+-    .statfs = realfs_statfs,
++    .statfs = fakefs_statfs,
+     .open = fakefs_open,
+     .readlink = fakefs_readlink,
+     .link = fakefs_link,
+diff --git a/fs/proc/pid.c b/fs/proc/pid.c
+index 2920f525..107ddcea 100644
+--- a/fs/proc/pid.c
++++ b/fs/proc/pid.c
+@@ -207,6 +207,26 @@ out_free_task:
+     return err;
+ }
+ 
++// ENV-09 (follow-up): /proc/<pid>/comm did not exist at all. Linux tools
++// (ps, pgrep, htop) read it for the 15-char task name; iSH already tracks
++// it as task->comm (set from the executable basename at exec, read under
++// general_lock like proc_pid_stat_show does). Note cmdline is intentionally
++// NOT changed here: it is already correct for every exec'd process, and
++// the one empty case, /proc/1/cmdline, is empty because pid 1 never execs
++// in dsh-go (ISHKernel.m creates it with become_first_process and runs
++// every command as a become_new_init_child + do_execve child), so there
++// is no argv to report — fabricating one would be lying.
++static int proc_pid_comm_show(struct proc_entry *entry, struct proc_data *buf) {
++    struct task *task = proc_get_task(entry);
++    if (task == NULL)
++        return _ESRCH;
++    lock(&task->general_lock);
++    proc_printf(buf, "%s\n", task->comm);
++    unlock(&task->general_lock);
++    proc_put_task(task);
++    return 0;
++}
++
+ void proc_maps_dump(struct task *task, struct proc_data *buf) {
+     struct mem *mem = task->mem;
+     if (mem == NULL)
+@@ -407,6 +427,7 @@ static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
+ struct proc_children proc_pid_children = PROC_CHILDREN({
+     {"auxv", .show = proc_pid_auxv_show},
+     {"cmdline", .show = proc_pid_cmdline_show},
++    {"comm", .show = proc_pid_comm_show},
+     {"cwd", S_IFLNK, .readlink = proc_pid_cwd_readlink},
+     {"exe", S_IFLNK, .readlink = proc_pid_exe_readlink},
+     {"fd", S_IFDIR, .readdir = proc_pid_fd_readdir},
 diff --git a/fs/sock.c b/fs/sock.c
 index 58dc3e32..fc692386 100644
 --- a/fs/sock.c
@@ -85,11 +248,98 @@ index ed34b517..51262c95 100644
  int_t sys_socketcall(dword_t call_num, addr_t args_addr);
  
  int_t sys_socket(dword_t domain, dword_t type, dword_t protocol);
+diff --git a/fs/stat.c b/fs/stat.c
+index 33f0234f..0647f068 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -1,3 +1,4 @@
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <limits.h>
+@@ -5,6 +6,7 @@
+ #include "kernel/calls.h"
+ #include "kernel/errno.h"
+ #include "kernel/fs.h"
++#include "kernel/task.h"
+ #include "fs/fd.h"
+ #include "fs/path.h"
+ 
+@@ -56,7 +58,69 @@ struct stat_arm64 stat_convert_arm64(struct statbuf stat) {
+     return arm64stat;
+ }
+ 
++// Build the absolute path of path_raw as seen from dirfd at, for magic-link
++// matching (which only matches absolute paths). Returns 0 on success, -1 if
++// the path cannot be made absolute; the caller then falls through to normal
++// resolution, so a failure here is never fatal.
++static int stat_make_absolute(struct fd *at, const char *path_raw, char *out, size_t out_size) {
++    if (path_raw[0] == '/') {
++        if (strlen(path_raw) >= out_size)
++            return -1;
++        strcpy(out, path_raw);
++        return 0;
++    }
++    // Relative: resolve against the at directory (AT_PWD = caller's cwd),
++    // mirroring path_normalize's base selection. Retain the cwd fd while
++    // the lock is held: a sibling thread sharing fs_info could chdir and
++    // drop the last reference to it between the lookup and the getpath.
++    struct fd *base = at;
++    int retained = 0;
++    if (at == AT_PWD) {
++        lock(&current->fs->lock);
++        base = fd_retain(current->fs->pwd);
++        unlock(&current->fs->lock);
++        retained = 1;
++    }
++    if (base == NULL)
++        return -1;
++    char at_path[MAX_PATH];
++    int err = generic_getpath(base, at_path);
++    if (retained)
++        fd_close(base);
++    if (err < 0)
++        return -1;
++    if (snprintf(out, out_size, "%s%s%s", at_path,
++                 strcmp(at_path, "/") == 0 ? "" : "/", path_raw) >= (int) out_size)
++        return -1;
++    return 0;
++}
++
+ int generic_statat(struct fd *at, const char *path_raw, struct statbuf *stat, bool follow_links) {
++    if (follow_links) {
++        // Magic links: /proc/<pid>/fd/<n>, /dev/fd/<n>, /dev/std{in,out,err}.
++        // Build 22 fixed the OPEN path (sys_openat dups the target fd); stat
++        // with follow was still broken: path_normalize resolves the final
++        // component through procfs's readlink, which returns
++        // "anon_inode:[...]" for pipes, ttys and sockets, and that string is
++        // not a path, so stat -L /proc/self/fd/0 always failed with ENOENT.
++        // Resolve the target fd directly and fstat it instead, before any
++        // path normalization runs. lstat (follow_links == false) is
++        // deliberately NOT intercepted: it must report the link itself.
++        char abs_path[MAX_PATH];
++        if (stat_make_absolute(at, path_raw, abs_path, sizeof(abs_path)) == 0) {
++            int err = 0;
++            struct fd *target = proc_fd_magic_link_target(abs_path, &err);
++            if (target != NULL) {
++                int ferr = target->mount->fs->fstat(target, stat);
++                fd_close(target);
++                return ferr;
++            }
++            if (err < 0)
++                return err;
++        }
++        // Not a magic link (or the path could not be made absolute): fall
++        // through to normal resolution below.
++    }
+     char path[MAX_PATH];
+     int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
+     if (err < 0)
 diff --git a/kernel/fs.c b/kernel/fs.c
-index 554d8220..85c8ac54 100644
+index 554d8220..d6f07289 100644
 --- a/kernel/fs.c
 +++ b/kernel/fs.c
-@@ -66,12 +66,122 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags)
+@@ -66,12 +66,153 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags)
      return err;
  }
  
@@ -112,12 +362,15 @@ index 554d8220..85c8ac54 100644
 +
 +// Magic links: /proc/<pid>/fd/<n>, /dev/fd/<n>, /dev/std{in,out,err}.
 +//
-+// Returns 1 if path is exactly a proc-fd magic link (result set to the new
-+// fd number, or a negative errno when the target does not exist), 0 if not
-+// a magic link (the caller does the normal open). Only absolute paths are
-+// matched; a relative path, a trailing slash, or extra components do not
-+// match and fall through to normal resolution.
-+static int try_proc_fd_magic_link(const char *path, dword_t flags, fd_t *result) {
++// Resolves the path to the target fd (retained; the caller owns one
++// reference and must fd_close() it), or NULL. *err is 0 when the path is
++// not a magic link at all, and a negative errno when it IS one but the
++// target task/fd does not exist. Only absolute paths are matched; a
++// relative path, a trailing slash, or extra components do not match.
++// Shared by the open path (try_proc_fd_magic_link, dup semantics) and the
++// stat path (generic_statat, fstat of the target fd): both must agree on
++// what counts as a magic link, or stat -L and open would disagree.
++struct fd *proc_fd_magic_link_target(const char *path, int *err) {
 +    int fdnum = -1;
 +    int is_self = 0;
 +    dword_t pid = 0;
@@ -128,8 +381,10 @@ index 554d8220..85c8ac54 100644
 +    else if (strncmp(path, "/dev/fd/", 8) == 0) {
 +        const char *p = path + 8;
 +        fdnum = parse_decimal(&p);
-+        if (fdnum < 0 || *p != '\0')
-+            return 0;
++        if (fdnum < 0 || *p != '\0') {
++            *err = 0;
++            return NULL;
++        }
 +        is_self = 1;
 +    } else if (strncmp(path, "/proc/", 6) == 0) {
 +        const char *p = path + 6;
@@ -138,19 +393,26 @@ index 554d8220..85c8ac54 100644
 +            is_self = 1;
 +        } else {
 +            int v = parse_decimal(&p);
-+            if (v <= 0 || *p != '/')
-+                return 0;
++            if (v <= 0 || *p != '/') {
++                *err = 0;
++                return NULL;
++            }
 +            pid = (dword_t) v;
 +            p++; // skip '/'
 +        }
-+        if (strncmp(p, "fd/", 3) != 0)
-+            return 0;
++        if (strncmp(p, "fd/", 3) != 0) {
++            *err = 0;
++            return NULL;
++        }
 +        p += 3;
 +        fdnum = parse_decimal(&p);
-+        if (fdnum < 0 || *p != '\0')
-+            return 0;
++        if (fdnum < 0 || *p != '\0') {
++            *err = 0;
++            return NULL;
++        }
 +    } else {
-+        return 0;
++        *err = 0;
++        return NULL;
 +    }
 +
 +    // Resolve the owning task. "self" is the running task (no lookup, no
@@ -168,8 +430,8 @@ index 554d8220..85c8ac54 100644
 +            task = NULL;
 +        if (task == NULL) {
 +            unlock(&pids_lock);
-+            *result = _ESRCH;
-+            return 1;
++            *err = _ESRCH;
++            return NULL;
 +        }
 +    }
 +
@@ -183,11 +445,30 @@ index 554d8220..85c8ac54 100644
 +    if (held_pids_lock)
 +        unlock(&pids_lock);
 +    if (fd == NULL) {
-+        *result = _ENOENT;
++        *err = _ENOENT;
++        return NULL;
++    }
++    *err = 0;
++    return fd;
++}
++
++// Open-path wrapper: dup semantics for a magic link.
++//
++// Returns 1 if path is exactly a proc-fd magic link (result set to the new
++// fd number, or a negative errno when the target does not exist), 0 if not
++// a magic link (the caller does the normal open).
++static int try_proc_fd_magic_link(const char *path, dword_t flags, fd_t *result) {
++    int err = 0;
++    struct fd *fd = proc_fd_magic_link_target(path, &err);
++    if (fd == NULL) {
++        if (err == 0)
++            return 0;
++        *result = err;
 +        return 1;
 +    }
 +    // Dup semantics: the new fd refers to the same open file description.
-+    // f_install also honours O_CLOEXEC / O_NONBLOCK from flags.
++    // f_install also honours O_CLOEXEC / O_NONBLOCK from flags, and drops
++    // the retained reference if installation fails.
 +    *result = f_install(fd, (int) flags);
 +    return 1;
 +}
@@ -212,3 +493,114 @@ index 554d8220..85c8ac54 100644
      if (flags & O_CREAT_)
          apply_umask(&mode);
  
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 0e9c2103..0a41ffeb 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -63,6 +63,12 @@ int generic_seek(struct fd *fd, off_t_ off, int whence, size_t size);
+ #define AC_F 0
+ int generic_accessat(struct fd *dirfd, const char *path, int mode);
+ int generic_statat(struct fd *at, const char *path, struct statbuf *stat, bool follow_links);
++// Resolve a proc-fd magic link (/proc/<pid>/fd/<n>, /dev/fd/<n>,
++// /dev/std{in,out,err}) to its target fd. Defined in kernel/fs.c; shared
++// by the open path (dup semantics) and the stat path (fstat of the target).
++// Returns the retained target fd, or NULL. *err is 0 when the path is not
++// a magic link, a negative errno when it is one but unresolvable.
++struct fd *proc_fd_magic_link_target(const char *path, int *err);
+ int generic_setattrat(struct fd *at, const char *path, struct attr attr, bool follow_links);
+ int generic_utime(struct fd *at, const char *path, struct timespec atime, struct timespec mtime, bool follow_links);
+ ssize_t generic_readlinkat(struct fd *at, const char *path, char *buf, size_t bufsize);
+diff --git a/kernel/init.c b/kernel/init.c
+index 5fb8db9d..416011d7 100644
+--- a/kernel/init.c
++++ b/kernel/init.c
+@@ -41,7 +41,18 @@ static struct rlimit_ init_rlimits[16] = {
+     [RLIMIT_CORE_]       = {0, RLIM_INFINITY_},
+     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
+     [RLIMIT_NPROC_]      = {1024, 1024},
+-    [RLIMIT_NOFILE_]     = {1024, 4096},
++    // ENV-05: the soft limit is what `ulimit -n` reports and what the fd
++    // table enforces (f_install_start / fdtable_expand in fs/fd.c refuse
++    // new fds at rlimit(RLIMIT_NOFILE_)), so 1024 was the real ceiling for
++    // npm/tsc-style workloads. Soft 4096 is the target; hard 8192 lets a
++    // process raise itself further (ulimit -n 8192 / setrlimit) when the
++    // host allows it. Note the outer bound is the HOST process's own
++    // RLIMIT_NOFILE: every guest fd that maps to a real file, pipe or
++    // socket consumes a host fd, so the app must also raise the host limit
++    // at startup (ISHKernel.m, before the kernel starts) for the full
++    // 4096 to be usable. If the host limit is lower, host open() fails
++    // with EMFILE and the guest sees EMFILE — graceful, never a crash.
++    [RLIMIT_NOFILE_]     = {4096, 8192},
+     [RLIMIT_MEMLOCK_]    = {64*1024, 64*1024},
+     [RLIMIT_AS_]         = {RLIM_INFINITY_, RLIM_INFINITY_},
+     [RLIMIT_LOCKS_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 26fd317..c8fbd66 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -879,25 +879,31 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
+     // Force-inject environment variables into every execve'd process.
+     // mode=0: inject only if not present, mode=1: replace existing value
+     static const struct { const char *kv; size_t prefix_len; int mode; } inject_envs[] = {
+-        { "PYTHONMALLOC=malloc", 13, 1 },      // FORCE bypass pymalloc arenas (mode=1: always replace)
++        // ENV-13 (dsh-go, 2026-11-17): PYTHONMALLOC=malloc (mode=1, forced)
++        // and PYTHONDONTWRITEBYTECODE=1 were injected here and are now
++        // REMOVED. PYTHONMALLOC=malloc disabled pymalloc (slower Python)
++        // and PYTHONDONTWRITEBYTECODE=1 blocked all .pyc caching, which
++        // made pip recompile ~100 modules from source on every run
++        // (ENV-03: pip --version routinely exceeded the 60s timeout).
++        // The bridge also sets PYTHONDONTWRITEBYTECODE=0 (guestEnv),
++        // which neutralises pre-patch kernels (mode-0: only if absent).
+         { "NO_COLOR=1", 9, 0 },                // Disable color output
+         { "PIP_PROGRESS_BAR=off", 17, 0 },     // Disable pip progress bar
+-        { "PYTHONDONTWRITEBYTECODE=1", 25, 0 }, // Skip .pyc generation to reduce allocs
+         // Go async preemption sends SIGURG and reads/modifies mcontext at a
+         // fixed offset. Our JIT delivers signals at gadget boundaries, not at
+         // the exact interrupted instruction, so the PC in the signal frame is
+         // imprecise. cpu_poke reduces latency but can't fix PC precision.
+         // Cooperative preemption (function-call checkpoints) works correctly.
+         { "GODEBUG=asyncpreemptoff=1", 8, 0 }, // Disable Go async preemption
+-        // Limit Go threads to reduce TLB stale-pointer crashes from concurrent
+-        // page table modifications. GOMAXPROCS=2 is sufficient for most Go CLI
+-        // tools and eliminates nearly all multi-thread race conditions.
+-        { "GOMAXPROCS=2", 11, 0 },             // Limit Go thread count
+-        // libuv's default worker pool is 4 threads. On iSH jitless node,
+-        // short scripts never use them but pay the futex sync cost. Setting
+-        // to 1 saves ~1s on `node -e 0`. Apps that genuinely need more
+-        // worker threads can override via the user environment (mode=0).
+-        { "UV_THREADPOOL_SIZE=1", 19, 0 },
++        // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS was force-injected
++        // here (=2) and is now REMOVED — Go defaults to runtime.NumCPU.
++        // (The old cap's rationale — fewer TLB stale-pointer crashes
++        // from concurrent page-table writes — is a known risk; if Go
++        // multi-thread crashes reappear, re-add a cap, scaled, not 2.)
++        // ENV-13 (dsh-go, 2026-11-17): UV_THREADPOOL_SIZE was
++        // force-injected here (=1) and is now REMOVED — libuv defaults
++        // to 4. (The old =1 saved ~1s on `node -e 0`; the bridge no
++        // longer re-adds it either — see ish-bridge.mjs guestEnv.)
+     };
+     for (size_t vi = 0; vi < sizeof(inject_envs)/sizeof(inject_envs[0]); vi++) {
+         char *e = envp;
+
+diff --git a/xX_main_Xx.h b/xX_main_Xx.h
+index 22f1435..3e22217 100644
+--- a/xX_main_Xx.h
++++ b/xX_main_Xx.h
+@@ -207,13 +207,11 @@ do_exec:
+         // These are injected only if not already present.
+         static const char *inject_vars[] = {
+             "GODEBUG=asyncpreemptoff=1",  // Disable Go async preemption
+-            "GOMAXPROCS=2",               // Limit Go thread count
+             "NO_COLOR=1",                 // Disable color output
+-            "PYTHONMALLOC=malloc",        // Bypass pymalloc arenas
+-            "PYTHONDONTWRITEBYTECODE=1",  // Skip .pyc generation
+-            // Reduce libuv worker pool from 4→1: short scripts never use them
+-            // but pay the futex sync cost. Saves ~1s on `node -e 0`.
+-            "UV_THREADPOOL_SIZE=1",
++            // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS, PYTHONMALLOC,
++            // PYTHONDONTWRITEBYTECODE and UV_THREADPOOL_SIZE were
++            // injected here and are now REMOVED (same reason as the
++            // sys_execve table in kernel/exec.c). Kept: GODEBUG, NO_COLOR.
+         };
+         for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
+             // Check if already present (search by prefix up to '=')

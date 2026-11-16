@@ -10,14 +10,21 @@
 //  Endpoints (design §2.4(c)):
 //    GET  /ish/status  — readiness probe (200 when booted, 503 when not)
 //    POST /ish/exec    — one-shot command, chunked NDJSON stream
-//         body {command, stdinData?, cwd?, env?, fsContext?, timeoutMs?}
+//         body {command, stdinData?, cwd?, env?, fsContext?, timeoutMs?,
+//               tty?, cols?, rows?}
 //         response: NDJSON {stream: "stdout"/"stderr", line} frames +
 //         terminal frame {exitCode, durationMs}
 //         (timeout: {exitCode: -3, timedOut: true, partialOutput})
+//         tty exec: body tty:true runs the command on a fresh fake
+//         PTY (merged stream, isStderr always "stdout"); the terminal
+//         frame adds {tty: true}. Refused with 429 when the kernel's
+//         PTY session cap is reached.
 //    WS   /ish/pty     — interactive terminal: binary frames carry raw
 //         PTY bytes both ways; JSON control frames {type: "resize",
-//         cols, rows} / {type: "close"}. Server kills the Guest process
-//         group when the socket disconnects.
+//         cols, rows} / {type: "close"}. The server sends one text
+//         frame right after the upgrade: {type: "session",
+//         sessionId} — the kernel session id for this socket. Server
+//         kills the Guest process group when the socket disconnects.
 //
 //  BYTE STREAM (the 2.3 log-ring fix, done properly here): guest output
 //  is a byte stream, not lines. /ish/exec accumulates bytes in a
@@ -29,12 +36,18 @@
 //  UTF-8 sequence. /ish/pty forwards raw PTY bytes with no line
 //  splitting at all.
 //
-//  PTY SESSIONS: ISHKernel's interactive path is a single shared
-//  _consoleTTY, so at most ONE /ish/pty session is active at a time.
-//  A second WebSocket connection while one is active is closed with
-//  code 1008 (policy violation). Each session spawns its own /bin/sh;
+//  PTY SESSIONS (stage 5.3, multi-terminal): ISHKernel routes every
+//  guest PTY write to the session that owns its tty (per-session
+//  buffer + output handler), so any number of /ish/pty sessions up to
+//  ISHPtyMaxSessions (8) can be live at once. Each WSConnection owns
+//  exactly one PTYSession (one kernel session id, one guest /bin/sh);
 //  on disconnect (or shell exit) the shell's process group is killed
-//  (ISHShellExecutor.killProcessGroup), never pid 1, never halt_system.
+//  (ISHShellExecutor.killProcessGroup via ISHKernel.closePtySession),
+//  never pid 1, never halt_system. The old single-session 1008 refusal
+//  now only fires at the cap. Output routing no longer goes through
+//  ISHRuntime.ptyOutputSink (that sink can only point at ONE session);
+//  each session registers its own kernel output handler, and the
+//  legacy outputCallback fan-out still feeds the dsh/ish log ring.
 //
 //  TRANSPORT: Network framework NWListener (TCP, 127.0.0.1, port 0).
 //  HTTP/1.1 and WebSocket framing are implemented here by hand (no
@@ -96,8 +109,9 @@ final class IShLoopbackService {
   private var startCalled = false
   private var startCount = 0
 
-  /// The single active PTY session (nil when none). Guarded by `queue`.
-  private var ptySession: PTYSession?
+  /// Live PTY sessions by kernel session id (nil when none).
+  /// Guarded by `queue`.
+  private var ptySessions: [String: PTYSession] = [:]
 
   /// Live client connections, retained until they close (otherwise the
   /// HTTPConnection would deallocate mid-request). Guarded by `queue`.
@@ -212,15 +226,12 @@ final class IShLoopbackService {
     }
   }
 
-  /// Stop listening, close the PTY session (kills its shell), remove
-  /// the token file. Idempotent.
+  /// Stop listening, close all PTY sessions (kills their shells),
+  /// remove the token file. Idempotent.
   func stop() {
     queue.async { [weak self] in
       guard let self else { return }
-      if let session = self.ptySession {
-        // close() clears ptySession + the output sink via
-        // clearPTYSession (do not nil ptySession first — the sink
-        // would leak).
+      for session in self.ptySessions.values {
         session.close(reason: "service stopped")
       }
       self.listener?.cancel()
@@ -317,34 +328,39 @@ final class IShLoopbackService {
     return diff == 0
   }
 
-  /// Forward raw PTY bytes to the active session (called from
-  /// ISHRuntime.ptyOutputSink on the main queue).
-  fileprivate func forwardPTYOutput(_ data: Data) {
+  /// Forward raw PTY bytes to one session (called from that
+  /// session's kernel output handler on the main queue).
+  fileprivate func forwardPTYOutput(_ data: Data, sessionId: String) {
     queue.async { [weak self] in
-      guard let self, let session = self.ptySession, !session.closed else { return }
+      guard let self, let session = self.ptySessions[sessionId], !session.closed else { return }
       session.sendBinary(data)
     }
   }
 
-  /// Register the active PTY session (called by HTTPConnection after a
-  /// successful /ish/pty upgrade). Returns false if one is already
-  /// active (the caller then closes the new connection with 1008).
+  /// Register a PTY session (called by WSConnection after spawning
+  /// its shell). Returns false when the session cap is already
+  /// reached (the caller then closes the new connection with 1008).
+  /// Registers the session's kernel output handler, so the kernel
+  /// routes that tty's bytes to exactly this session.
   fileprivate func registerPTYSession(_ session: PTYSession) -> Bool {
     // Called on `queue` (HTTPConnection runs there).
-    if ptySession != nil { return false }
-    ptySession = session
-    ISHRuntime.ptyOutputSink = { [weak self] data in
-      self?.forwardPTYOutput(data)
-    }
+    if ptySessions.count >= Int(ISHPtyMaxSessions) { return false }
+    if ptySessions[session.id] != nil { return false }
+    ptySessions[session.id] = session
+    let sessionId = session.id
+    ISHKernel.shared.setPtyOutputHandler({ [weak self] data in
+      self?.forwardPTYOutput(data, sessionId: sessionId)
+    }, forSession: sessionId)
     return true
   }
 
-  /// Clear the active PTY session (called when it ends). Idempotent.
+  /// Clear a PTY session (called when it ends). Idempotent. Also
+  /// clears the session's kernel output handler.
   fileprivate func clearPTYSession(_ session: PTYSession) {
     // Called on `queue`.
-    if ptySession === session {
-      ptySession = nil
-      ISHRuntime.ptyOutputSink = nil
+    if ptySessions[session.id] === session {
+      ptySessions.removeValue(forKey: session.id)
+      ISHKernel.shared.setPtyOutputHandler(nil, forSession: session.id)
     }
   }
 }
@@ -522,6 +538,7 @@ private final class HTTPConnection {
         "booted": true,
         "guestProcessCount": Int(n),
         "guestMemoryBytes": Int(anon),
+        "ptySessions": Int(kernel.ptySessionCount()),
       ])
     } else {
       sendJSON(status: 503, reason: "Service Unavailable", object: [
@@ -634,30 +651,83 @@ extension HTTPConnection {
     var timeoutMs = 30_000
     if let n = json["timeoutMs"] as? NSNumber { timeoutMs = n.intValue }
     timeoutMs = max(1_000, min(timeoutMs, 900_000))
+    // ENV-14: per-exec nonce for the session-cwd marker. Hex only,
+    // capped at 64 chars; anything else is ignored (no marker), so a
+    // malformed client can never inject shell syntax through it.
+    let cwdNonce: String? = {
+      guard let nonce = json["cwdNonce"] as? String, !nonce.isEmpty, nonce.count <= 64,
+            nonce.unicodeScalars.allSatisfy({ ($0.value >= 48 && $0.value <= 57)
+              || ($0.value >= 97 && $0.value <= 102) }) else { return nil }
+      return nonce
+    }()
+    // PTY exec (stage 5.3, ENV-02): tty:true runs the command on a
+    // fresh fake PTY (merged stream) instead of host pipes. The flag
+    // is the "has pty" contract with the bridge (see ish-bridge.mjs):
+    // absent/false means the pipe path, exactly as before.
+    let tty = (json["tty"] as? Bool) ?? false
+    var cols = 80
+    var rows = 24
+    if let n = json["cols"] as? NSNumber { cols = n.intValue }
+    if let n = json["rows"] as? NSNumber { rows = n.intValue }
+    cols = max(2, min(cols, 500))
+    rows = max(1, min(rows, 200))
     let shellCommand = Self.buildShellCommand(
       command: command,
       cwd: json["cwd"] as? String,
-      env: json["env"] as? [String: String])
+      env: json["env"] as? [String: String],
+      cwdNonce: cwdNonce)
     guard ISHKernel.shared.isBooted else {
       sendJSON(status: 503, reason: "Service Unavailable", object: ["error": "ish_not_booted"])
       return
     }
-    let session = ExecSession(connection: self)
+    let session = ExecSession(connection: self, cwdNonce: cwdNonce)
     execSession = session
-    session.start(command: shellCommand, stdinData: stdinData,
-                  fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0)
+    if tty {
+      // Cap pre-check (stage 5.3): refuse with 429 BEFORE any
+      // headers are sent, so the bridge sees a typed failure instead
+      // of a -1 terminal frame. Racy by one spawn (another session
+      // can open between the check and the start); the loser then
+      // fails with the executor's -1 creation-failed frame instead
+      // — same code as any other failed start, documented in
+      // ISHShellExecutor.runTtyRecord.
+      if ISHKernel.shared.ptySessionCount() >= Int(ISHPtyMaxSessions) {
+        sendJSON(status: 429, reason: "Too Many Requests",
+                 object: ["error": "pty_session_limit"])
+        return
+      }
+      session.startTty(command: shellCommand, stdinData: stdinData,
+                       fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0,
+                       cols: cols, rows: rows)
+    } else {
+      session.start(command: shellCommand, stdinData: stdinData,
+                    fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0)
+    }
   }
 
-  /// Single-quote a string for /bin/sh (ash). Embedded single quotes
-  /// become '\'' (close quote, escaped quote, reopen quote).
+  /// Single-quote a string for /bin/bash (quoting is the same as for
+  /// /bin/sh ash). Embedded single quotes become '\'' (close quote,
+  /// escaped quote, reopen quote).
   static func shellQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
   }
 
-  /// Build the /bin/sh -c command from the request: optional env
+  /// Build the /bin/bash -c command from the request: optional env
   /// exports, then an optional cd, then the command itself. Only valid
-  /// shell identifiers are exported (others are ignored).
-  static func buildShellCommand(command: String, cwd: String?, env: [String: String]?) -> String {
+  /// shell identifiers are exported (others are ignored). The shell is
+  /// /bin/bash (ENV-01; ISHShellExecutor.executeCommand), not /bin/sh.
+  ///
+  /// With a cwdNonce, a trailer is appended that prints the shell's
+  /// final cwd as one stderr line (`__DSH_CWD__<nonce>:<cwd>`) and
+  /// preserves the command's exit code (ENV-14: the bridge remembers
+  /// a bare `cd` across execs of one session). The trailer runs after
+  /// the command regardless of its exit code (`;`, not `&&`); it is
+  /// skipped only when the command replaces the shell (`exec`) or
+  /// exits it (`exit`) or the shell is killed — all cases where there
+  /// is no cwd worth remembering. The bridge swallows the marker line
+  /// (it never reaches tool output); ExecSession keeps it out of the
+  /// timeout frame's partialOutput too.
+  static func buildShellCommand(command: String, cwd: String?, env: [String: String]?,
+                                cwdNonce: String? = nil) -> String {
     var prefix = ""
     if let env, !env.isEmpty {
       for key in env.keys.sorted() {
@@ -668,7 +738,11 @@ extension HTTPConnection {
     if let cwd, !cwd.isEmpty {
       prefix += "cd -- \(shellQuote(cwd)) && "
     }
-    return prefix + command
+    var built = prefix + command
+    if let cwdNonce {
+      built += "; _dsh_ec=$?; printf '__DSH_CWD__\(cwdNonce):%s\\n' \"$PWD\" >&2; exit $_dsh_ec"
+    }
+    return built
   }
 
   /// Shell variable names are ASCII [A-Za-z_][A-Za-z0-9_]* (checked
@@ -733,9 +807,18 @@ private final class ExecSession {
   private var partialOutput = ""
   private var finished = false
   private var execution: ISHShellExecution?
+  /// Per-exec nonce for the session-cwd marker (ENV-14), or nil when
+  /// the client did not ask for cwd tracking. The marker line is still
+  /// sent as an NDJSON frame (the bridge needs it) but is kept out of
+  /// partialOutput (see sendLine).
+  private let cwdNonce: String?
+  /// True when this exec runs on a PTY (merged stream; the terminal
+  /// frame reports it so the bridge knows the exec had a tty).
+  private var isTty = false
 
-  init(connection: HTTPConnection) {
+  init(connection: HTTPConnection, cwdNonce: String? = nil) {
     self.connection = connection
+    self.cwdNonce = cwdNonce
   }
 
   func start(command: String, stdinData: Data?, fsContext: UInt64, timeout: TimeInterval) {
@@ -744,6 +827,30 @@ private final class ExecSession {
     let started = Date()
     execution = ISHShellExecutor.shared().executeCommand(
       command, stdinData: stdinData, fsContext: fsContext, timeout: timeout,
+      outputHandler: { [weak self] isStderr, chunk in
+        self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
+      },
+      completion: { [weak self] result in
+        self?.queue.async { [weak self] in self?.onComplete(result: result, started: started) }
+      })
+  }
+
+  /// PTY exec (stage 5.3, ENV-02): the same one-shot shape, but the
+  /// command runs on a fresh fake PTY via
+  /// ISHShellExecutor.executeCommandTty. stdout/stderr are merged —
+  /// onChunk always sees isStderr == false, so every line is
+  /// streamed as "stdout" (documented in the file header). stdin is
+  /// fed by the executor (chunked + EOT); TERM is xterm-256color
+  /// because a tty is present.
+  func startTty(command: String, stdinData: Data?, fsContext: UInt64,
+                timeout: TimeInterval, cols: Int, rows: Int) {
+    // Send the chunked headers first, then stream.
+    connection?.sendChunkedHeaders()
+    let started = Date()
+    isTty = true
+    execution = ISHShellExecutor.shared().executeCommandTty(
+      command, stdinData: stdinData, fsContext: fsContext, timeout: timeout,
+      cols: Int32(cols), rows: Int32(rows),
       outputHandler: { [weak self] isStderr, chunk in
         self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
       },
@@ -773,6 +880,15 @@ private final class ExecSession {
   private func onComplete(result: ISHShellExecutionResult, started: Date) {
     guard !finished else { return }
     finished = true
+    // NOTE (ENV-14, background jobs): on NORMAL completion the guest
+    // process group is intentionally NOT killed. A command that
+    // backgrounds work (`sleep 600 &`) leaves it running after the
+    // exec returns — that is the long-task escape hatch the env report
+    // documents, and the engine's managed handle only tracks the
+    // foreground exec (its synthetic pid cannot signal the guest).
+    // Cancel (disconnect) and timeout DO kill the group; see cancel()
+    // and the executor's timeout path. A `&` child therefore survives
+    // untracked: there is no job list for it yet (see the REPORT).
     // Flush trailing partial lines (if any) as final lines.
     if let line = stdoutBuffer.flush() { sendLine(stream: "stdout", lineData: line) }
     if let line = stderrBuffer.flush() { sendLine(stream: "stderr", lineData: line) }
@@ -781,6 +897,11 @@ private final class ExecSession {
       "exitCode": result.exitCode,
       "durationMs": durationMs,
     ]
+    if isTty {
+      // The "had a pty" flag (ENV-02 contract): the bridge checks
+      // this to confirm the exec really ran on a PTY.
+      frame["tty"] = true
+    }
     if result.timedOut {
       frame["timedOut"] = true
       frame["partialOutput"] = partialOutput
@@ -807,9 +928,18 @@ private final class ExecSession {
   /// character at end-of-stream becomes U+FFFD — the bytes themselves
   /// were already preserved in the buffer; only the JSON rendering is
   /// lossy, and only for a truncated final character).
+  ///
+  /// ENV-14: the session-cwd marker line (`__DSH_CWD__<nonce>:<cwd>`,
+  /// stderr only, exact nonce) is still sent — the bridge consumes it
+  /// — but is not appended to partialOutput, so a timeout frame never
+  /// shows protocol as command output.
   private func sendLine(stream: String, lineData: Data) {
     let line = String(decoding: lineData, as: UTF8.self)
-    partialOutput += line + "\n"
+    let isCwdMarker = stream == "stderr" && cwdNonce != nil
+      && line.hasPrefix("__DSH_CWD__\(cwdNonce!):")
+    if !isCwdMarker {
+      partialOutput += line + "\n"
+    }
     sendJSONFrame(["stream": stream, "line": line])
   }
 
@@ -879,8 +1009,8 @@ extension HTTPConnection {
     send(Data(response.utf8)) { [weak self] in
       guard let self, let service = self.service else { return }
       // Switch this connection to WebSocket mode. The WSConnection
-      // spawns the shell and registers the PTY session; if a session
-      // is already active it closes with 1008.
+      // spawns the shell and registers the PTY session; if the
+      // session cap is reached it closes with 1008.
       let ws = WSConnection(httpConnection: self, service: service)
       self.wsSession = ws
       ws.start()
@@ -918,23 +1048,39 @@ private final class WSConnection {
   /// 101 response is sent.
   func start() {
     guard !closed else { return }
+    // Each socket gets its own kernel session (stage 5.3): a fresh
+    // UUID is the routing key for this socket's PTY.
+    let sessionId = UUID().uuidString
     var pid: Int32 = 0
-    let rc = ISHKernel.shared.executeCommand(["/bin/sh"], pid: &pid)
+    let rc = ISHKernel.shared.executeCommand(["/bin/sh"], pid: &pid,
+        sessionId: sessionId, fsContext: 0, cols: 0, rows: 0)
     guard rc == 0, pid > 0 else {
-      NSLog("ish-loopback: pty shell spawn failed (rc=\(rc))")
-      close(code: 1011, reason: "shell spawn failed")
+      // -5 is the session cap: refuse as 1008 (policy), not 1011.
+      if rc == -5 {
+        close(code: 1008, reason: "too many pty sessions are active (max \(ISHPtyMaxSessions))")
+      } else {
+        NSLog("ish-loopback: pty shell spawn failed (rc=\(rc))")
+        close(code: 1011, reason: "shell spawn failed")
+      }
       return
     }
-    let session = PTYSession(guestPid: Int(pid), service: service, ws: self)
+    let session = PTYSession(id: sessionId, guestPid: Int(pid), service: service, ws: self)
     guard let service, service.registerPTYSession(session) else {
-      // Another PTY session is already active (single shared
-      // _consoleTTY). Kill the shell we just spawned and refuse.
-      ISHShellExecutor.shared().killProcessGroup(pid)
-      close(code: 1008, reason: "another pty session is active")
+      // Cap filled between the spawn and the register (a duplicate
+      // id cannot happen with UUIDs): release the kernel session —
+      // closePtySession kills the shell AND frees the registry
+      // slot — then refuse.
+      ISHKernel.shared.closePtySession(sessionId)
+      close(code: 1008, reason: "too many pty sessions are active (max \(ISHPtyMaxSessions))")
       return
     }
     ptySession = session
-    NSLog("ish-loopback: pty session started (guest pid \(pid))")
+    // Tell the client its session id (the bridge stores it for
+    // diagnostics; routing itself is by socket). Sent as a text
+    // frame: the client distinguishes control frames by opcode
+    // (binary = PTY bytes, text = JSON control).
+    sendText("{\"type\":\"session\",\"sessionId\":\"\(sessionId)\"}")
+    NSLog("ish-loopback: pty session started (guest pid \(pid), session \(sessionId))")
   }
 
   /// Feed inbound bytes (called by HTTPConnection after the upgrade).
@@ -1033,8 +1179,8 @@ private final class WSConnection {
       switch type {
       case "resize":
         if let cols = json["cols"] as? Int, let rows = json["rows"] as? Int,
-           cols > 0, rows > 0 {
-          ISHKernel.shared.setTerminalSize(Int32(cols), rows: Int32(rows))
+           cols > 0, rows > 0, let id = ptySession?.id {
+          ISHKernel.shared.setTerminalSize(Int32(cols), rows: Int32(rows), sessionId: id)
         }
       case "close":
         close(code: 1000, reason: "client requested close")
@@ -1042,7 +1188,9 @@ private final class WSConnection {
         break
       }
     case 0x2: // Binary — PTY input (raw bytes to the guest shell).
-      ISHKernel.shared.sendInput(payload)
+      if let id = ptySession?.id {
+        ISHKernel.shared.sendInput(payload, sessionId: id)
+      }
     default:
       break
     }
@@ -1055,6 +1203,13 @@ private final class WSConnection {
   func sendBinary(_ data: Data) {
     guard !closed else { return }
     sendFrame(opcode: 0x2, payload: data)
+  }
+
+  /// Send a text frame (JSON control, e.g. the session hello sent
+  /// right after the upgrade).
+  func sendText(_ string: String) {
+    guard !closed else { return }
+    sendFrame(opcode: 0x1, payload: Data(string.utf8))
   }
 
   private func sendFrame(opcode: UInt8, payload: Data, completion: @escaping () -> Void = {}) {
@@ -1092,8 +1247,8 @@ private final class WSConnection {
   /// been handed to the network stack: cancelling the connection
   /// synchronously right after enqueueing the frame (the old code)
   /// discarded the frame, so the client saw `read ECONNRESET`
-  /// instead of the intended close code (e.g. 1008 "another pty
-  /// session is active"). A 2 s fallback tears down anyway, so a
+  /// instead of the intended close code (e.g. 1008 "too many pty
+  /// sessions are active"). A 2 s fallback tears down anyway, so a
   /// stuck send can never leak the connection or the shell.
   /// Idempotent.
   func close(code: UInt16, reason: String) {
@@ -1129,6 +1284,9 @@ private final class WSConnection {
 /// WebSocket. The shell is a child of init (pid >= 2); on close its
 /// process group is killed (never pid 1, never halt_system).
 private final class PTYSession {
+  /// The kernel session id (UUID, the routing key for this session's
+  /// PTY). The WSConnection owns exactly one PTYSession.
+  let id: String
   let guestPid: Int
   private weak var service: IShLoopbackService?
   private weak var ws: WSConnection?
@@ -1136,7 +1294,8 @@ private final class PTYSession {
   fileprivate var closed = false
   private var exitObserver: NSObjectProtocol?
 
-  init(guestPid: Int, service: IShLoopbackService?, ws: WSConnection) {
+  init(id: String, guestPid: Int, service: IShLoopbackService?, ws: WSConnection) {
+    self.id = id
     self.guestPid = guestPid
     self.service = service
     self.ws = ws
@@ -1161,14 +1320,16 @@ private final class PTYSession {
   }
 
   /// Forward raw PTY bytes to the WebSocket (binary frame). Called
-  /// from the service queue via ISHRuntime.ptyOutputSink.
+  /// from the service queue via this session's kernel output handler.
   func sendBinary(_ data: Data) {
     guard !closed else { return }
     ws?.sendBinary(data)
   }
 
-  /// Kill the shell's process group and unregister. Idempotent.
-  /// Runs on the service queue.
+  /// Kill the shell's process group, unregister the kernel session
+  /// (frees the registry slot + clears the output handler), and
+  /// unregister from the service. Idempotent. Runs on the service
+  /// queue.
   func close(reason: String) {
     guard !closed else { return }
     closed = true
@@ -1176,8 +1337,8 @@ private final class PTYSession {
       NotificationCenter.default.removeObserver(observer)
       exitObserver = nil
     }
-    ISHShellExecutor.shared().killProcessGroup(Int32(guestPid))
+    ISHKernel.shared.closePtySession(id)
     service?.clearPTYSession(self)
-    NSLog("ish-loopback: pty session closed (guest pid \(guestPid)): \(reason)")
+    NSLog("ish-loopback: pty session closed (guest pid \(guestPid), session \(id)): \(reason)")
   }
 }

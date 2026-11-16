@@ -74,6 +74,15 @@ extern NSNotificationName const ISHGuestExitedNotification;
 /// -4 cancelled).
 int ISHDecodeWaitStatus(int status);
 
+/// Maximum live PTY sessions (interactive terminals + tty execs
+/// combined). The kernel refuses a new session past this cap
+/// (executeCommand:pid:sessionId:fsContext:cols:rows: returns -5);
+/// the loopback service turns that into close 1008 (WS) or HTTP 429
+/// (/ish/exec tty). 8 is generous for a phone (each session is a live
+/// guest shell + a 4 KiB tty buffer) and small enough to keep the
+/// per-write registry scan trivial.
+extern const NSInteger ISHPtyMaxSessions;
+
 @interface ISHKernel : NSObject
 
 @property (class, readonly) ISHKernel *shared;
@@ -84,6 +93,14 @@ int ISHDecodeWaitStatus(int status);
 /// Guest output (PTY/console bytes) sink, called on the main queue.
 /// Batched: at most one invocation per burst of guest writes. Also used
 /// by the harness to capture one-shot command output.
+///
+/// MULTI-SESSION (stage 5.3): every PTY session's output ALSO fans out
+/// here (same batch, same main-queue call), so the dsh/ish log ring
+/// keeps seeing all terminal output exactly as before. Per-session
+/// routing uses setPtyOutputHandler:forSession: instead — the loopback
+/// service and the tty executor register one handler per session there,
+/// and the legacy ISHRuntime.ptyOutputSink is no longer set by anyone
+/// (it stays nil; do not revive it — it can only point at ONE session).
 @property (nonatomic, copy, nullable) void (^outputCallback)(NSData *data);
 
 /// Extra environment variables injected into every guest command's envp
@@ -106,14 +123,97 @@ int ISHDecodeWaitStatus(int status);
 /// asynchronously; poll exitCodeForGuestPid: for completion.
 /// This is the INTERACTIVE-terminal path (single shared _consoleTTY);
 /// one-shot agent commands use ISHShellExecutor instead.
+/// LEGACY: delegates to the session API below with a fresh UUID
+/// session id, remembered as the "default" session for the legacy
+/// sendInput: / setTerminalSize:rows: / drainOutput shims. Kept so
+/// existing callers keep working unchanged; new callers use the
+/// session API.
 - (int)executeCommand:(NSArray<NSString *> *)command
                   pid:(nullable int *)outPid;
+
+/// Per-session execution (stage 5.3, multi-terminal). Same as
+/// executeCommand:pid: but the command runs in the named PTY session:
+/// its own fake PTY (own input buffer, termios, winsize), its own
+/// output buffer and output handler, routed by session id. `sessionId`
+/// must be non-empty and unique among live sessions (callers use a
+/// UUID); `fsContext` is written to the child's group before exec
+/// (0 = none; the interactive path passes 0, the tty executor passes
+/// the agent run's context). `cols`/`rows` set the initial winsize
+/// (<= 0 means the historic default 24 rows x 200 cols).
+/// Returns 0 on success, or -1 (not booted), -2 (empty command),
+/// -3 (start timed out), -4 (spawn failed), -5 (session cap reached:
+/// ISHPtyMaxSessions live sessions already exist). The session stays
+/// registered until closePtySession: (or closeAllPtySessions /
+/// stopGuest); closing kills the guest process group.
+/// The caller normally registers an output handler with
+/// setPtyOutputHandler:forSession: BEFORE calling this, so no output
+/// can be missed (output can only start after task_start, which runs
+/// after this returns — but registering first costs nothing).
+- (int)executeCommand:(NSArray<NSString *> *)command
+                  pid:(nullable int *)outPid
+            sessionId:(NSString *)sessionId
+            fsContext:(uint64_t)fsContext
+                 cols:(int)cols
+                 rows:(int)rows;
+
+/// Write raw bytes into one PTY session's input (the guest shell's
+/// stdin). Same queueing as sendInput: (dedicated serial queue, never
+/// the main thread). No-op for an unknown or closed session, or after
+/// the guest exited. Safe to call before boot (no-op).
+- (void)sendInput:(NSData *)data sessionId:(NSString *)sessionId;
+
+/// Convenience for sendInput:sessionId: with a UTF-8 string.
+- (void)sendInputString:(NSString *)string sessionId:(NSString *)sessionId;
+
+/// Resize one PTY session (cols x rows) and deliver SIGWINCH to the
+/// foreground process group. No-op for an unknown or closed session.
+- (void)setTerminalSize:(int)cols rows:(int)rows sessionId:(NSString *)sessionId;
+
+/// Register (or clear, with nil) the per-session output handler: called
+/// on the main queue with each drained batch of THAT session's PTY
+/// bytes, at most once per burst (same coalescing as outputCallback).
+/// The legacy outputCallback ALSO receives every session's batches
+/// (fan-out for the log ring). The handler is called with a batch that
+/// was already removed from the session buffer, so bytes are delivered
+/// exactly once across handler + drainOutputForSession:. Set the
+/// handler before executeCommand:sessionId:... and clear it by closing
+/// the session (closePtySession: removes it).
+- (void)setPtyOutputHandler:(nullable void (^)(NSData *data))handler
+                 forSession:(NSString *)sessionId;
+
+/// Drain and return all output buffered for one session since the last
+/// drain (or since the last handler batch — the two are two views of
+/// the same buffer; a byte is delivered exactly once, by whichever
+/// drains first). Empty data for an unknown session.
+- (NSData *)drainOutputForSession:(NSString *)sessionId;
+
+/// Close one PTY session: marks it closed (further input/resize is
+/// dropped), removes its output handler, kills the guest process
+/// group, and unregisters it. Idempotent; no-op for an unknown id.
+/// Never touches pid 1. The tty itself is freed by the kernel when
+/// the guest's stdio fds close (tty_release); this method never
+/// dereferences the tty after the kill.
+- (void)closePtySession:(NSString *)sessionId;
+
+/// Close every live PTY session (same per-session semantics as
+/// closePtySession:). Called by stopGuest, so a guest stop never
+/// leaves stale session records behind.
+- (void)closeAllPtySessions;
+
+/// Number of live PTY sessions (for /ish/status diagnostics).
+- (NSUInteger)ptySessionCount;
+
+/// The session id of the most recent legacy executeCommand:pid:
+/// call, or nil when none. Diagnostics only.
+@property (nonatomic, readonly, nullable) NSString *defaultPtySessionId;
 
 /// Write raw bytes into the interactive terminal's PTY (the guest
 /// shell's stdin). Must be called from any queue EXCEPT the main
 /// queue's runloop is fine — the write is forwarded to a dedicated
 /// serial queue because tty_input() takes a pthread mutex and blocks
 /// while the kernel is busy. Safe to call before boot (no-op).
+/// LEGACY: routes to the default session (see executeCommand:pid:).
+/// New callers use sendInput:sessionId:.
 - (void)sendInput:(NSData *)data;
 
 /// Convenience for sendInput: with a UTF-8 string.
@@ -122,6 +222,8 @@ int ISHDecodeWaitStatus(int status);
 /// Resize the interactive terminal's PTY (cols x rows) and deliver
 /// SIGWINCH to the foreground process group. No-op before boot or
 /// before any executeCommand:.
+/// LEGACY: routes to the default session. New callers use
+/// setTerminalSize:rows:sessionId:.
 - (void)setTerminalSize:(int)cols rows:(int)rows;
 
 /// Exit code of a guest pid (wait-encoded; decode with
@@ -162,6 +264,9 @@ int ISHDecodeWaitStatus(int status);
 - (void)refreshDns;
 
 /// Drain and return all PTY/console output captured since the last drain.
+/// LEGACY: drains the default session's buffer plus the console
+/// (PID 1 / unregistered-tty) buffer, concatenated in that order.
+/// New callers use drainOutputForSession:.
 - (NSData *)drainOutput;
 
 /// Bind-mount a host directory into the guest: creates a symlink in

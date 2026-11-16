@@ -1,0 +1,16 @@
+--- a/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml
++++ b/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml
+@@ -18,6 +18,13 @@
+               maxBytes: 65536
+           - id: time-context
+             name: '@deepseek-ai/dsh-time-context'
++            config:
++              # ENV-10: pin the fallback display zone to the user's zone
++              # instead of the embedded Node process zone, which on iOS
++              # reports a zone name whose offset does not match (observed
++              # +08:00[America/Chicago]). User messages carry the device
++              # zone as clientTimeZone when known; this is the fallback.
++              timeZone: 'Asia/Shanghai'
+           - id: tool-bash
+             name: '@deepseek-ai/dsh-tool-bash'
+             disabled: !!js process.platform === 'win32'

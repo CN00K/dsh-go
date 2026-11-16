@@ -22,7 +22,22 @@
 #      (exactly like fakefsify does for the base image) — NOT real host
 #      symlinks, because `zip` (without -y) dereferences those and stores
 #      the target's content, which the guest kernel would then read as a
-#      (garbage) link target. Install scripts
+#      (garbage) link target. GNU packages (coreutils, grep, sed,
+#      findutils, procps-ng, util-linux-misc, binutils) ship real files
+#      at paths where the base image has BusyBox applet symlinks
+#      (e.g. /bin/ls, /bin/grep, /bin/sed) — those are TAKEN OVER in place:
+#      the installer overwrites the busybox symlink file with the real
+#      binary, updates that path's meta.db row to a regular file (same
+#      inode), and prunes the path from the old owner's installed-db
+#      entry (busybox). Takeover is allowed ONLY when the existing path
+#      is a symlink whose on-disk content is exactly "/bin/busybox";
+#      any other collision is a hard error. Hardlinks (binutils/gcc ship
+#      ld, ar, ... as hardlinks to the target-prefixed binaries) are
+#      stored as real copies of the target's content — the guest fakefs
+#      has no link-count concept in meta.db (one inode per path), so
+#      only st_nlink/inode differ, which nothing here relies on; the
+#      apk db records them as regular files with the content checksum,
+#      like real apk does. Install scripts
 #      (.pre-install/.post-install/.pre-upgrade/.post-upgrade/.trigger)
 #      are collected into lib/apk/db/scripts.tar (named
 #      `<pkg>-<ver>.<C>.<type>`, the apk convention) — they are NOT run
@@ -40,12 +55,18 @@
 #   5. Updates the fakefs meta.db (sibling of data/): inserts a paths row
 #      (absolute path -> new inode) and a stats row (inode -> 16-byte
 #      struct ish_stat {mode, uid, gid, rdev}) for every new file, dir
-#      and symlink. This is REQUIRED: the kernel's fakefs_rebuild only
-#      re-indexes paths already in the db — files added to data/ without
-#      a db row are invisible to the guest. New inodes continue from
-#      max(inode)+1 in deterministic (path-sorted) order. The meta table
-#      (db_inode) is left alone: the kernel sets it on first mount.
+#      and symlink. For a busybox-symlink takeover (see step 3) the
+#      existing row is UPDATED in place (same inode, new mode) instead of
+#      a new row being inserted. This is REQUIRED: the kernel's
+#      fakefs_rebuild only re-indexes paths already in the db — files added
+#      to data/ without a db row are invisible to the guest. New inodes
+#      continue from max(inode)+1 in deterministic (path-sorted) order.
+#      The meta table (db_inode) is left alone: the kernel sets it on
+#      first mount.
 #   6. Writes the resolved lock file (all packages as name=version).
+#      Also prunes taken-over paths from the previous owner's installed-db
+#      entry, so no path is claimed by two packages (apk verify stays
+#      clean).
 #
 # Determinism: every output is produced in sorted order from pinned
 # inputs, so the same package list yields the same rootfs zip. The only
@@ -172,6 +193,66 @@ def read_pkginfo(apk_path):
             k, v = line.split(" = ", 1)
             info[k.strip()] = v.strip()
     return info
+
+def _check_takeover(dest, abs_path_b, existing_modes, takeover_paths):
+    """Gate for overwriting an existing meta.db path with a new package
+    file. Allowed ONLY when the existing path is a BusyBox applet symlink
+    (meta.db mode symlink, on-disk fakefs-style file whose content is
+    exactly b"/bin/busybox"). Anything else is a hard error — the new
+    package would silently clobber a real file owned by the base image
+    or another package. Also errors if another package in this same run
+    already took the path over."""
+    if abs_path_b in takeover_paths:
+        raise SystemExit(f"error: {abs_path_b.decode()!r} is taken over by two "
+                         "packages in this run — refusing to overwrite")
+    mode = existing_modes[abs_path_b]
+    if mode & 0o170000 != 0o120000:
+        raise SystemExit(f"error: {abs_path_b.decode()!r} already exists in meta.db "
+                         "as a non-symlink — refusing to overwrite")
+    try:
+        with open(dest, "rb") as f:
+            content = f.read()
+    except OSError as e:
+        raise SystemExit(f"error: cannot read existing {abs_path_b.decode()!r}: {e}")
+    if content != b"/bin/busybox":
+        raise SystemExit(f"error: {abs_path_b.decode()!r} already exists in meta.db "
+                         f"as a symlink to {content!r} (not /bin/busybox) — refusing "
+                         "to overwrite")
+
+def prune_takeovers(merged, takeover_paths):
+    """Remove taken-over paths from the previous owner's installed-db
+    entry, so no path is claimed by two packages (apk verify stays
+    clean). takeover_paths are absolute-path bytes (b"/bin/ls"); db
+    entries list files as F:<dir> / R:<base> pairs. Dropped: the R: line
+    plus its following a:/Z: lines. F: lines are kept (apk lists empty
+    dirs too)."""
+    pruned = {}
+    for name, entry in merged.items():
+        lines = entry.split("\n")
+        out = []
+        cur_dir = None
+        skip_rest = False  # dropping the a:/Z: lines after a pruned R:
+        for line in lines:
+            if line.startswith("F:"):
+                cur_dir = line[2:]
+                skip_rest = False
+                out.append(line)
+                continue
+            if line.startswith("R:"):
+                base = line[2:]
+                full = (cur_dir + "/" + base) if cur_dir else base
+                if ("/" + full).encode() in takeover_paths:
+                    skip_rest = True
+                    continue  # drop the R: line
+                skip_rest = False
+                out.append(line)
+                continue
+            if skip_rest and (line.startswith("a:") or line.startswith("Z:")):
+                continue  # drop the checksum/perm lines of a pruned R:
+            skip_rest = False
+            out.append(line)
+        pruned[name] = "\n".join(out)
+    return pruned
 
 SCRIPT_TYPES = (".pre-install", ".post-install", ".pre-upgrade", ".post-upgrade",
                 ".pre-deinstall", ".post-deinstall", ".trigger")
@@ -301,12 +382,29 @@ def main():
     meta_db_path = os.path.join(os.path.dirname(data_dir), "meta.db")
     have_meta = os.path.exists(meta_db_path)
     new_paths = []  # (abs_path_bytes, mode, uid, gid, rdev)
+    takeovers = []  # (abs_path_bytes, mode, uid, gid, rdev) — busybox
+    #   symlinks overwritten in place (same inode, mode updated)
+    takeover_paths = set()
     new_entries = {}  # pkgname -> installed-db entry text
     scripts = {}  # scripts.tar member name -> bytes
+    # Existing meta.db paths+modes, for the busybox-symlink takeover
+    # check: a new file/symlink may only overwrite an existing path when
+    # that path is a symlink whose on-disk content is "/bin/busybox".
+    existing_modes = {}
+    if have_meta:
+        _con = sqlite3.connect(f"file:{meta_db_path}?mode=ro", uri=True)
+        try:
+            for _path_b, _blob in _con.execute(
+                    "SELECT paths.path, stats.stat FROM paths "
+                    "JOIN stats ON paths.inode = stats.inode"):
+                existing_modes[_path_b] = struct.unpack("<IIII", _blob)[0]
+        finally:
+            _con.close()
     for p in to_install:
         apk_path = apk_paths[p["P"]]
         with tarfile.open(apk_path, "r:gz") as tf:
             members = [m for m in tf.getmembers() if not m.name.startswith(".")]
+            members_by_name = {m.name: m for m in members}
             # collect install scripts (dotfiles) for scripts.tar
             for m in tf.getmembers():
                 if m.name in SCRIPT_TYPES:
@@ -315,12 +413,23 @@ def main():
             for m in members:
                 rel = m.name
                 dest = os.path.join(data_dir, rel)
+                abs_path_b = ("/" + rel).encode()
                 if m.isdir():
+                    if abs_path_b in existing_modes and \
+                            existing_modes[abs_path_b] & 0o170000 != 0o040000:
+                        raise SystemExit(f"error: {apk_path} dir {rel} collides "
+                                         "with a non-directory in meta.db")
                     os.makedirs(dest, exist_ok=True)
                     os.chmod(dest, m.mode & 0o7777)
                 elif m.issym():
                     parent = os.path.dirname(dest)
                     os.makedirs(parent, exist_ok=True)
+                    if abs_path_b in existing_modes:
+                        _check_takeover(dest, abs_path_b, existing_modes,
+                                        takeover_paths)
+                        takeovers.append((abs_path_b, 0o120000 | 0o777,
+                                          m.uid, m.gid, 0))
+                        takeover_paths.add(abs_path_b)
                     if os.path.lexists(dest):
                         os.unlink(dest)
                     # fakefs-style symlink: write the link target as the
@@ -341,11 +450,42 @@ def main():
                         f.write(m.linkname.encode())
                     os.chmod(dest, 0o660)
                 elif m.islnk():
-                    raise SystemExit(f"error: {apk_path} contains hardlink {rel} — "
-                                     "not handled, add support or drop the package")
+                    # Hardlink: same content as the link target member in
+                    # this same .apk (binutils/gcc ship ld, ar, ... as
+                    # hardlinks to the target-prefixed binaries). The
+                    # guest fakefs has no link-count concept in meta.db
+                    # (one inode per path), so store a real copy of the
+                    # target's content — functionally identical (only
+                    # st_nlink/inode differ, which nothing here relies
+                    # on). The apk db records it as a regular file with
+                    # the content checksum, like real apk does.
+                    parent = os.path.dirname(dest)
+                    os.makedirs(parent, exist_ok=True)
+                    target = members_by_name.get(m.linkname)
+                    if target is None or not target.isfile():
+                        raise SystemExit(f"error: {apk_path} hardlink {rel} -> "
+                                         f"{m.linkname} (target not a regular "
+                                         "file in this apk)")
+                    if abs_path_b in existing_modes:
+                        _check_takeover(dest, abs_path_b, existing_modes,
+                                        takeover_paths)
+                        takeovers.append((abs_path_b,
+                                          0o100000 | (m.mode & 0o7777),
+                                          m.uid, m.gid, 0))
+                        takeover_paths.add(abs_path_b)
+                    with open(dest, "wb") as f:
+                        f.write(tf.extractfile(target).read())
+                    os.chmod(dest, m.mode & 0o7777)
                 elif m.isfile():
                     parent = os.path.dirname(dest)
                     os.makedirs(parent, exist_ok=True)
+                    if abs_path_b in existing_modes:
+                        _check_takeover(dest, abs_path_b, existing_modes,
+                                        takeover_paths)
+                        takeovers.append((abs_path_b,
+                                          0o100000 | (m.mode & 0o7777),
+                                          m.uid, m.gid, 0))
+                        takeover_paths.add(abs_path_b)
                     with open(dest, "wb") as f:
                         f.write(tf.extractfile(m).read())
                     os.chmod(dest, m.mode & 0o7777)
@@ -358,20 +498,33 @@ def main():
         if have_meta:
             for m in members:
                 abs_path = "/" + m.name
+                if abs_path.encode() in takeover_paths:
+                    continue  # takeover: same inode, mode updated in place
                 if m.isdir():
                     mode = 0o040000 | (m.mode & 0o7777)
                     new_paths.append((abs_path.encode(), mode, m.uid, m.gid, 0))
                 elif m.issym():
                     new_paths.append((abs_path.encode(), 0o120000 | 0o777, m.uid, m.gid, 0))
+                elif m.islnk():
+                    # Hardlink: recorded as a regular file with the
+                    # target's content (see the extraction branch above).
+                    mode = 0o100000 | (m.mode & 0o7777)
+                    new_paths.append((abs_path.encode(), mode, m.uid, m.gid, 0))
                 elif m.isfile():
                     mode = 0o100000 | (m.mode & 0o7777)
                     new_paths.append((abs_path.encode(), mode, m.uid, m.gid, 0))
     print(f"extracted {len(to_install)} packages into {data_dir}")
 
     # --- 7. write installed db (existing entries verbatim + new, sorted) ---
+    # Taken-over paths are pruned from the previous owner's entry first,
+    # so no path is claimed by two packages.
     merged = dict(installed_raw)
     for name, entry in new_entries.items():
         merged[name] = entry
+    if takeovers:
+        merged = prune_takeovers(merged, takeover_paths)
+        print(f"installed db: pruned {len(takeover_paths)} taken-over path(s) "
+              "from previous owner(s)")
     with open(installed_db_path, "w", encoding="utf-8") as f:
         for name in sorted(merged):
             f.write(merged[name])
@@ -432,8 +585,9 @@ def main():
 
     # --- 11. meta.db: insert paths + stats rows ---
     if have_meta:
-        update_meta_db(meta_db_path, new_paths)
-        print(f"meta.db: {len(new_paths)} new path(s)")
+        update_meta_db(meta_db_path, new_paths, takeovers)
+        print(f"meta.db: {len(new_paths)} new path(s), "
+              f"{len(takeovers)} busybox symlink takeover(s)")
     else:
         print("warning: no meta.db next to data/ — skipped meta.db update "
               "(fakefsify must run after this helper, or the guest will not see the new files)")
@@ -448,7 +602,8 @@ def main():
         print(f"lock file: {args.lock_file}")
 
     print(f"done: {len(to_install)} packages, {total_inst // 1024} KiB installed, "
-          f"{len(new_paths)} new filesystem entries")
+          f"{len(new_paths)} new filesystem entries, "
+          f"{len(takeovers)} busybox symlink takeover(s)")
     return 0
 
 def build_db_entry(pkg, apk_path):
@@ -456,9 +611,21 @@ def build_db_entry(pkg, apk_path):
     with tarfile.open(apk_path, "r:gz") as tf:
         members = [m for m in tf.getmembers() if not m.name.startswith(".")]
         contents = {}
+        by_name = {m.name: m for m in members}
         for m in members:
             if m.isfile():
                 contents[m.name] = tf.extractfile(m).read()
+            elif m.islnk():
+                # Hardlink: same content as its target member in this apk
+                # (binutils/gcc ship ld/ar/... this way). Real apk records
+                # hardlinked paths as regular file entries with the
+                # content checksum.
+                target = by_name.get(m.linkname)
+                if target is None or not target.isfile():
+                    raise SystemExit(f"error: {apk_path} hardlink {m.name} -> "
+                                     f"{m.linkname} (target not a regular "
+                                     "file in this apk)")
+                contents[m.name] = tf.extractfile(target).read()
     fields = ["C", "P", "V", "A", "S", "I", "T", "U", "L", "o", "m", "t", "c",
               "k", "D", "q", "p", "r"]
     lines = []
@@ -494,18 +661,21 @@ def build_db_entry(pkg, apk_path):
                 # it agreed with the old verifier only because the verifier
                 # resolved the same way — circular. Real apk uses raw.)
                 lines.append(f"Z:{apk_checksum(m.linkname.encode())}")
-            elif m.isfile():
+            elif m.isfile() or m.islnk():
                 perm = m.mode & 0o7777
                 if (m.uid, m.gid, perm) != (0, 0, 0o644):
                     lines.append(f"a:{m.uid}:{m.gid}:{perm:o}")
                 lines.append(f"Z:{apk_checksum(contents[m.name])}")
     return "\n".join(lines) + "\n"
 
-def update_meta_db(meta_db_path, new_paths):
+def update_meta_db(meta_db_path, new_paths, takeovers=None):
     """Insert paths + stats rows for new files. new_paths: list of
-    (abs_path_bytes, mode, uid, gid, rdev). Directories that already exist
-    in the db (e.g. /usr/bin, shared by many packages) are skipped; a
-    file/symlink colliding with an existing path is a hard error."""
+    (abs_path_bytes, mode, uid, gid, rdev). takeovers: same shape — paths
+    that already exist in the db as BusyBox applet symlinks and were
+    overwritten in place; their stats row is UPDATED (same inode, new
+    mode) instead of a new row being inserted. Directories that already
+    exist in the db (e.g. /usr/bin, shared by many packages) are skipped;
+    a file/symlink colliding with an existing path is a hard error."""
     # dedup by path (several packages ship the same dirs)
     by_path = {}
     for path, mode, uid, gid, rdev in new_paths:
@@ -513,6 +683,7 @@ def update_meta_db(meta_db_path, new_paths):
             raise SystemExit(f"error: conflicting entries for {path!r} in the package set")
         by_path.setdefault(path, (mode, uid, gid, rdev))
     new_paths = sorted(by_path.items(), key=lambda kv: kv[0])
+    takeovers = sorted(takeovers or [], key=lambda t: t[0])
     con = sqlite3.connect(meta_db_path)
     try:
         cur = con.cursor()
@@ -534,12 +705,25 @@ def update_meta_db(meta_db_path, new_paths):
             rows_path.append((path, inode))
         cur.executemany("INSERT INTO stats (inode, stat) VALUES (?, ?)", rows_stat)
         cur.executemany("INSERT INTO paths (path, inode) VALUES (?, ?)", rows_path)
+        # Takeovers: same inode, new mode (symlink -> regular file, or
+        # symlink -> symlink with a new target). The row must already
+        # exist — the extraction step verified the path was a busybox
+        # symlink before overwriting it.
+        for path, mode, uid, gid, rdev in takeovers:
+            row = cur.execute("SELECT inode FROM paths WHERE path = ?",
+                              (path,)).fetchone()
+            if row is None:
+                raise SystemExit(f"error: takeover path {path!r} not in meta.db")
+            blob = struct.pack("<IIII", mode, uid, gid, rdev)
+            cur.execute("UPDATE stats SET stat = ? WHERE inode = ?",
+                        (blob, row[0]))
         con.commit()
         # merge the WAL back into the main db file so the shipped db (the
         # zip step excludes *.db-wal/*.db-shm) contains the new rows
         cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         con.commit()
-        print(f"meta.db: {len(rows_path)} new path(s), {skipped_dirs} shared dir(s) skipped")
+        print(f"meta.db: {len(rows_path)} new path(s), {skipped_dirs} shared dir(s) skipped, "
+              f"{len(takeovers)} takeover(s) updated in place")
     finally:
         con.close()
     # sanity: re-open read-only and confirm the rows are in the main db file

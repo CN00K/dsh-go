@@ -16,9 +16,10 @@
 #     the prototype App). The intermediate fakefs tree is kept under
 #     third_party/ish/.work/alpine-rootfs/ for inspection, not in the bundle.
 #   - Branding changed from MinisApp to dsh-go (/etc/profile PS1, /etc/motd).
-#   - Extra packages (bash, python3, ripgrep, curl) are installed into the
-#     fakefs tree by install-rootfs-packages.py (see rootfs-packages.txt)
-#     AFTER fakefsify and BEFORE the zip, so the shipped sandbox has them
+#   - Extra packages (see rootfs-packages.txt: bash, python3, ripgrep,
+#     curl, GNU coreutils/findutils/grep/sed, procps-ng, jq, make,
+#     build-base, util-linux-misc) are installed into the fakefs tree by
+#     install-rootfs-packages.py AFTER fakefsify and BEFORE the zip, so the
 #     preinstalled. The helper also updates the apk db and the fakefs
 #     meta.db — both are required for the guest to see the new files.
 #   - Idempotent: if IShArtifacts/rootfs-manifest.json already records the
@@ -93,7 +94,7 @@ ALPINE_URL="${ALPINE_MIRROR}/v3.21/releases/${ALPINE_ARCH}/${ALPINE_FILE}"
 # and a direct download (3,851,686 bytes). Both agree.
 ALPINE_SHA256="f31202c4070c4ef7de9e157e1bd01cb4da3a2150035d74ea5372c5e86f1efac1"
 
-# --- Extra rootfs packages (bash, python3, ripgrep, curl) ---
+# --- Extra rootfs packages (see rootfs-packages.txt) ---
 # Pinned top-level list + the helper that installs them into the fakefs
 # tree. The list SHA256 is recorded in the manifest and checked by the
 # skip guard, so editing the list forces a rebuild.
@@ -269,6 +270,8 @@ configure_rootfs() {
 
     # Shell defaults. NOTE: this appends on every run; create_fakefs wipes
     # the tree first, so the append happens exactly once per fresh rootfs.
+    # No `cd ~` here (ENV-12): the harness owns the working directory
+    # (cd -- /home/workspace per call); a profile cd would race it.
     cat >> "$rootfs_data/etc/profile" << 'EOF'
 
 # dsh-go iSH Configuration
@@ -284,8 +287,6 @@ alias ll='ls -la'
 alias la='ls -A'
 alias l='ls -CF'
 alias grep='grep --color=auto'
-
-cd ~
 EOF
 
     cat > "$rootfs_data/etc/motd" << 'EOF'
@@ -331,7 +332,7 @@ EOF
 }
 
 # ============================================================================
-# Install extra packages (bash, python3, ripgrep, curl) into the fakefs tree
+# Install extra packages (see rootfs-packages.txt) into the fakefs tree
 # ============================================================================
 install_rootfs_packages() {
     log_info "Installing extra rootfs packages (see rootfs-packages.txt)..."
@@ -347,6 +348,60 @@ install_rootfs_packages() {
         --cache-dir "$CACHE_DIR/rootfs-packages" \
         --lock-file "$PACKAGES_LOCK"
     log_success "Extra packages installed (lock: $PACKAGES_LOCK)"
+}
+
+# ============================================================================
+# Pre-compile Python bytecode (ENV-03)
+# ============================================================================
+# The guest ships no .pyc files at all, and PYTHONDONTWRITEBYTECODE=1
+# blocks creating them at runtime, so every `pip` run recompiles ~100
+# stdlib / site-packages modules from source (optparse alone costs 6 s
+# in the emulator; pip startup routinely exceeds 60 s and gets killed).
+# Baking __pycache__ into the image at build time fixes it: imports then
+# load the .pyc directly.
+#
+# Why --invalidation-mode checked-hash (PEP 552) instead of the default
+# timestamp mode: a timestamp .pyc is only valid when the source file's
+# mtime matches the mtime baked into the .pyc header. The guest's fakefs
+# does NOT store mtimes in meta.db (struct ish_stat has no mtime field);
+# fakefs_stat reports the HOST file's mtime, which is whatever the App's
+# unzip set at extract time — the zip step normalises it to ROOTFS_EPOCH,
+# but that depends on the App preserving zip entry mtimes, which is not
+# guaranteed. A hash-based .pyc is valid whenever the source bytes are
+# unchanged, regardless of mtime, so it is robust to all of that. The
+# header embeds the first 8 bytes of the source's SHA256 — fully
+# deterministic across runs (same source -> same .pyc bytes).
+# .pyc files are written by the HOST python3 (3.12); the guest python is
+# 3.12.16 — same magic number (3531), so the .pyc load. (If the guest
+# ever moves to a different Python minor, the magic changes and the
+# .pyc are silently ignored — safe fallback, just slow again.)
+# Modes are fixed explicitly (644 for .pyc, 755 for __pycache__ dirs):
+# compileall writes with the caller's umask, which varies between build
+# machines and would make meta.db (and the zip SHA) non-deterministic.
+# The whole data tree is compiled, not just /usr/lib/python3.12: npm's
+# bundled node-gyp also ships Python (gyp/*.py, 58 files), which runs
+# under the guest python during native builds. Runs after
+# install_rootfs_packages (so site-packages is compiled too) and before
+# index_missing_rootfs_files (so the new __pycache__ dirs and .pyc files
+# get meta.db rows — without them the guest cannot see them).
+precompile_python() {
+    log_info "Pre-compiling Python bytecode into the image (ENV-03)..."
+    local data_dir="$WORK_DIR/alpine-rootfs/data"
+    [ -d "$data_dir/usr/lib/python3.12" ] || log_error "Python lib dir missing: $data_dir/usr/lib/python3.12"
+    python3 - "$data_dir" << 'PYEOF'
+import compileall, sys
+ok = compileall.compile_dir(sys.argv[1], quiet=1, force=True,
+                            invalidation_mode="checked-hash", workers=1)
+if not ok:
+    print("error: compileall reported failures", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    # Deterministic modes (see the comment above).
+    find "$data_dir" -type d -name __pycache__ -exec chmod 755 {} +
+    find "$data_dir" -type f -name '*.pyc' -exec chmod 644 {} +
+    local n_pyc
+    n_pyc="$(find "$data_dir" -type f -name '*.pyc' | wc -l)"
+    log_success "Python pre-compiled: $n_pyc .pyc files"
 }
 
 # ============================================================================
@@ -577,6 +632,7 @@ main() {
     create_fakefs
     configure_rootfs
     install_rootfs_packages
+    precompile_python
     index_missing_rootfs_files
     create_zip_archive
     print_summary

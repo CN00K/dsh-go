@@ -1,0 +1,19 @@
+--- a/node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js
+@@ -241,7 +241,15 @@
+ 	validateEscalationArgs(args.sandbox_permissions, justification);
+ }
+ function bashDescription() {
+-	return `Execute a bash command (\`bash -c\`) and return its stdout/stderr. Each call runs in a fresh shell; pass \`workdir\` instead of using \`cd\`. Managed \`$${DSH_ENV_PREFIX}*\` variables expose current harness environment facts. Long output is truncated to its tail; the full output is saved to a file whose path is reported when available. Provide \`description\` before \`command\` in the arguments. Before any delete or move, verify that the resolved absolute target path is the intended one; never run it against a computed path you have not checked. An unset variable expands to an empty string, so guard variables in such paths with \`\${VAR:?}\`. Commands may run under a file sandbox; a blocked file operation is reported as \`[sandbox: file access denied under <mode> mode]\`, a policy denial: do not retry another way.`;
++	// iSH Linux sandbox (Stage 5, dsh-go; ENV-07): the guest shell sees only
++	// the guest filesystem. The DSH engine install (Runner.app/NativeNode)
++	// and the dsh-go source checkout live outside the guest and cannot be
++	// read or modified from this shell; change DSH itself on the host or in
++	// the repo checkout instead. The iSH bridge is installed before the
++	// engine boots (runtime/native-node/engine-worker.mjs), so the symbol
++	// below is present exactly on iOS guest backends and nowhere else.
++	const ishGuest = globalThis[Symbol.for("dsh.ish.pty")] !== void 0;
++	return `Execute a bash command (\`bash -c\`) and return its stdout/stderr. Each call runs in a fresh shell; pass \`workdir\` instead of using \`cd\`. Managed \`$${DSH_ENV_PREFIX}*\` variables expose current harness environment facts. Long output is truncated to its tail; the full output is saved to a file whose path is reported when available. Provide \`description\` before \`command\` in the arguments. Before any delete or move, verify that the resolved absolute target path is the intended one; never run it against a computed path you have not checked. An unset variable expands to an empty string, so guard variables in such paths with \`\${VAR:?}\`. Commands may run under a file sandbox; a blocked file operation is reported as \`[sandbox: file access denied under <mode> mode]\`, a policy denial: do not retry another way.${ishGuest ? ` This shell runs inside an iSH Linux guest on iOS: only the guest filesystem is visible. The DSH engine install (Runner.app/NativeNode) and the dsh-go source checkout are outside the guest and cannot be read or modified from here; change DSH itself on the host or in the repo checkout, not from this shell.` : ``}`;
+ }
+ function presentBashCall(args) {
+ 	if (args.run_in_background === true) return {

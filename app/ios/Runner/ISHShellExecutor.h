@@ -1,11 +1,15 @@
 //  ISHShellExecutor.h
 //  dsh-go — Stage 2 native bridge layer (design §3, step 2.1).
 //
-//  One-shot guest command execution over host pipes (design §1.7).
+//  One-shot guest command execution over host pipes (design §1.7),
+//  plus a PTY variant (stage 5.3, ENV-02) that runs the command on a
+//  fresh fake PTY (ISHKernel per-session API) so interactive programs
+//  work: vi/vim/less/top, REPLs, login prompts.
 //  This is the AGENT path: the DSH agent loop runs tools (apk, ls, cat,
 //  npm, ...) as short-lived guest processes whose stdout/stderr are
 //  captured and returned. It is NOT the interactive terminal — that
-//  stays on ISHKernel's shared PTY (executeCommand: / sendInput:).
+//  stays on ISHKernel's per-session PTY API (executeCommand:pid:
+//  sessionId:... / sendInput:sessionId:).
 //
 //  Mechanism (design §1.7, verified against ish-src):
 //  - become_new_init_child() gives the child a FRESH fdtable
@@ -47,6 +51,8 @@
 //  in practice there is rarely more than one live execution. The
 //  sweeper (every 30 s) logs any execution live longer than 30 s;
 //  leakGuardStatus exposes the same scan for the channel layer.
+//  PTY executions additionally share ISHKernel's ISHPtyMaxSessions
+//  cap with interactive terminals (a refused start fails with -1).
 
 #import <Foundation/Foundation.h>
 
@@ -140,6 +146,39 @@ typedef NS_ENUM(NSInteger, ISHShellExecutionError) {
                               timeout:(NSTimeInterval)timeout
                         outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                            completion:(void (^)(ISHShellExecutionResult *result))completion;
+
+/// PTY variant (stage 5.3, ENV-02): run through /bin/sh -c <command>
+/// on a fresh fake PTY (its own ISHKernel session, own winsize)
+/// instead of host pipes. stdout/stderr are MERGED — a PTY has one
+/// stream — so chunks always arrive with isStderr == NO and the
+/// result's stderrData is empty. stdinData is fed to the PTY in
+/// <= 2 KiB chunks, then an EOT byte (0x04) is sent so the guest sees
+/// EOF (the same end-of-input semantics as the pipe path closing
+/// stdin). TERM is xterm-256color (a tty IS present — this is the
+/// "has tty" case of ENV-02; the pipe path's TERM handling is owned
+/// by the env/executor workstream, not this method). cols/rows set the initial
+/// winsize (<= 0 means 80x24). Timeout / cancel / finalization are
+/// the same as the pipe path (exit notification, 500 ms grace,
+/// -3 / -4 sentinels). The kernel session id is internal; the result
+/// carries no session id. Counts against the kernel's
+/// ISHPtyMaxSessions cap (a refused start fails with -1).
+- (ISHShellExecution *)executeCommandTty:(NSString *)command
+                               stdinData:(nullable NSData *)stdinData
+                               fsContext:(uint64_t)fsContext
+                                 timeout:(NSTimeInterval)timeout
+                                    cols:(int)cols
+                                    rows:(int)rows
+                           outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                              completion:(void (^)(ISHShellExecutionResult *result))completion;
+
+/// Non-streaming wrapper of the PTY variant above.
+- (ISHShellExecution *)executeCommandTty:(NSString *)command
+                               stdinData:(nullable NSData *)stdinData
+                               fsContext:(uint64_t)fsContext
+                                 timeout:(NSTimeInterval)timeout
+                                    cols:(int)cols
+                                    rows:(int)rows
+                              completion:(void (^)(ISHShellExecutionResult *result))completion;
 
 /// Synchronous one-shot, for agent preflight checks (e.g. `test -x
 /// /sbin/apk`). Blocks the calling thread until the result is ready.

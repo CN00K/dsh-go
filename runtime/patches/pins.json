@@ -982,6 +982,22 @@
         }
       }
     },
+    "zzzzzzzz-sandbox-source-boundary.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js": {
+          "after": "ee06a2cedbd88e6733a4a593da4cf5baf1e8414c40644a870adc05a08edc50d0",
+          "before": "7f5a2c438a9b32eb5c7beac97a6e589e1908b3df79b18abebb22ea192300cad1"
+        }
+      }
+    },
+    "zzzzzzzz-time-zone-fallback.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml": {
+          "after": "ecff295c0c6b8ce6c3c0f706a39fa56eb7c853e5d721a8dfb564d89cccf2e170",
+          "before": "3006cc3780cddaa7fb0089e5854e6bbef4409cf1d425930fd835226b95660afd"
+        }
+      }
+    },
     "zzzzzzzz-schedule-authorization.diff": {
       "0.2.1-rc.4": {
         "node_modules/@deepseek-ai/dsh-schedule/lib/index.js": {

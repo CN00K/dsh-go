@@ -58,7 +58,10 @@ import Foundation
 
   /// Host workspace shared into the guest at /home/workspace
   /// (same directory DSH uses as its working directory).
-  private static var hostWorkspaceURL: URL {
+  /// Shared with FilesPlugin.resolveGuest: guest paths under
+  /// /home/workspace map here, not under RootfsManager.dataURL —
+  /// keep this the single definition of the location.
+  static var hostWorkspaceURL: URL {
     FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("NativeNode/home/workspace", isDirectory: true)
   }
