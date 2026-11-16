@@ -37,6 +37,7 @@
 #include "ish/fs/devices.h"
 #include "ish/fs/path.h"
 #include "ish/fs/fd.h"
+#include "ish/fs/sock.h"    // ish_sock_set_tmp_prefix (AF_UNIX backing prefix)
 #include "ish/emu/cpu.h"
 #include "ish/kernel/mm.h"
 #include "ish/kernel/signal.h"
@@ -284,6 +285,19 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
         NSLog(@"ISHKernel: already booted");
         return 0;
     }
+    // [DSH-ISH-FIX-P0] Point the iSH AF_UNIX backing prefix at a writable
+    // container dir. The default "/tmp/ishsock" is outside the iOS sandbox,
+    // so every guest AF_UNIX bind() failed with EPERM (including the
+    // abstract namespace, which never touches the guest filesystem). Must
+    // run before boot: no guest socket can exist yet, and the setter is
+    // only called once. NSTemporaryDirectory() ends with a slash, so the
+    // backing path becomes "<tmp>/ishsock<pid>.<id>".
+    {
+        NSString *tmpDir = NSTemporaryDirectory();
+        NSString *prefix = [tmpDir stringByAppendingString:@"ishsock"];
+        ish_sock_set_tmp_prefix(prefix.UTF8String);
+        NSLog(@"ISHKernel: AF_UNIX backing prefix set to %@", prefix);
+    }
     // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
     // Reset is now synchronous and self-healing; the next boot just
     // reinstalls the rootfs from the bundled zip. See
@@ -478,6 +492,16 @@ static void ish_proto_handle_process_exit(struct task *task, int code) {
                     dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
     generic_mknodat(AT_PWD, "/dev/urandom", S_IFCHR | 0666,
                     dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
+    // [DSH-ISH-FIX-P1] Standard /dev/fd + /dev/std* symlinks. These only
+    // work because sys_openat now resolves proc-fd magic links by dup (see
+    // the iSH kernel patch, kernel/fs.c); without that, opening them fails
+    // with ENOENT because procfs readlink returns "anon_inode:[...]" for
+    // pipes/ttys/sockets. The targets need not exist yet: /proc is mounted
+    // in step 4, after this runs, and a symlink may dangle until then.
+    generic_symlinkat("/proc/self/fd", AT_PWD, "/dev/fd");
+    generic_symlinkat("/proc/self/fd/0", AT_PWD, "/dev/stdin");
+    generic_symlinkat("/proc/self/fd/1", AT_PWD, "/dev/stdout");
+    generic_symlinkat("/proc/self/fd/2", AT_PWD, "/dev/stderr");
     NSLog(@"ISHKernel: device nodes created");
 }
 

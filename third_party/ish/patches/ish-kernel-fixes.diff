@@ -1,0 +1,214 @@
+# ish-kernel-fixes.diff — dsh-go patches to the pinned iSH fork
+# (OpenMinis/ish-arm64 @ 0fd17a13, see third_party/ish/source.json).
+# Applied by third_party/ish/build-ish.sh after extracting the source
+# tarball, before the meson build. The marker in build-ish.sh includes
+# this file's SHA256, so any edit forces a fresh extract + re-apply.
+#
+# P0 (AF_UNIX bind EPERM): fs/sock.c + fs/sock.h — ish_sock_set_tmp_prefix()
+#   lets the app point the host-side Unix-socket backing prefix at a
+#   writable container dir (NSTemporaryDirectory); the default
+#   "/tmp/ishsock" is outside the iOS sandbox. Also hardens the
+#   sun_path sprintf to snprintf (ENAMETOOLONG on truncation).
+# P1 (proc-fd magic link): kernel/fs.c — sys_openat intercepts
+#   /proc/<pid>/fd/<n>, /dev/fd/<n> and /dev/std{in,out,err} and dups the
+#   target fd, instead of resolving procfs's "anon_inode:[...]"
+#   readlink string as a path (which always ENOENTs for pipes/ttys).
+#   The /dev/fd + /dev/std* symlinks themselves are created by the app
+#   in ISHKernel.m createDeviceNodes (not in the kernel source).
+#
+# NOT fixed here (see the 2026-11-16 defect report): signalfd4 /
+# memfd_create need real implementations (not stubs); clone3 already
+# works (EINVAL for a size-0 args struct is correct Linux behaviour);
+# openat2 / epoll_pwait2 / io_uring_setup are deliberate stubs with
+# working libc fallbacks; the pty question is app-layer (agent exec
+# uses pipes by design; the interactive terminal already has a pty).
+diff --git a/fs/sock.c b/fs/sock.c
+index 58dc3e32..fc692386 100644
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -428,6 +428,17 @@ static void unix_abstract_release(struct unix_abstract *name) {
+ 
+ const char *sock_tmp_prefix = "/tmp/ishsock";
+ 
++// Host-side backing path prefix for AF_UNIX sockets (see fs/sock.h).
++// The copy is deliberately leaked: it is set once at boot and lives for the
++// kernel's lifetime.
++void ish_sock_set_tmp_prefix(const char *prefix) {
++    if (prefix == NULL || prefix[0] == '\0')
++        return;
++    char *copy = strdup(prefix);
++    if (copy != NULL)
++        sock_tmp_prefix = copy;
++}
++
+ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+     // Make sure we can read things without overflowing buffers
+     if (*sockaddr_len < 2)
+@@ -477,7 +488,14 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
+             }
+ 
+             struct sockaddr_un *real_addr_un = sockaddr;
+-            size_t path_len = sprintf(real_addr_un->sun_path, "%s%d.%u", sock_tmp_prefix, getpid(), socket_id);
++            // snprintf, not sprintf: a long prefix (e.g. an app-container
++            // tmp dir) must not overflow sun_path (108 bytes). Truncation
++            // is a hard error, not a silent wrong path.
++            int written = snprintf(real_addr_un->sun_path, sizeof(real_addr_un->sun_path),
++                                   "%s%d.%u", sock_tmp_prefix, getpid(), socket_id);
++            if (written < 0 || (size_t) written >= sizeof(real_addr_un->sun_path))
++                return _ENAMETOOLONG;
++            size_t path_len = (size_t) written;
+             // The call to real bind will fail if the backing socket already
+             // exists from a previous run or something. We already checked that
+             // the fake file doesn't exist in unix_socket_get, so try a simple
+diff --git a/fs/sock.h b/fs/sock.h
+index ed34b517..51262c95 100644
+--- a/fs/sock.h
++++ b/fs/sock.h
+@@ -9,6 +9,20 @@
+ #include "misc.h"
+ #include "debug.h"
+ 
++// Host-side backing path prefix for AF_UNIX sockets.
++//
++// The guest's Unix sockets are backed by real host sockets whose paths are
++// built as "<prefix><pid>.<socket_id>" (see sockaddr_read_bind in fs/sock.c).
++// The default prefix is "/tmp/ishsock", which is NOT writable inside the iOS
++// app sandbox, so every guest AF_UNIX bind() fails with EPERM — including the
++// abstract namespace, which never touches the guest filesystem at all.
++//
++// The embedding app must call ish_sock_set_tmp_prefix() once at boot, before
++// the kernel starts, with a directory the host process can write (e.g. the
++// app's NSTemporaryDirectory() + "ishsock"). The string is copied; the caller
++// keeps ownership of its argument. A NULL/empty prefix is ignored.
++void ish_sock_set_tmp_prefix(const char *prefix);
++
+ int_t sys_socketcall(dword_t call_num, addr_t args_addr);
+ 
+ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol);
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 554d8220..85c8ac54 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -66,12 +66,122 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags)
+     return err;
+ }
+ 
++// Parse a decimal number from *p; on success *p points past the digits.
++// Returns -1 if there is no digit or the value exceeds the sanity cap.
++static int parse_decimal(const char **p) {
++    const char *s = *p;
++    if (*s < '0' || *s > '9')
++        return -1;
++    long value = 0;
++    while (*s >= '0' && *s <= '9') {
++        value = value * 10 + (*s - '0');
++        if (value > 1000000)
++            return -1;
++        s++;
++    }
++    *p = s;
++    return (int) value;
++}
++
++// Magic links: /proc/<pid>/fd/<n>, /dev/fd/<n>, /dev/std{in,out,err}.
++//
++// Returns 1 if path is exactly a proc-fd magic link (result set to the new
++// fd number, or a negative errno when the target does not exist), 0 if not
++// a magic link (the caller does the normal open). Only absolute paths are
++// matched; a relative path, a trailing slash, or extra components do not
++// match and fall through to normal resolution.
++static int try_proc_fd_magic_link(const char *path, dword_t flags, fd_t *result) {
++    int fdnum = -1;
++    int is_self = 0;
++    dword_t pid = 0;
++
++    if (strcmp(path, "/dev/stdin") == 0) { fdnum = 0; is_self = 1; }
++    else if (strcmp(path, "/dev/stdout") == 0) { fdnum = 1; is_self = 1; }
++    else if (strcmp(path, "/dev/stderr") == 0) { fdnum = 2; is_self = 1; }
++    else if (strncmp(path, "/dev/fd/", 8) == 0) {
++        const char *p = path + 8;
++        fdnum = parse_decimal(&p);
++        if (fdnum < 0 || *p != '\0')
++            return 0;
++        is_self = 1;
++    } else if (strncmp(path, "/proc/", 6) == 0) {
++        const char *p = path + 6;
++        if (strncmp(p, "self/", 5) == 0) {
++            p += 5;
++            is_self = 1;
++        } else {
++            int v = parse_decimal(&p);
++            if (v <= 0 || *p != '/')
++                return 0;
++            pid = (dword_t) v;
++            p++; // skip '/'
++        }
++        if (strncmp(p, "fd/", 3) != 0)
++            return 0;
++        p += 3;
++        fdnum = parse_decimal(&p);
++        if (fdnum < 0 || *p != '\0')
++            return 0;
++    } else {
++        return 0;
++    }
++
++    // Resolve the owning task. "self" is the running task (no lookup, no
++    // race). A numeric pid goes through pid_get_task under pids_lock, with
++    // the same mid-exit rejection proc_get_task uses.
++    struct task *task = NULL;
++    int held_pids_lock = 0;
++    if (is_self) {
++        task = current;
++    } else {
++        lock(&pids_lock);
++        held_pids_lock = 1;
++        task = pid_get_task(pid);
++        if (task != NULL && (task->exiting || task->sighand == NULL || task->group == NULL))
++            task = NULL;
++        if (task == NULL) {
++            unlock(&pids_lock);
++            *result = _ESRCH;
++            return 1;
++        }
++    }
++
++    // Retain the target fd under the task's files lock (same lock order as
++    // proc_pid_fd_readlink: pids_lock, then files->lock).
++    lock(&task->files->lock);
++    struct fd *fd = fdtable_get(task->files, (fd_t) fdnum);
++    if (fd != NULL)
++        fd = fd_retain(fd);
++    unlock(&task->files->lock);
++    if (held_pids_lock)
++        unlock(&pids_lock);
++    if (fd == NULL) {
++        *result = _ENOENT;
++        return 1;
++    }
++    // Dup semantics: the new fd refers to the same open file description.
++    // f_install also honours O_CLOEXEC / O_NONBLOCK from flags.
++    *result = f_install(fd, (int) flags);
++    return 1;
++}
++
+ fd_t sys_openat(fd_t at_f, addr_t path_addr, dword_t flags, mode_t_ mode) {
+     char path[MAX_PATH];
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("openat(%d, \"%s\", 0x%x, 0x%x)", at_f, path, flags, mode);
+ 
++    // Magic links: /proc/<pid>/fd/<n> (and /dev/fd/<n>, /dev/std{in,out,err}).
++    // Linux resolves these by duplicating the target fd, NOT by following a
++    // pathname. iSH's procfs readlink returns "anon_inode:[...]" for pipes,
++    // ttys and sockets, and __path_normalize then tries to resolve that
++    // string as a path, which always fails with ENOENT — so open() of
++    // /proc/self/fd/0 on a pipe, process substitution (<(...)), and
++    // /dev/stdin were all broken. Intercept here, before path resolution.
++    fd_t magic_result;
++    if (try_proc_fd_magic_link(path, flags, &magic_result))
++        return magic_result;
++
+     if (flags & O_CREAT_)
+         apply_umask(&mode);
+ 

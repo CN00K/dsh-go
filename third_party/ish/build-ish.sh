@@ -208,10 +208,19 @@ fetch_ish_source() {
         printf '%s  %s\n' "$ISH_TARBALL_SHA256" "$tarball" | shasum -a 256 -c -
     fi
 
-    # Extract once per pinned commit; the marker file records what is on disk.
+    # Extract once per pinned commit + kernel-patch set; the marker records
+    # both, so changing either the commit or a patch forces a fresh extract
+    # (a patch can never be applied twice, and a changed patch can never be
+    # silently skipped on an already-extracted tree).
+    local patch_file="$REPO_ROOT/third_party/ish/patches/ish-kernel-fixes.diff"
+    local patch_sha="none"
+    if [ -f "$patch_file" ]; then
+        patch_sha="$(shasum -a 256 "$patch_file" | awk '{print $1}')"
+    fi
     local marker="$ISH_SRC/.ish-source-commit"
-    if [ -f "$marker" ] && [ "$(cat "$marker")" = "$ISH_COMMIT" ] && [ -f "$ISH_SRC/meson.build" ]; then
-        log_info "Source already extracted at $ISH_COMMIT, skipping"
+    local expected_marker="$ISH_COMMIT $patch_sha"
+    if [ -f "$marker" ] && [ "$(cat "$marker")" = "$expected_marker" ] && [ -f "$ISH_SRC/meson.build" ]; then
+        log_info "Source already extracted at $ISH_COMMIT (patches $patch_sha), skipping"
         return
     fi
     log_info "Extracting tarball to $ISH_SRC ..."
@@ -221,7 +230,15 @@ fetch_ish_source() {
     [ -f "$ISH_SRC/meson.build" ] || log_error "Extracted source has no meson.build — tarball contents unexpected"
     [ -f "$ISH_SRC/tools/fakefsify.c" ] || log_error "Extracted source has no tools/fakefsify.c — tarball contents unexpected"
     [ -d "$ISH_SRC/vdso/arm64" ] || log_error "Extracted source has no vdso/arm64 — tarball contents unexpected"
-    printf '%s\n' "$ISH_COMMIT" > "$marker"
+    # Apply the dsh-go iSH kernel patches (P0 AF_UNIX backing prefix, P1
+    # proc-fd magic link). The tree is freshly extracted, so `patch` applies
+    # cleanly; a failure here is fatal — a half-patched kernel must never build.
+    if [ -f "$patch_file" ]; then
+        log_info "Applying iSH kernel patches ($patch_file) ..."
+        (cd "$ISH_SRC" && patch -p1 < "$patch_file") || log_error "Failed to apply iSH kernel patches"
+        log_success "iSH kernel patches applied"
+    fi
+    printf '%s\n' "$expected_marker" > "$marker"
     log_success "Source extracted at $ISH_COMMIT"
 }
 
