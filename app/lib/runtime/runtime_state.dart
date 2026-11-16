@@ -10,8 +10,20 @@ import 'runtime_bridge.dart';
 import 'ish/ish_runtime_bridge.dart';
 import 'ish/ish_runtime_service.dart';
 import 'native_node/native_node_runtime_bridge.dart';
+import 'shellbox/shellbox_runtime_bridge.dart';
 
 final runtimeBridgeProvider = Provider<RuntimeBridge>((ref) => Platform.isIOS ? NativeNodeRuntimeBridge() : RuntimeBridge());
+
+/// The `dsh/shellbox` background bridge (iOS only). Separate from
+/// [runtimeBridgeProvider] (which stays NativeNodeRuntimeBridge on iOS):
+/// the iOS background settings page reads this provider so it always
+/// gets a ShellBoxRuntimeBridge. Only the background methods are used
+/// through it (setBackgroundEnabled / updateActiveTasks /
+/// requestContinuedProcessing / cancelContinuedProcessing /
+/// getBackgroundExecutionState / getBackgroundCapabilities); the bridge's
+/// other methods (start/stop/install/logs) are unimplemented on iOS and
+/// must not be called through this provider.
+final shellBoxBackgroundBridgeProvider = Provider<ShellBoxRuntimeBridge>((ref) => ShellBoxRuntimeBridge());
 
 /// The iSH Linux guest bridge (MethodChannel `dsh/ish`), held next to
 /// the Node bridge: the two runtimes have independent lifecycles and

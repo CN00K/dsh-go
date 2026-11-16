@@ -4,13 +4,17 @@
 <dict>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
     <array><string>$(PRODUCT_BUNDLE_IDENTIFIER).dsh.continued.*</string></array>
-    <key>UIBackgroundModes</key><array><string>processing</string></array>
+    <key>UIBackgroundModes</key><array><string>processing</string><string>audio</string><string>location</string></array>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>Select photos to attach to a conversation or customize the app.</string>
     <key>NSCameraUsageDescription</key>
     <string>Take a photo to attach to a conversation or scan a connection code.</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Unlock DSH Go when you enable app lock.</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>DSH Go keeps your agent running in the background while a task is active, so it can continue working after you leave the app.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>DSH Go uses your location only while a background task is running, to keep the agent alive after you leave the app.</string>
     <key>UIFileSharingEnabled</key>
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>

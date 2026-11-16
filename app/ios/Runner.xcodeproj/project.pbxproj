@@ -35,6 +35,8 @@
 		D5E200000000000000000007 /* RootfsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000013 /* RootfsManager.swift */; };
 		D5E200000000000000000008 /* ISHRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000014 /* ISHRuntime.swift */; };
 		D5E200000000000000000009 /* IShLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000015 /* IShLoopbackService.swift */; };
+		D5F200000000000000000001 /* FilesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F100000000000000000001 /* FilesPlugin.swift */; };
+		D5F200000000000000000002 /* ShellBoxPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F100000000000000000002 /* ShellBoxPlugin.swift */; };
 		D5E200000000000000000010 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000019 /* libsqlite3.tbd */; };
 		D5E200000000000000000011 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000020 /* libz.tbd */; };
 		D5E200000000000000000012 /* alpine-rootfs.zip in Resources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000021 /* alpine-rootfs.zip */; };
@@ -133,6 +135,8 @@
 		D5E100000000000000000013 /* RootfsManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RootfsManager.swift; sourceTree = "<group>"; };
 		D5E100000000000000000014 /* ISHRuntime.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ISHRuntime.swift; sourceTree = "<group>"; };
 		D5E100000000000000000015 /* IShLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IShLoopbackService.swift; sourceTree = "<group>"; };
+		D5F100000000000000000001 /* FilesPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FilesPlugin.swift; sourceTree = "<group>"; };
+		D5F100000000000000000002 /* ShellBoxPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ShellBoxPlugin.swift; sourceTree = "<group>"; };
 		D5E100000000000000000016 /* libish.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000017 /* libish_emu.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_emu.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000018 /* libfakefs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libfakefs.a"; sourceTree = SOURCE_ROOT; };
@@ -280,6 +284,8 @@
 				D5E100000000000000000013 /* RootfsManager.swift */,
 				D5E100000000000000000014 /* ISHRuntime.swift */,
 				D5E100000000000000000015 /* IShLoopbackService.swift */,
+				D5F100000000000000000001 /* FilesPlugin.swift */,
+				D5F100000000000000000002 /* ShellBoxPlugin.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -583,6 +589,8 @@
 				D5E200000000000000000007 /* RootfsManager.swift in Sources */,
 				D5E200000000000000000008 /* ISHRuntime.swift in Sources */,
 				D5E200000000000000000009 /* IShLoopbackService.swift in Sources */,
+				D5F200000000000000000001 /* FilesPlugin.swift in Sources */,
+				D5F200000000000000000002 /* ShellBoxPlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

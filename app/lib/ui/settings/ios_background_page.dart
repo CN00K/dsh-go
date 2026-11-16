@@ -22,14 +22,16 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
   StreamSubscription<Map<String, dynamic>>? _subscription;
   late final AppLifecycleListener _lifecycle;
 
-  late final ShellBoxRuntimeBridge? _bridge;
+  late final ShellBoxRuntimeBridge _bridge;
 
   @override
   void initState() {
     super.initState();
-    final bridge = ref.read(runtimeBridgeProvider);
-    _bridge = bridge is ShellBoxRuntimeBridge ? bridge : null;
-    _subscription = _bridge?.backgroundChanges.listen((snapshot) {
+    // The background bridge is separate from runtimeBridgeProvider (which
+    // stays NativeNodeRuntimeBridge on iOS): it talks to the native
+    // `dsh/shellbox` channel and only the background methods are used.
+    _bridge = ref.read(shellBoxBackgroundBridgeProvider);
+    _subscription = _bridge.backgroundChanges.listen((snapshot) {
       if (mounted) setState(() => _snapshot = snapshot);
     });
     _lifecycle = AppLifecycleListener(onResume: _refresh);
@@ -38,7 +40,6 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
 
   Future<void> _refresh() async {
     final bridge = _bridge;
-    if (bridge == null) return;
     try {
       final capabilities = await bridge.getBackgroundCapabilities();
       final snapshot = await bridge.getBackgroundExecutionState();
@@ -74,12 +75,6 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final bridge = _bridge;
-    if (bridge == null) {
-      return AppPage.list(
-        title: l10n.iosBackgroundTitle,
-        children: [ListTile(title: Text(l10n.iosBackgroundUnavailable))],
-      );
-    }
     final state = switch (_snapshot?['state']) {
       'foreground' => l10n.iosBackgroundForeground,
       'resuming' => l10n.iosBackgroundResuming,

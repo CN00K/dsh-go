@@ -29,5 +29,8 @@ import UserNotifications
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshFiles") {
       FilesPlugin.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshShellBox") {
+      ShellBoxPlugin.register(with: registrar)
+    }
   }
 }
