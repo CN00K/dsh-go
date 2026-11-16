@@ -789,10 +789,17 @@ private final class ExecSession {
       frame["cancelled"] = true
     }
     sendJSONFrame(frame)
-    connection?.sendChunkEnd()
+    // Close only after the terminating chunk has been handed to the
+    // network stack. The sends are async — closing first cancels the
+    // connection and discards the final frame, so the client sees the
+    // stream die mid-response as "aborted" (build 52/53 agent bash).
+    // Sends are serialised through sendQueue, so the chunk-end
+    // completion also implies the final frame was processed.
     // Close on the service queue (ExecSession runs on its own queue;
     // HTTPConnection state is owned by the service queue).
-    connection?.closeFromAnyQueue()
+    connection?.sendChunkEnd { [weak self] in
+      self?.connection?.closeFromAnyQueue()
+    }
   }
 
   /// Encode one NDJSON line ({stream, line}) and send it as a chunk.
@@ -835,10 +842,13 @@ extension HTTPConnection {
     send(prefix)
   }
 
-  /// Send the terminating "0\r\n\r\n" chunk (does not close; the
-  /// caller closes after).
-  fileprivate func sendChunkEnd() {
-    send(Data("0\r\n\r\n".utf8))
+  /// Send the terminating "0\r\n\r\n" chunk. Calls completion when the
+  /// chunk has been handed to the network stack; the caller closes
+  /// after (closing earlier discards the final frame — close() cancels
+  /// the connection before the async sends flush, so the client sees
+  /// the stream die mid-response as "aborted").
+  fileprivate func sendChunkEnd(completion: @escaping () -> Void = {}) {
+    send(Data("0\r\n\r\n".utf8), completion: completion)
   }
 }
 
