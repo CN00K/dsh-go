@@ -865,7 +865,7 @@ final class BrowserUseManager: NSObject, ObservableObject {
         let status = http?.statusCode ?? 0
         let mime = http?.mimeType ?? "application/octet-stream"
         let filename = Self.parseContentDispositionFilename(http?.value(forHTTPHeaderField: "Content-Disposition"))
-            ?? url.lastPathComponent.isEmpty ? nil : url.lastPathComponent
+            ?? (url.lastPathComponent.isEmpty ? nil : url.lastPathComponent)
         // Text-ish content comes back inline (truncated); anything else is
         // saved to Documents and the path is returned instead of the bytes.
         let textTypes = ["text/", "application/json", "application/xml", "+json", "+xml"]
@@ -910,7 +910,11 @@ final class BrowserUseManager: NSObject, ObservableObject {
 
     private func getCookies(keywords: [String]?, fuzzy: Bool) async -> BrowserActionResult {
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        let cookies = await store.getAllCookies()
+        // No async overload in this SDK (Xcode 26.6): getAllCookies only takes
+        // a completion handler — bridge it with a continuation.
+        let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+            store.getAllCookies { cookies in continuation.resume(returning: cookies) }
+        }
         let filtered: [HTTPCookie]
         if let keywords, !keywords.isEmpty {
             filtered = cookies.filter { cookie in

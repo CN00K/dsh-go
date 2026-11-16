@@ -18,6 +18,10 @@ final class BrowserTabPool: ObservableObject {
 
     // MARK: - Tab
 
+    // Nested types do NOT inherit the enclosing class's @MainActor
+    // isolation (Swift 6): Tab must be @MainActor itself, or its computed
+    // properties cannot read the manager's @Published state.
+    @MainActor
     struct Tab: Identifiable {
         let id: Int
         let manager: BrowserUseManager

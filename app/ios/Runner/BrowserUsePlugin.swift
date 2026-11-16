@@ -36,7 +36,9 @@ public final class BrowserUsePlugin: NSObject, FlutterPlugin {
 
     /// The single tab pool for the app: the MethodChannel and the loopback
     /// service share it, so Dart and the agent see the same tabs.
-    static let sharedPool = BrowserTabPool()
+    /// @MainActor: BrowserTabPool.init is main-actor-isolated, so the
+    /// shared instance must be too; all users already hop to @MainActor.
+    @MainActor static let sharedPool = BrowserTabPool()
 
     private let channel: FlutterMethodChannel
 
@@ -50,7 +52,9 @@ public final class BrowserUsePlugin: NSObject, FlutterPlugin {
         case "execute":
             execute(call, result: result)
         case "status":
-            result(Self.statusDict())
+            Task { @MainActor in
+                result(Self.statusDict())
+            }
         case "openBrowser":
             Task { @MainActor in
                 Self.sharedPool.ensureTabForUI()
@@ -81,9 +85,10 @@ public final class BrowserUsePlugin: NSObject, FlutterPlugin {
     }
 
     /// Current pool status for Dart / the browser page.
-    static func statusDict() -> [String: Any] {
-        // Must be called on the main actor (pool is @MainActor); the channel
-        // handler runs on the main thread, so this is safe here.
+    /// @MainActor: reads the @MainActor pool (tabs, selectedTabId, maxTabs);
+    /// all callers already run on the main actor (channel handler hops via
+    /// Task, loopback service hops via Task).
+    @MainActor static func statusDict() -> [String: Any] {
         let pool = sharedPool
         var tabs: [[String: Any]] = []
         for tab in pool.tabs {
@@ -100,7 +105,8 @@ public final class BrowserUsePlugin: NSObject, FlutterPlugin {
     }
 
     /// Tell Dart the browser state changed (after every execute).
-    private func pushStateChanged() {
+    /// @MainActor: reads the pool via statusDict; callers run in @MainActor Tasks.
+    @MainActor private func pushStateChanged() {
         channel.invokeMethod("browserStateChanged", arguments: Self.statusDict())
     }
 }
