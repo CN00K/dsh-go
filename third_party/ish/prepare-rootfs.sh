@@ -143,7 +143,10 @@ check_prerequisites() {
         log_error "iSH source not found at $ISH_SRC. Run third_party/ish/build-ish.sh FIRST (it downloads + extracts the pinned iSH tarball), then re-run this script."
     fi
     local marker="$ISH_SRC/.ish-source-commit"
-    if [ -f "$marker" ] && [ "$(cat "$marker")" != "$ISH_COMMIT" ]; then
+    # build-ish.sh writes "<commit> <patch-sha>" (the patch set is part of
+    # the marker since the P0/P1 kernel patch landed); compare only the
+    # commit field — a changed patch already forces a fresh extract there.
+    if [ -f "$marker" ] && [ "$(awk '{print $1}' "$marker")" != "$ISH_COMMIT" ]; then
         log_error "iSH source on disk is at $(cat "$marker"), but this script pins $ISH_COMMIT. Re-run build-ish.sh to re-extract the pinned source first."
     fi
 
