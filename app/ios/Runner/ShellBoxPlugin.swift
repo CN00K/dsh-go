@@ -25,14 +25,31 @@
 //    or the system expires it as stalled; the system task card has a Stop
 //    button (indistinguishable from expiry via the API).
 //
-//  Deliberately NOT here (follow-ups, need their own UI + native work):
-//  Live Activity, task notifications, privacy mode, background reading.
+//  Also here (settings page, 6 toggles):
+//  - Prefer continued processing (iOS 26+): gates requestContinuedProcessing.
+//  - Live Activity (DSHActivityAttributes, shared file): started when the app
+//    backgrounds with an active task, ended on task outcome / expiry / toggle
+//    off. Rendered by the PetLiveActivity widget extension (a second
+//    ActivityConfiguration in the same bundle); no new target was needed.
+//  - Task notifications (UNUserNotificationCenter): posted when a background
+//    task completes / fails / expires; auth requested on toggle-on only.
+//  - Privacy mode: Live Activity + notification + speech show a generic
+//    message only, never the task title / summary.
+//  - Background reading (AVSpeechSynthesizer): reads the reply aloud when a
+//    background task completes; background only, never in the foreground.
+//  Preferences live in UserDefaults (single source of truth); Dart reads and
+//  writes them through getBackgroundPreferences / setBackgroundPreference.
+//  notifyTaskOutcome is the completion hook for the runtime to call when a
+//  background task finishes (caller wiring is a follow-up, same as the
+//  requestContinuedProcessing run-start hook).
 
+import ActivityKit
 import AVFoundation
 import BackgroundTasks
 import CoreLocation
 import Flutter
 import UIKit
+import UserNotifications
 
 public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDelegate {
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -44,6 +61,11 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
     }
 
     private static let enabledKey = "dsh.shellbox.backgroundEnabled"
+    private static let preferContinuedKey = "dsh.shellbox.preferContinuedProcessing"
+    private static let liveActivityKey = "dsh.shellbox.liveActivityEnabled"
+    private static let notificationsKey = "dsh.shellbox.notificationsEnabled"
+    private static let privacyKey = "dsh.shellbox.privacyMode"
+    private static let speakKey = "dsh.shellbox.backgroundSpeakEnabled"
 
     private let channel: FlutterMethodChannel
 
@@ -64,6 +86,36 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
     private var enabled: Bool
     private var registrationFailed = false
     private var resumeTimer: Timer?
+    // MARK: - Preferences (UserDefaults is the single source of truth)
+
+    /// Default true: the pre-existing behaviour submits a continued task when
+    /// enabled + foreground + iOS 26.
+    private var preferContinued: Bool {
+        UserDefaults.standard.object(forKey: Self.preferContinuedKey) as? Bool ?? true
+    }
+    private var liveActivityEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.liveActivityKey)
+    }
+    private var notificationsEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.notificationsKey)
+    }
+    private var privacyMode: Bool {
+        UserDefaults.standard.bool(forKey: Self.privacyKey)
+    }
+    private var backgroundSpeak: Bool {
+        UserDefaults.standard.bool(forKey: Self.speakKey)
+    }
+
+    // MARK: - Live Activity / speech state
+
+    /// The running DSH agent Live Activity, stored as Any so this property
+    /// compiles on older deployment targets (same pattern as continuedTask).
+    private var liveActivity: Any?
+    private var liveActivityStatus = "running"
+    /// When the current task started; used by the privacy notification body
+    /// ("1 task completed · 2m 30s").
+    private var taskStartedAt: Date?
+    private let speechSynthesizer = AVSpeechSynthesizer()
 
     /// The active task's identity (for the continued-task card + the
     /// cancelBackgroundTask push). Set by updateActiveTasks.
@@ -101,6 +153,9 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
             startSilentAudio()
             startLocation(requestAuthorization: false)
         }
+        // A Live Activity from a previous process has no task behind it any
+        // more; end it so a stale card does not linger.
+        if #available(iOS 16.2, *) { cleanupStaleLiveActivities() }
     }
 
     deinit {
@@ -124,6 +179,19 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
             requestContinuedProcessing(result: result)
         case "cancelContinuedProcessing":
             cancelContinuedProcessing()
+            result(nil)
+        case "getBackgroundPreferences":
+            result(backgroundPreferences())
+        case "setBackgroundPreference":
+            if let args = call.arguments as? [String: Any],
+               let key = args["key"] as? String {
+                setBackgroundPreference(key: key, value: args["value"] as? Bool ?? false)
+            }
+            result(nil)
+        case "notifyTaskOutcome":
+            if let args = call.arguments as? [String: Any] {
+                notifyTaskOutcome(args)
+            }
             result(nil)
         case "getBackgroundExecutionState":
             result(snapshot())
@@ -184,7 +252,15 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
         let sessionId = args["sessionId"] as? String ?? ""
         let taskId = args["taskId"] as? String ?? ""
         let title = args["title"] as? String ?? "DSH agent"
+        // A new taskId restarts the clock (privacy notification body) and
+        // refreshes the Live Activity title if one is showing.
+        if activeTaskInfo?.taskId != taskId {
+            taskStartedAt = Date()
+        }
         activeTaskInfo = (runtimeInstanceId, sessionId, taskId, title)
+        if liveActivity != nil, #available(iOS 16.2, *) {
+            updateLiveActivity(status: liveActivityStatus, detail: nil)
+        }
     }
 
     // MARK: - Continued processing (iOS 26+)
@@ -192,6 +268,8 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
     private func requestContinuedProcessing(result: @escaping FlutterResult) {
         // The system only accepts the request from the foreground app.
         guard enabled else { result(nil); return }
+        // Toggle 2: when the user prefers audio + location only, do not submit.
+        guard preferContinued else { result(nil); return }
         guard UIApplication.shared.applicationState == .active else { result(nil); return }
         guard #available(iOS 26.0, *) else { result(nil); return }
         submitContinuedTask(result: result)
@@ -288,6 +366,13 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
                 "taskId": info.taskId,
             ])
         }
+        // The background authorization ended: surface it like a task outcome.
+        if #available(iOS 16.2, *) { endLiveActivity(status: "expired", detail: nil) }
+        if UIApplication.shared.applicationState != .active {
+            postTaskNotification(title: activeTaskInfo?.title, summary: nil,
+                                 outcome: "expired", sessionId: activeTaskInfo?.sessionId ?? "")
+            speakTaskOutcome(title: activeTaskInfo?.title, summary: nil, outcome: "expired")
+        }
         pushState()
     }
 
@@ -327,6 +412,274 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
         continuedHandlerHold?.signal()
         continuedHandlerHold = nil
         return true
+    }
+
+
+    // MARK: - Preferences (toggles 2-6)
+
+    private func backgroundPreferences() -> [String: Any] {
+        return [
+            "preferContinuedProcessing": preferContinued,
+            "liveActivity": liveActivityEnabled,
+            "notifications": notificationsEnabled,
+            "privacyMode": privacyMode,
+            "backgroundSpeak": backgroundSpeak,
+        ]
+    }
+
+    private func setBackgroundPreference(key: String, value: Bool) {
+        switch key {
+        case "preferContinuedProcessing":
+            UserDefaults.standard.set(value, forKey: Self.preferContinuedKey)
+            // Turning it off ends the continued task in flight; the silent
+            // audio + location keep-alive is unaffected.
+            if !value, finishContinuedTask(success: true, reason: "preferContinuedOff") {
+                state = .completed
+                pushState()
+            }
+        case "liveActivity":
+            UserDefaults.standard.set(value, forKey: Self.liveActivityKey)
+            if value {
+                if UIApplication.shared.applicationState != .active, #available(iOS 16.2, *) {
+                    startLiveActivity()
+                }
+            } else if #available(iOS 16.2, *) {
+                endLiveActivity(status: "expired", detail: nil)
+            }
+        case "notifications":
+            UserDefaults.standard.set(value, forKey: Self.notificationsKey)
+            // Authorization is requested only when the user turns this on,
+            // never at launch.
+            if value { requestNotificationAuthorization() }
+        case "privacyMode":
+            UserDefaults.standard.set(value, forKey: Self.privacyKey)
+            // Apply the new privacy level to a showing Live Activity at once.
+            if liveActivity != nil, #available(iOS 16.2, *) {
+                updateLiveActivity(status: liveActivityStatus, detail: nil)
+            }
+        case "backgroundSpeak":
+            UserDefaults.standard.set(value, forKey: Self.speakKey)
+        default:
+            NSLog("[ShellBox] unknown background preference key: \(key)")
+        }
+    }
+
+    private func requestNotificationAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error { NSLog("[ShellBox] notification authorization error: \(error)") }
+            NSLog("[ShellBox] notification authorization granted=\(granted)")
+        }
+    }
+
+    // MARK: - Task outcome (completion hook)
+
+    /// Called by the runtime when a background task finishes. Ends the Live
+    /// Activity; while the app is in the background it also posts the
+    /// notification and reads the reply aloud (both honour the toggles and
+    /// privacy mode). In the foreground the user can see the result, so
+    /// nothing is posted or spoken.
+    private func notifyTaskOutcome(_ args: [String: Any]) {
+        let outcome = args["outcome"] as? String ?? "completed"
+        let title = args["title"] as? String
+        let summary = args["summary"] as? String
+        let sessionId = args["sessionId"] as? String ?? ""
+        if #available(iOS 16.2, *) { endLiveActivity(status: outcome, detail: summary) }
+        guard UIApplication.shared.applicationState != .active else { return }
+        postTaskNotification(title: title, summary: summary, outcome: outcome, sessionId: sessionId)
+        speakTaskOutcome(title: title, summary: summary, outcome: outcome)
+    }
+
+    // MARK: - Live Activity (DSH agent task)
+
+    @available(iOS 16.2, *)
+    private func startLiveActivity() {
+        guard liveActivityEnabled else { return }
+        guard liveActivity == nil else { return }
+        guard let info = activeTaskInfo else { return }
+        // Adopt an activity that is already running instead of requesting a
+        // second one (e.g. after the toggle was flipped off and on again).
+        if let existing = Activity<DSHActivityAttributes>.activities.first {
+            liveActivity = existing
+            liveActivityStatus = "running"
+            return
+        }
+        let attrs = DSHActivityAttributes(startedAt: taskStartedAt ?? Date())
+        liveActivityStatus = "running"
+        let state = DSHActivityAttributes.ContentState(
+            title: displayTitle(for: info.title),
+            status: liveActivityStatus,
+            detail: displayDetail(for: nil))
+        do {
+            let activity = try Activity<DSHActivityAttributes>.request(
+                attributes: attrs,
+                content: ActivityContent(state: state, staleDate: nil))
+            liveActivity = activity
+            NSLog("[ShellBox] Live Activity started")
+        } catch {
+            NSLog("[ShellBox] Live Activity start failed: \(error)")
+        }
+    }
+
+    @available(iOS 16.2, *)
+    private func updateLiveActivity(status: String, detail: String?) {
+        guard let activity = liveActivity as? Activity<DSHActivityAttributes> else { return }
+        liveActivityStatus = status
+        let title = displayTitle(for: activeTaskInfo?.title ?? "DSH agent")
+        let state = DSHActivityAttributes.ContentState(
+            title: title, status: status, detail: displayDetail(for: detail))
+        Task { @MainActor in
+            await activity.update(ActivityContent(state: state, staleDate: nil))
+        }
+    }
+
+    @available(iOS 16.2, *)
+    private func endLiveActivity(status: String, detail: String?) {
+        guard let activity = liveActivity as? Activity<DSHActivityAttributes> else { return }
+        liveActivity = nil
+        liveActivityStatus = status
+        let title = displayTitle(for: activeTaskInfo?.title ?? "DSH agent")
+        let state = DSHActivityAttributes.ContentState(
+            title: title, status: status, detail: displayDetail(for: detail))
+        Task { @MainActor in
+            await activity.end(ActivityContent(state: state, staleDate: nil),
+                               dismissalPolicy: .immediate)
+        }
+    }
+
+    @available(iOS 16.2, *)
+    private func cleanupStaleLiveActivities() {
+        // From a previous process: no task behind them any more.
+        for activity in Activity<DSHActivityAttributes>.activities {
+            Task { @MainActor in
+                let state = DSHActivityAttributes.ContentState(
+                    title: "DSH agent", status: "expired", detail: nil)
+                await activity.end(ActivityContent(state: state, staleDate: nil),
+                                   dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    // MARK: - Task notifications
+
+    private func postTaskNotification(title: String?, summary: String?, outcome: String, sessionId: String) {
+        guard notificationsEnabled else { return }
+        guard UIApplication.shared.applicationState != .active else { return }
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self] settings in
+            guard settings.authorizationStatus == .authorized else {
+                NSLog("[ShellBox] notifications not authorized; skipping task notification")
+                return
+            }
+            self?.deliverTaskNotification(title: title, summary: summary,
+                                          outcome: outcome, sessionId: sessionId, center: center)
+        }
+    }
+
+    private func deliverTaskNotification(title: String?, summary: String?, outcome: String,
+                                         sessionId: String, center: UNUserNotificationCenter) {
+        let content = UNMutableNotificationContent()
+        if privacyMode {
+            // Generic only: never the task title or the reply summary.
+            switch outcome {
+            case "failed": content.title = isChinese ? "❌ 任务失败" : "❌ Task failed"
+            case "expired": content.title = isChinese ? "⏸ 后台运行已结束" : "⏸ Background run ended"
+            default: content.title = isChinese ? "✅ 任务已完成" : "✅ Task completed"
+            }
+            content.body = privacyNotificationBody(outcome: outcome)
+        } else {
+            let mark: String
+            switch outcome {
+            case "failed": mark = "❌"
+            case "expired": mark = "⏸"
+            default: mark = "✅"
+            }
+            let shownTitle = (title?.isEmpty == false) ? title! : "DSH agent"
+            content.title = "\(mark) \(shownTitle)"
+            content.body = (summary?.isEmpty == false) ? summary! : genericSpokenText(outcome: outcome)
+        }
+        content.sound = .default
+        content.categoryIdentifier = "dsh.background.task"
+        if !sessionId.isEmpty { content.userInfo = ["sessionId": sessionId] }
+        // One notification per session: a later outcome replaces the earlier one.
+        let identifier = sessionId.isEmpty
+            ? "dsh.background.task.\(UUID().uuidString)"
+            : "dsh.background.task.\(sessionId)"
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        center.add(request) { error in
+            if let error { NSLog("[ShellBox] notification post failed: \(error)") }
+        }
+    }
+
+    private func privacyNotificationBody(outcome: String) -> String {
+        let base: String
+        switch outcome {
+        case "failed": base = isChinese ? "1 个任务失败" : "1 task failed"
+        case "expired": base = isChinese ? "1 个后台任务已结束" : "1 background task ended"
+        default: base = isChinese ? "1 个任务已完成" : "1 task completed"
+        }
+        guard let startedAt = taskStartedAt else { return base }
+        let elapsed = Int(Date().timeIntervalSince(startedAt).rounded())
+        guard elapsed > 0 else { return base }
+        let formatted: String
+        if elapsed >= 3600 {
+            formatted = String(format: "%dh %dm", elapsed / 3600, (elapsed % 3600) / 60)
+        } else if elapsed >= 60 {
+            formatted = String(format: "%dm %ds", elapsed / 60, elapsed % 60)
+        } else {
+            formatted = String(format: "%ds", elapsed)
+        }
+        return "\(base) · \(formatted)"
+    }
+
+    // MARK: - Background reading (text-to-speech)
+
+    private func speakTaskOutcome(title: String?, summary: String?, outcome: String) {
+        guard backgroundSpeak else { return }
+        guard UIApplication.shared.applicationState != .active else { return }
+        let text: String
+        if privacyMode {
+            // Spoken words can be overheard: generic message only.
+            text = genericSpokenText(outcome: outcome)
+        } else if let summary, !summary.isEmpty {
+            text = summary
+        } else if let title, !title.isEmpty {
+            text = title
+        } else {
+            text = genericSpokenText(outcome: outcome)
+        }
+        let utterance = AVSpeechUtterance(string: text)
+        // Voice matching the device language; nil falls back to the system
+        // default voice.
+        if let code = Locale.current.languageCode,
+           let voice = AVSpeechSynthesisVoice(language: code) {
+            utterance.voice = voice
+        }
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        speechSynthesizer.speak(utterance)
+    }
+
+    private func genericSpokenText(outcome: String) -> String {
+        switch outcome {
+        case "failed": return isChinese ? "任务失败" : "Task failed"
+        case "expired": return isChinese ? "后台运行已结束" : "Background run ended"
+        default: return isChinese ? "任务已完成" : "Task completed"
+        }
+    }
+
+    // MARK: - Display helpers (privacy)
+
+    private var isChinese: Bool { Locale.current.languageCode == "zh" }
+
+    /// Title shown in the Live Activity. Privacy mode hides the real title.
+    private func displayTitle(for title: String) -> String {
+        privacyMode ? "DSH agent" : title
+    }
+
+    /// Detail shown in the Live Activity. Privacy mode hides it entirely.
+    private func displayDetail(for detail: String?) -> String? {
+        guard !privacyMode else { return nil }
+        guard let detail, !detail.isEmpty else { return nil }
+        return detail
     }
 
     // MARK: - Keep-alive: silent audio
@@ -443,6 +796,10 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
         resumeTimer = nil
         state = continuedTask != nil ? .continuedProcessing : .backgroundGrace
         pushState()
+        // Show the Live Activity while the task runs in the background.
+        if enabled, liveActivityEnabled, activeTaskInfo != nil, #available(iOS 16.2, *) {
+            startLiveActivity()
+        }
     }
 
     @objc private func appWillEnterForeground() {

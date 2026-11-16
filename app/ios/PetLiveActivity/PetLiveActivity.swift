@@ -6,7 +6,7 @@ import WidgetKit
 
 @main
 struct PetLiveActivityBundle: WidgetBundle {
-  var body: some Widget { PetLiveActivity() }
+  var body: some Widget { PetLiveActivity(); DSHAgentLiveActivity() }
 }
 
 struct PetLiveActivity: Widget {
@@ -537,5 +537,84 @@ private enum Emoji {
     case "error": return "😿"
     default: return "😺"
     }
+  }
+}
+
+/// Live Activity for a DSH agent background task (Settings → iOS background
+/// running → 实时活动). Minimal on purpose: title + status, no pet art.
+/// Attributes live in Shared/DSHActivityAttributes.swift so the Runner target
+/// can start / update / end this activity.
+@available(iOS 16.2, *)
+struct DSHAgentLiveActivity: Widget {
+  var body: some WidgetConfiguration {
+    ActivityConfiguration(for: DSHActivityAttributes.self) { context in
+      VStack(alignment: .leading, spacing: 4) {
+        Text(context.state.title)
+          .font(.headline)
+          .lineLimit(1)
+        Text(dshActivityStatusText(context.state.status))
+          .font(.subheadline)
+          .foregroundStyle(.secondary)
+        if let detail = context.state.detail, !detail.isEmpty {
+          Text(detail)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+        }
+      }
+      .padding()
+      .activityBackgroundTint(Color(.systemBackground))
+      .activitySystemActionForegroundColor(.primary)
+    } dynamicIsland: { context in
+      DynamicIsland {
+        DynamicIslandExpandedRegion(.leading) {
+          Text(context.state.title)
+            .font(.system(size: 14, weight: .semibold))
+            .lineLimit(1)
+        }
+        DynamicIslandExpandedRegion(.trailing) {
+          Text(dshActivityStatusText(context.state.status))
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        DynamicIslandExpandedRegion(.bottom) {
+          if let detail = context.state.detail, !detail.isEmpty {
+            Text(detail)
+              .font(.system(size: 12))
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+          }
+        }
+      } compactLeading: {
+        Text("DSH")
+          .font(.system(size: 12, weight: .bold))
+      } compactTrailing: {
+        Text(dshActivityStatusShort(context.state.status))
+          .font(.system(size: 12))
+      } minimal: {
+        Text(dshActivityStatusShort(context.state.status))
+          .font(.system(size: 12))
+      }
+    }
+  }
+}
+
+private func dshActivityStatusText(_ status: String) -> String {
+  let zh = Locale.current.languageCode == "zh"
+  switch status {
+  case "completed": return zh ? "已完成" : "Completed"
+  case "failed": return zh ? "失败" : "Failed"
+  case "expired": return zh ? "已结束" : "Ended"
+  default: return zh ? "运行中" : "Running"
+  }
+}
+
+private func dshActivityStatusShort(_ status: String) -> String {
+  switch status {
+  case "completed": return "✓"
+  case "failed": return "✕"
+  case "expired": return "—"
+  default: return "…"
   }
 }

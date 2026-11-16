@@ -13,6 +13,7 @@
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
 		491DA3A23DF992330792DB1A /* PetLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = FFE6541DEFF151A9C6BD9402 /* PetLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		573520B481EA67D54B594BCC /* PetActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20017C4520EC9675D24EE1C5 /* PetActivityAttributes.swift */; };
+		D5F400000000000000000001 /* DSHActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F300000000000000000001 /* DSHActivityAttributes.swift */; };
 		640C25198CB22A499C868EB1 /* PetLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E350E022F325AE1242B2BC9 /* PetLiveActivity.swift */; };
 		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
 		74A91C8AAF87F617741C0CF7 /* PetLiveActivityPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23D518D49B6E8E558011F937 /* PetLiveActivityPlugin.swift */; };
@@ -22,6 +23,7 @@
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
 		D075770FD1165A62194A3992 /* PetActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20017C4520EC9675D24EE1C5 /* PetActivityAttributes.swift */; };
+		D5F400000000000000000002 /* DSHActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F300000000000000000001 /* DSHActivityAttributes.swift */; };
 		D56000000000000000000001 /* NotifyPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56000000000000000000002 /* NotifyPlugin.swift */; };
 		D5B000000000000000000001 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = D5B000000000000000000002 /* Localizable.strings */; };
 		D5B000000000000000000005 /* BackgroundTasks.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5B000000000000000000006 /* BackgroundTasks.framework */; };
@@ -92,6 +94,7 @@
 		176BBCAE2474B02FC2FDAAE1 /* Pods-RunnerTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.release.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.release.xcconfig"; sourceTree = "<group>"; };
 		1E350E022F325AE1242B2BC9 /* PetLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PetLiveActivity/PetLiveActivity.swift; sourceTree = SOURCE_ROOT; };
 		20017C4520EC9675D24EE1C5 /* PetActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/PetActivityAttributes.swift; sourceTree = SOURCE_ROOT; };
+		D5F300000000000000000001 /* DSHActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/DSHActivityAttributes.swift; sourceTree = SOURCE_ROOT; };
 		23D518D49B6E8E558011F937 /* PetLiveActivityPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Runner/PetLiveActivityPlugin.swift; sourceTree = SOURCE_ROOT; };
 		331C807B294A618700263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		331C8081294A63A400263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -201,6 +204,7 @@
 			children = (
 				23D518D49B6E8E558011F937 /* PetLiveActivityPlugin.swift */,
 				20017C4520EC9675D24EE1C5 /* PetActivityAttributes.swift */,
+				D5F300000000000000000001 /* DSHActivityAttributes.swift */,
 				1E350E022F325AE1242B2BC9 /* PetLiveActivity.swift */,
 				CDA593B9C14ED658B1250A32 /* Info.plist */,
 				A514527612FC7C6A562F052C /* Runner.entitlements */,
@@ -566,6 +570,7 @@
 			files = (
 				640C25198CB22A499C868EB1 /* PetLiveActivity.swift in Sources */,
 				573520B481EA67D54B594BCC /* PetActivityAttributes.swift in Sources */,
+				D5F400000000000000000001 /* DSHActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -575,6 +580,7 @@
 			files = (
 				74A91C8AAF87F617741C0CF7 /* PetLiveActivityPlugin.swift in Sources */,
 				D075770FD1165A62194A3992 /* PetActivityAttributes.swift in Sources */,
+				D5F400000000000000000002 /* DSHActivityAttributes.swift in Sources */,
 				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
 				D56000000000000000000001 /* NotifyPlugin.swift in Sources */,
 				D5C100000000000000000001 /* NativeNodeRuntime.swift in Sources */,

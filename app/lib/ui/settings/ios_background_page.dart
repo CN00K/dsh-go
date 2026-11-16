@@ -18,6 +18,7 @@ class IosBackgroundPage extends ConsumerStatefulWidget {
 class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
   Map<String, dynamic>? _capabilities;
   Map<String, dynamic>? _snapshot;
+  Map<String, dynamic>? _prefs;
   bool _failed = false;
   StreamSubscription<Map<String, dynamic>>? _subscription;
   late final AppLifecycleListener _lifecycle;
@@ -53,6 +54,14 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
     } catch (_) {
       if (mounted) setState(() => _failed = true);
     }
+    // Preferences are best-effort: a failure leaves the last known values
+    // in place instead of blanking the whole page.
+    try {
+      final prefs = await bridge.getBackgroundPreferences();
+      if (mounted) setState(() => _prefs = prefs);
+    } catch (_) {
+      // Keep the previous _prefs; toggles stay at their last known state.
+    }
   }
 
   Future<void> _change(Future<void> Function() action) async {
@@ -62,6 +71,10 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
     } catch (_) {
       if (mounted) setState(() => _failed = true);
     }
+  }
+
+  Future<void> _setPref(String key, bool value) async {
+    await _change(() => _bridge.setBackgroundPreference(key, value));
   }
 
   @override
@@ -91,15 +104,52 @@ class _IosBackgroundPageState extends ConsumerState<IosBackgroundPage> {
       'registration_failed' => l10n.iosBackgroundRegistrationFailed,
       _ => l10n.iosBackgroundSystemMayDecline,
     };
+    final continuedSupported = _capabilities?['continuedProcessingOSSupported'] == true;
+    final masterOn = _snapshot?['enabled'] == true;
     return AppPage.list(
       title: l10n.iosBackgroundTitle,
       children: [
         SwitchListTile.adaptive(
           title: Text(l10n.iosBackgroundEnable),
           subtitle: Text(l10n.iosBackgroundContinued),
-          value: _snapshot?['enabled'] == true,
-          onChanged: _capabilities?['continuedProcessingOSSupported'] == true
+          value: masterOn,
+          onChanged: continuedSupported
               ? (enabled) => _change(() => bridge.setBackgroundEnabled(enabled)) : null,
+        ),
+        SwitchListTile.adaptive(
+          title: Text(l10n.iosBackgroundPreferContinued),
+          subtitle: Text(l10n.iosBackgroundPreferContinuedSub),
+          value: _prefs?['preferContinuedProcessing'] == true,
+          onChanged: masterOn && continuedSupported
+              ? (enabled) => _setPref('preferContinuedProcessing', enabled) : null,
+        ),
+        SwitchListTile.adaptive(
+          title: Text(l10n.iosBackgroundLiveActivity),
+          subtitle: Text(l10n.iosBackgroundLiveActivitySub),
+          value: _prefs?['liveActivity'] == true,
+          onChanged: masterOn
+              ? (enabled) => _setPref('liveActivity', enabled) : null,
+        ),
+        SwitchListTile.adaptive(
+          title: Text(l10n.iosBackgroundNotifications),
+          subtitle: Text(l10n.iosBackgroundNotificationsSub),
+          value: _prefs?['notifications'] == true,
+          onChanged: masterOn
+              ? (enabled) => _setPref('notifications', enabled) : null,
+        ),
+        SwitchListTile.adaptive(
+          title: Text(l10n.iosBackgroundPrivacy),
+          subtitle: Text(l10n.iosBackgroundPrivacySub),
+          value: _prefs?['privacyMode'] == true,
+          onChanged: masterOn
+              ? (enabled) => _setPref('privacyMode', enabled) : null,
+        ),
+        SwitchListTile.adaptive(
+          title: Text(l10n.iosBackgroundSpeak),
+          subtitle: Text(l10n.iosBackgroundSpeakSub),
+          value: _prefs?['backgroundSpeak'] == true,
+          onChanged: masterOn
+              ? (enabled) => _setPref('backgroundSpeak', enabled) : null,
         ),
         ListTile(title: Text(reason)),
         ListTile(title: Text(l10n.iosBackgroundGrace)),

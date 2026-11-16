@@ -59,6 +59,23 @@ class ShellBoxRuntimeBridge extends RuntimeBridge {
   Future<String?> requestContinuedProcessing() => _channel.invokeMethod<String>('requestContinuedProcessing');
   Future<void> cancelContinuedProcessing() => _channel.invokeMethod<void>('cancelContinuedProcessing');
 
+  /// The five background preference toggles (persisted natively in
+  /// UserDefaults; the master `enabled` lives in getBackgroundExecutionState).
+  /// Keys: preferContinuedProcessing, liveActivity, notifications,
+  /// privacyMode, backgroundSpeak.
+  Future<Map<String, dynamic>> getBackgroundPreferences() async =>
+      (await _channel.invokeMapMethod<String, dynamic>('getBackgroundPreferences'))!;
+
+  Future<void> setBackgroundPreference(String key, bool value) =>
+      _channel.invokeMethod<void>('setBackgroundPreference', {'key': key, 'value': value});
+
+  /// Tell native a background task finished (completed/failed/expired) so it
+  /// can post the notification, read the reply aloud and end the Live
+  /// Activity. Only has an effect while the app is in the background.
+  /// The runtime does not call this yet (caller wiring is a follow-up).
+  Future<void> notifyTaskOutcome(Map<String, Object?> outcome) =>
+      _channel.invokeMethod<void>('notifyTaskOutcome', outcome);
+
 
   static RuntimeStatus _status(Map<String, dynamic> raw) {
     final error = raw['error'];
@@ -222,6 +239,9 @@ class _ShellBoxChannel extends MethodChannel {
       case 'networkMetered':
       case 'getBackgroundExecutionState':
       case 'getBackgroundCapabilities':
+      case 'getBackgroundPreferences':
+      case 'setBackgroundPreference':
+      case 'notifyTaskOutcome':
       case 'setBackgroundEnabled':
       case 'updateActiveTasks':
       case 'requestContinuedProcessing':
