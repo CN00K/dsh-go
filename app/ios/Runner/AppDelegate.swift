@@ -32,5 +32,8 @@ import UserNotifications
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshShellBox") {
       ShellBoxPlugin.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshBrowser") {
+      BrowserUsePlugin.register(with: registrar)
+    }
   }
 }

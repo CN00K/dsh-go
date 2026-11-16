@@ -164,7 +164,7 @@ public final class ShellBoxPlugin: NSObject, FlutterPlugin, CLLocationManagerDel
 
     // MARK: - Method channel
 
-    private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "setBackgroundEnabled":
             let enabled = (call.arguments as? [String: Any])?["enabled"] as? Bool ?? false

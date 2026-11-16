@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/read_list_epoch.dart';
 import '../state/settings_state.dart';
+import 'browser/browser_state.dart';
 import 'runtime_bridge.dart';
 import 'ish/ish_runtime_bridge.dart';
 import 'ish/ish_runtime_service.dart';
@@ -25,6 +26,12 @@ final runtimeBridgeProvider = Provider<RuntimeBridge>((ref) => Platform.isIOS ? 
 /// must not be called through this provider.
 final shellBoxBackgroundBridgeProvider = Provider<ShellBoxRuntimeBridge>((ref) => ShellBoxRuntimeBridge());
 
+/// The agent browser bridge (MethodChannel `dsh/browser`) lives in
+/// [browser_state.dart]: [browserRuntimeBridgeProvider] is defined there
+/// (next to [browserStateProvider], the way the iSH provider sits next to
+/// its controller below) — this import is the registration, do not define
+/// a second provider here.
+///
 /// The iSH Linux guest bridge (MethodChannel `dsh/ish`), held next to
 /// the Node bridge: the two runtimes have independent lifecycles and
 /// phase machines, and Node's terminal `nodeExited` semantics must never

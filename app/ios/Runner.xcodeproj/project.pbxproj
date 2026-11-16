@@ -39,6 +39,12 @@
 		D5E200000000000000000009 /* IShLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000015 /* IShLoopbackService.swift */; };
 		D5F200000000000000000001 /* FilesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F100000000000000000001 /* FilesPlugin.swift */; };
 		D5F200000000000000000002 /* ShellBoxPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F100000000000000000002 /* ShellBoxPlugin.swift */; };
+		D5B100000000000000000002 /* BrowserUseActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B100000000000000000001 /* BrowserUseActions.swift */; };
+		D5B100000000000000000004 /* BrowserUseJavaScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B100000000000000000003 /* BrowserUseJavaScript.swift */; };
+		D5B100000000000000000006 /* BrowserUseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B100000000000000000005 /* BrowserUseManager.swift */; };
+		D5B200000000000000000002 /* BrowserTabPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B200000000000000000001 /* BrowserTabPool.swift */; };
+		D5B200000000000000000004 /* BrowserUsePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B200000000000000000003 /* BrowserUsePlugin.swift */; };
+		D5B200000000000000000006 /* BrowserLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5B200000000000000000005 /* BrowserLoopbackService.swift */; };
 		D5E200000000000000000010 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000019 /* libsqlite3.tbd */; };
 		D5E200000000000000000011 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000020 /* libz.tbd */; };
 		D5E200000000000000000012 /* alpine-rootfs.zip in Resources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000021 /* alpine-rootfs.zip */; };
@@ -140,6 +146,12 @@
 		D5E100000000000000000015 /* IShLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IShLoopbackService.swift; sourceTree = "<group>"; };
 		D5F100000000000000000001 /* FilesPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FilesPlugin.swift; sourceTree = "<group>"; };
 		D5F100000000000000000002 /* ShellBoxPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ShellBoxPlugin.swift; sourceTree = "<group>"; };
+		D5B100000000000000000001 /* BrowserUseActions.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseActions.swift; sourceTree = "<group>"; };
+		D5B100000000000000000003 /* BrowserUseJavaScript.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseJavaScript.swift; sourceTree = "<group>"; };
+		D5B100000000000000000005 /* BrowserUseManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseManager.swift; sourceTree = "<group>"; };
+		D5B200000000000000000001 /* BrowserTabPool.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserTabPool.swift; sourceTree = "<group>"; };
+		D5B200000000000000000003 /* BrowserUsePlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUsePlugin.swift; sourceTree = "<group>"; };
+		D5B200000000000000000005 /* BrowserLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserLoopbackService.swift; sourceTree = "<group>"; };
 		D5E100000000000000000016 /* libish.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000017 /* libish_emu.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_emu.a"; sourceTree = SOURCE_ROOT; };
 		D5E100000000000000000018 /* libfakefs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libfakefs.a"; sourceTree = SOURCE_ROOT; };
@@ -290,6 +302,12 @@
 				D5E100000000000000000015 /* IShLoopbackService.swift */,
 				D5F100000000000000000001 /* FilesPlugin.swift */,
 				D5F100000000000000000002 /* ShellBoxPlugin.swift */,
+				D5B100000000000000000001 /* BrowserUseActions.swift */,
+				D5B100000000000000000003 /* BrowserUseJavaScript.swift */,
+				D5B100000000000000000005 /* BrowserUseManager.swift */,
+				D5B200000000000000000001 /* BrowserTabPool.swift */,
+				D5B200000000000000000003 /* BrowserUsePlugin.swift */,
+				D5B200000000000000000005 /* BrowserLoopbackService.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -597,6 +615,12 @@
 				D5E200000000000000000009 /* IShLoopbackService.swift in Sources */,
 				D5F200000000000000000001 /* FilesPlugin.swift in Sources */,
 				D5F200000000000000000002 /* ShellBoxPlugin.swift in Sources */,
+				D5B100000000000000000002 /* BrowserUseActions.swift in Sources */,
+				D5B100000000000000000004 /* BrowserUseJavaScript.swift in Sources */,
+				D5B100000000000000000006 /* BrowserUseManager.swift in Sources */,
+				D5B200000000000000000002 /* BrowserTabPool.swift in Sources */,
+				D5B200000000000000000004 /* BrowserUsePlugin.swift in Sources */,
+				D5B200000000000000000006 /* BrowserLoopbackService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -110,6 +110,19 @@ workflows:
             2>&1 | tee build-logs/03-npm-ci-dsh.log
           python3 -c "import json; v=json.load(open('engine-build/dsh-prefix/node_modules/@deepseek-ai/dsh/package.json'))['version']; assert v=='0.2.2-rc.1', v; print('dsh version OK:', v)"
 
+      - name: Install local tool-browser package
+        script: |
+          set -euo pipefail
+          # @dsh-go/dsh-tool-browser is a local, unpublished package (not in
+          # the npm lock); copy it into the engine tree so Cordis can resolve
+          # it. Without this step the browser_use tool is never loaded.
+          mkdir -p engine-build/dsh-prefix/node_modules/@dsh-go
+          cp -R runtime/tool-browser engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser
+          test -f engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/lib/index.js
+          test -f engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/package.json
+          node --check engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/lib/index.js
+          echo "tool-browser installed"
+
       - name: Install pnpm tree (npm ci)
         script: |
           set -euo pipefail
@@ -265,7 +278,7 @@ workflows:
           rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
           rsync -a --delete "$stage/opt/dsh/" "$output/engine/"
           cp "$stage/NodeMobile-LICENSE.txt" "$output/engine/"
-          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge}.mjs "$output/engine/"
+          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge,browser-bridge}.mjs "$output/engine/"
           # Verify exactly what runtime/native-node/embed-ios.sh will require.
           test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
           test -f "$output/engine/node_modules/@deepseek-ai/dsh/lib/bin.js"
@@ -273,6 +286,7 @@ workflows:
           test -f "$output/engine/supervisor.mjs"
           test -f "$output/engine/engine-worker.mjs"
           test -f "$output/engine/ish-bridge.mjs"
+          test -f "$output/engine/browser-bridge.mjs"
           echo "NativeNodeArtifacts OK:"
           du -sh "$output"
           find "$output/engine" -maxdepth 2 | head -20
@@ -376,6 +390,19 @@ workflows:
             2>&1 | tee build-logs/03-npm-ci-dsh.log
           python3 -c "import json; v=json.load(open('engine-build/dsh-prefix/node_modules/@deepseek-ai/dsh/package.json'))['version']; assert v=='0.2.2-rc.1', v; print('dsh version OK:', v)"
 
+      - name: Install local tool-browser package
+        script: |
+          set -euo pipefail
+          # @dsh-go/dsh-tool-browser is a local, unpublished package (not in
+          # the npm lock); copy it into the engine tree so Cordis can resolve
+          # it. Without this step the browser_use tool is never loaded.
+          mkdir -p engine-build/dsh-prefix/node_modules/@dsh-go
+          cp -R runtime/tool-browser engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser
+          test -f engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/lib/index.js
+          test -f engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/package.json
+          node --check engine-build/dsh-prefix/node_modules/@dsh-go/dsh-tool-browser/lib/index.js
+          echo "tool-browser installed"
+
       - name: Install pnpm tree (npm ci)
         script: |
           set -euo pipefail
@@ -531,7 +558,7 @@ workflows:
           rsync -a --delete "$stage/NodeMobile.xcframework/" "$output/NodeMobile.xcframework/"
           rsync -a --delete "$stage/opt/dsh/" "$output/engine/"
           cp "$stage/NodeMobile-LICENSE.txt" "$output/engine/"
-          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge}.mjs "$output/engine/"
+          cp runtime/native-node/{supervisor,engine-worker,pnpm-ios,pnpm-worker,ish-bridge,browser-bridge}.mjs "$output/engine/"
           # Verify exactly what runtime/native-node/embed-ios.sh will require.
           test -d "$output/NodeMobile.xcframework/ios-arm64/NodeMobile.framework"
           test -f "$output/engine/node_modules/@deepseek-ai/dsh/lib/bin.js"
@@ -539,6 +566,7 @@ workflows:
           test -f "$output/engine/supervisor.mjs"
           test -f "$output/engine/engine-worker.mjs"
           test -f "$output/engine/ish-bridge.mjs"
+          test -f "$output/engine/browser-bridge.mjs"
           echo "NativeNodeArtifacts OK:"
           du -sh "$output"
           find "$output/engine" -maxdepth 2 | head -20

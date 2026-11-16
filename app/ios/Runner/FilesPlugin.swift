@@ -58,7 +58,7 @@ public final class FilesPlugin: NSObject, FlutterPlugin, UIDocumentInteractionCo
     private var pdfDocument: PDFDocument?
     private var pdfPath: String?
 
-    private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "resolveGuest":
             let path = (call.arguments as? [String: Any])?["path"] as? String ?? ""

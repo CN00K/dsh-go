@@ -35,6 +35,12 @@ if (existsSync(pnpmDist)) {
 // when the loopback service is not up yet, the shims fail closed per call.
 const {installIshBridge} = await import(new URL('./ish-bridge.mjs', import.meta.url));
 installIshBridge();
+// Agent browser (browser_use): same place and technique as the iSH bridge
+// above — install before DSH starts, so the browser loopback client is on
+// the global before the browser_use tool loads. installBrowserBridge never
+// throws; when the loopback service is not up yet, calls fail closed per call.
+const {installBrowserBridge} = await import(new URL('./browser-bridge.mjs', import.meta.url));
+installBrowserBridge();
 parentPort.postMessage({phase: 'starting', nodeVersion: process.versions.node});
 const {runCli} = await import(entry);
 await runCli(packageManager === undefined ? {} : {packageManager});

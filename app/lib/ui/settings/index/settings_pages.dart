@@ -5,6 +5,7 @@
 import 'package:flutter/material.dart';
 
 import '../../account/account_page.dart';
+import '../../browser/browser_page.dart';
 import '../../engine/engine_screen.dart';
 import '../../engine_settings/engine_settings_hub.dart';
 import '../../engine_settings/runtime_settings_pages.dart';
@@ -70,6 +71,7 @@ Widget settingsPage(SettingsPageId id, {String? sessionId}) => switch (id) {
   SettingsPageId.shell => const ShellSettingsPage(),
   SettingsPageId.webSearch => const WebSearchSettingsPage(),
   SettingsPageId.media => const MediaSettingsPage(),
+  SettingsPageId.browser => const BrowserPage(),
   SettingsPageId.pluginInventory => const PluginInventoryPage(),
   SettingsPageId.plugins => const PluginsScreen(),
   SettingsPageId.allFeatures => const AllFeaturesPage(),
