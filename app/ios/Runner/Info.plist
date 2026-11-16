@@ -11,6 +11,10 @@
     <string>Take a photo to attach to a conversation or scan a connection code.</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Unlock DSH Go when you enable app lock.</string>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

@@ -26,5 +26,8 @@ import UserNotifications
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshIshRuntime") {
       ISHRuntime.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshFiles") {
+      FilesPlugin.register(with: registrar)
+    }
   }
 }
