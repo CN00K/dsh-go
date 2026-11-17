@@ -225,6 +225,8 @@ typedef NS_ENUM(NSInteger, ISHShellExecutionError) {
 // whole process tree (killProcessGroup on the worker pid), so no
 // background job survives its session.
 
+@end
+
 /// Max live workers (same cap as the PTY sessions: one guest task +
 /// three host pipe fds each, and the agent is serial per session, so
 /// more would only be idle shells).
@@ -257,6 +259,10 @@ extern const NSUInteger ISHWorkerMaxSessions;
 @property (nonatomic, copy, nullable) void (^onDeath)(NSNumber * _Nullable exitCode);
 - (instancetype)init NS_UNAVAILABLE;
 @end
+
+/// Worker-session methods (ENV-04), declared on a category so the
+/// worker-shell interface can sit above them in this header.
+@interface ISHShellExecutor (Worker)
 
 /// The registered worker for a session, if one exists (alive or
 /// recently dead). Does NOT create one. Used by the jobs-kill endpoint,
