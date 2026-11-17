@@ -202,22 +202,18 @@ workflows:
           test -s app/ios/Engine/runtime.zip
           # 1. Bridge unit tests (repo files, no engine needed).
           node --test runtime/ios/process/ish-bridge.test.mjs 2>&1 | tee build-logs/05-ish-bridge-test.log
-          # 2. The hook files must be inside runtime.zip (files/ prefix).
-          for entry in \
-            files/runtime/ios/process/ish-bridge.mjs \
-            files/runtime/ios/process/browser-bridge.mjs \
-            files/runtime/ios/process/ish-adapter.mjs \
-            files/node_modules/@dsh-go/dsh-tool-browser/lib/index.js \
-            files/node_modules/@dsh-go/dsh-tool-browser/package.json; do
-            unzip -l app/ios/Engine/runtime.zip "$entry" | grep -q "$entry" \
-              || { echo "MISSING in runtime.zip: $entry"; exit 1; }
-          done
-          # 3. preload.mjs inside the zip must install the bridges.
-          unzip -p app/ios/Engine/runtime.zip files/runtime/ohos/preload.mjs \
-            | grep -q installIshBridge \
-            || { echo "preload.mjs does not install the iSH bridge"; exit 1; }
-          echo "Engine hook verified: bridges + adapter + tool-browser in runtime.zip"
-          unzip -l app/ios/Engine/runtime.zip | grep -E "ish-bridge|ish-adapter|browser-bridge|dsh-tool-browser" || true
+          # 2. The hook files must be inside runtime.zip (files/ prefix),
+          #    and 3. preload.mjs inside the zip must install the bridges.
+          #    Both checks live in tooling/ios/verify-engine-hook.py.
+          # NOTE (build 39): `unzip -l runtime.zip <entry> | grep -q <entry>`
+          # reported ish-bridge.mjs MISSING on the builder, although the
+          # byte-identical zip passes the same command locally and the
+          # prepare-engine step's python zipfile listing (same file, same
+          # machine) shows the entry present with matching size/sha256/
+          # entry count. The unzip binary is not trustworthy for the
+          # verdict here, so the checks use python zipfile — the same
+          # mechanism the prepare-engine diagnostics already use.
+          python3 tooling/ios/verify-engine-hook.py app/ios/Engine/runtime.zip
           du -sh app/ios/Engine/runtime.zip
 
       - name: Install iSH build tools
@@ -539,22 +535,18 @@ workflows:
           test -s app/ios/Engine/runtime.zip
           # 1. Bridge unit tests (repo files, no engine needed).
           node --test runtime/ios/process/ish-bridge.test.mjs 2>&1 | tee build-logs/05-ish-bridge-test.log
-          # 2. The hook files must be inside runtime.zip (files/ prefix).
-          for entry in \
-            files/runtime/ios/process/ish-bridge.mjs \
-            files/runtime/ios/process/browser-bridge.mjs \
-            files/runtime/ios/process/ish-adapter.mjs \
-            files/node_modules/@dsh-go/dsh-tool-browser/lib/index.js \
-            files/node_modules/@dsh-go/dsh-tool-browser/package.json; do
-            unzip -l app/ios/Engine/runtime.zip "$entry" | grep -q "$entry" \
-              || { echo "MISSING in runtime.zip: $entry"; exit 1; }
-          done
-          # 3. preload.mjs inside the zip must install the bridges.
-          unzip -p app/ios/Engine/runtime.zip files/runtime/ohos/preload.mjs \
-            | grep -q installIshBridge \
-            || { echo "preload.mjs does not install the iSH bridge"; exit 1; }
-          echo "Engine hook verified: bridges + adapter + tool-browser in runtime.zip"
-          unzip -l app/ios/Engine/runtime.zip | grep -E "ish-bridge|ish-adapter|browser-bridge|dsh-tool-browser" || true
+          # 2. The hook files must be inside runtime.zip (files/ prefix),
+          #    and 3. preload.mjs inside the zip must install the bridges.
+          #    Both checks live in tooling/ios/verify-engine-hook.py.
+          # NOTE (build 39): `unzip -l runtime.zip <entry> | grep -q <entry>`
+          # reported ish-bridge.mjs MISSING on the builder, although the
+          # byte-identical zip passes the same command locally and the
+          # prepare-engine step's python zipfile listing (same file, same
+          # machine) shows the entry present with matching size/sha256/
+          # entry count. The unzip binary is not trustworthy for the
+          # verdict here, so the checks use python zipfile — the same
+          # mechanism the prepare-engine diagnostics already use.
+          python3 tooling/ios/verify-engine-hook.py app/ios/Engine/runtime.zip
           du -sh app/ios/Engine/runtime.zip
 
       - name: Prepare phone self-runner (best effort)
