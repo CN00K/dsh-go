@@ -1,0 +1,110 @@
+# Extra Alpine packages preinstalled in the dsh-go iSH rootfs.
+#
+# Format: one package per line, `name` or pinned `name=version`.
+# Pinned versions are verified against the live APKINDEX at build time:
+# if a pinned version is gone from the repo, the build fails loudly
+# (update the pin). Dependencies are resolved from the live index and
+# recorded in rootfs-packages.lock.
+#
+# Versions below were pinned 2026-11-17 against the live Alpine 3.21
+# aarch64 APKINDEX (main repo; all 25 packages are in main).
+#
+# 2026-11-17 build 35: +7 tools the user asked for on device
+# (build 34): vim, nano, openssh-client-default (ssh), openssh-server
+# (sshd), tmux, tree, htop. Verified against the same live index.
+#   vim        — real vim 9.1 (the base image only has the busybox vi
+#                applet at /usr/bin/vi; `vim` itself was missing). NOTE:
+#                the vim package does NOT ship /usr/bin/vi — vi stays
+#                the busybox applet (already in the image, indexed in
+#                meta.db); vim is the new /usr/bin/vim. vim-common is
+#                ~26.6 MiB installed (the runtime/syntax files) — the
+#                big part of this round's +36 MiB.
+#   nano       — nano 8.2, small terminal editor
+#   openssh-client-default — `ssh` (Alpine 3.21 has NO real package
+#                named `openssh-client`; it is a virtual provide. The
+#                real package is openssh-client-default, which provides
+#                cmd:ssh; the krb5 variant is the heavier alternative
+#                and is NOT used). Pulls in openssh-client-common (scp,
+#                sftp, ssh-agent, ssh-add, ssh-copy-id) and ssh-keygen.
+#   openssh-server — `sshd` (/usr/sbin/sshd). Host keys + actually
+#                running the daemon in the guest are a device follow-up;
+#                this change only installs the binaries.
+#   tmux       — terminal multiplexer 3.5a (pulls in libevent)
+#   tree       — real `tree` 2.2.1 (replaces the busybox tree applet
+#                symlink at /usr/bin/tree in place — takeover, same as
+#                the GNU coreutils takeovers in the ENV round)
+#   htop       — interactive process viewer 3.3.0
+#   NOTE: the xxd package (a vim dependency) likewise takes over the
+#   busybox xxd applet symlink at /usr/bin/xxd in place.
+#
+# What ships (and why):
+#   bash       — the sandbox shell (the DSH "bash" tool runs /bin/bash;
+#                the base image only has busybox ash)
+#   python3    — Python 3.12, the scripting runtime
+#   py3-pip    — pip, so the agent can install Python packages
+#   ripgrep    — `rg`, required by the DSH agent's file search (glob/grep)
+#   curl       — standard HTTP client (base image only has busybox wget)
+#   nodejs     — Node.js 22 (the DSH engine runtime; also what `node` is)
+#   npm        — npm 10 (ships separately from nodejs in Alpine)
+#   pnpm       — pnpm 9, fast disk-efficient package manager
+#   git        — git, version control
+#   coreutils  — GNU coreutils (ENV-06): replaces the BusyBox applets at
+#                /bin/* and /usr/bin/* in place, so `ls`, `cat`, `sort`,
+#                `date` etc. accept GNU options. The installer overwrites
+#                the busybox symlinks (takeover); see
+#                install-rootfs-packages.py.
+#   findutils  — GNU find/xargs (ENV-06): `find -printf` etc.
+#   grep       — GNU grep (ENV-06): `grep -P`, `grep --color` etc.
+#   procps-ng  — ps/top/pgrep (ENV-06): `ps -p`, `ps -o ...` etc.
+#                NOTE: the Alpine package is named `procps-ng`, there is
+#                no `procps` package in Alpine 3.21.
+#   sed        — GNU sed 4.9 (ENV-06): `sed --version` works. NOTE: GNU sed
+#                DOES exist as an apk in Alpine 3.21 main (earlier notes
+#                said it did not — that was wrong); it replaces the
+#                BusyBox sed applet at /bin/sed in place.
+#   jq         — JSON processor (ENV-11)
+#   make       — GNU make (ENV-11)
+#   build-base — compiler toolchain meta-package (ENV-11): pulls in gcc,
+#                g++, binutils, musl-dev, libc-dev, file, patch. This is
+#                the big one — gcc alone is ~123 MiB installed, the whole
+#                toolchain closure ~230 MiB installed (see the verification
+#                report for exact numbers). It was deliberately excluded
+#                before to keep the image small; it is included now because
+#                the user ordered all env issues fixed (native builds and
+#                node-gyp need it).
+#   util-linux-misc — `script` and friends (ENV-02): lets the agent use
+#                `script -qec` to get a pty as a fallback. NOTE: install
+#                the `util-linux-misc` subpackage, NOT the `util-linux`
+#                meta-package — the meta-package itself is 1 byte with no
+#                dependencies and installs nothing; `script` lives in
+#                -misc (plus libblkid/libmount/libfdisk/libsmartcols deps).
+#
+# Deliberately NOT included (install on demand with `apk add`):
+#   bun — NOT available as an apk in Alpine 3.21 (no `bun` package in
+#   main or community); install it separately if needed (official
+#   aarch64 binary from bun.sh, or `npm i -g bun` once npm is present).
+bash=5.2.37-r0
+python3=3.12.16-r0
+py3-pip=24.3.1-r0
+ripgrep=14.1.1-r0
+curl=8.14.1-r3
+nodejs=22.23.5-r0
+npm=10.9.1-r0
+pnpm=9.15.9-r0
+git=2.47.3-r0
+coreutils=9.5-r2
+findutils=4.10.0-r0
+grep=3.11-r0
+procps-ng=4.0.4-r2
+sed=4.9-r2
+jq=1.8.2-r0
+make=4.4.1-r2
+build-base=0.5-r3
+util-linux-misc=2.40.4-r1
+vim=9.1.1105-r0
+nano=8.2-r0
+openssh-client-default=9.9_p2-r1
+openssh-server=9.9_p2-r1
+tmux=3.5a-r0
+tree=2.2.1-r0
+htop=3.3.0-r0
