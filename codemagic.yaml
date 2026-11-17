@@ -175,6 +175,18 @@ workflows:
           echo "Engine prepared:"
           du -sh app/ios/Engine
           ls app/ios/Engine
+          # Build 38 diagnosis: the staged runtime.zip on the builder
+          # lacked files/runtime/ios/process/ish-bridge.mjs while the
+          # same code + same inputs produce a complete zip locally.
+          # Print size / sha256 / entry count / runtimeVersion so the
+          # next build log shows which side differs. Local reference
+          # (specialize re-run on fd1ec765 inputs): size 46115167,
+          # sha256 c9db2f4dd13e28424d882069950f8f97db7a74e9caba2a16875d11cc45a22d07,
+          # entries 12448, runtimeVersion ios-e66ee41c87a4e84fe0d1e526.
+          echo "Engine runtime.zip diagnostics (local reference: size=46115167 sha256=c9db2f4dd13e28424d882069950f8f97db7a74e9caba2a16875d11cc45a22d07 entries=12448 runtimeVersion=ios-e66ee41c87a4e84fe0d1e526):"
+          ls -l app/ios/Engine/runtime.zip
+          shasum -a 256 app/ios/Engine/runtime.zip
+          python3 -c 'import json, sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); names = z.namelist(); print("zip entries:", len(names)); print("hook entries:", sorted(n for n in names if "ish-bridge" in n or "browser-bridge" in n or "ish-adapter" in n or "dsh-tool-browser" in n)); print("runtimeVersion:", json.loads(z.read("manifest.json"))["runtimeVersion"])' app/ios/Engine/runtime.zip
 
       - name: Verify engine hook (ish-bridge / browser-bridge / tool-browser)
         script: |
