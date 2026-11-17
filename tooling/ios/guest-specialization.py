@@ -199,9 +199,16 @@ EDITS = {'runtime/ohos/process/index.mjs': (('  get temporaryRoot() { return thi
                                              "    iosGuest: ctx.get('subprocess')?.guestMetadata ?? "
                                              'guestMetadataView(undefined, false),\n'
                                              '    v: 1, bootId, platform:')),
- 'node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js': (('\t\tif (mode === "danger-full-access") return SandboxBashExecutor.decorateResult',
-                                                                '\t\t// iOS Linux still needs a one-use workspace ticket in full-access mode.\n'
-                                                                '\t\tif (mode === "danger-full-access" && this.ctx.subprocess.guestMetadata == null) return SandboxBashExecutor.decorateResult'),),
+ # dsh-go port: our ish-sandbox-backend.diff deletes the danger-full-access
+ # early return (unconfined super.execute() always fails on iOS with spawn
+ # EPERM, device-tested build 52), so the pristine anchor no longer exists.
+ # The guest override keeps the patched behavior: danger-full-access always
+ # goes through confine(), which is also what the upstream conditional falls
+ # through to whenever a guest is installed (and the override only loads
+ # with a guest installed). The entry stays so overrides.json keeps all 9
+ # whitelisted modules (overrides.mjs enforces the exact set).
+ 'node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js': (('\t\t// iSH Linux sandbox (Stage 5.3, dsh-go): on iOS there is no host',
+                                                                '\t\t// iSH Linux sandbox (Stage 5.3, dsh-go): on iOS there is no host'),),
  'node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js': (('function bashDescription(ctx) {',
                                                             'function bashDescription(ctx) {\n\tconst guestMetadata = ctx.get("subprocess")?.guestMetadata;'),
                                                            ('import z from "@deepseek-ai/schemastery";',
@@ -211,10 +218,14 @@ EDITS = {'runtime/ohos/process/index.mjs': (('  get temporaryRoot() { return thi
                                                            'import z from "@deepseek-ai/schemastery";'),
                                                           ('。没有系统进程、PTY、Python 或 WASM；',
                                                            '。当前虚拟 shell 本身没有系统进程、PTY、Python 或 WASM；'),
-                                                          (' + ohos;',
+                                                          # dsh-go port: our boundary diff appends the iSH
+                                                          # suffix, so the pristine ' + ohos;' anchor is
+                                                          # gone; re-anchor on the patched line, keeping
+                                                          # both the guest description and the iSH suffix.
+                                                          (' + ohos + ish;',
                                                            " + (ohos ? (guestMetadata ? '' : ohos + '\\n') + "
                                                            "guestDescription(guestMetadata) : "
-                                                           "'');"))}
+                                                           "'') + ish;"))}
 # Root grants exist only in exact installed-iOS replacements. Default modules stay byte-identical.
 FILES += ('runtime/ios/guest/root-grants.mjs',)
 EDITS['node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js'] += (

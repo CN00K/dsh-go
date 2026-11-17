@@ -35,6 +35,12 @@ ISH_ADAPTER = 'runtime/ios/process/ish-adapter.mjs'
 # like the feat build's install step did in the old dsh-prefix tree.
 TOOL_BROWSER_INDEX = 'node_modules/@dsh-go/dsh-tool-browser/lib/index.js'
 TOOL_BROWSER_PACKAGE = 'node_modules/@dsh-go/dsh-tool-browser/package.json'
+# Source of the local package in this repo. TOOL_BROWSER_* above are the
+# DESTINATION paths inside the composed runtime's node_modules; the repo
+# itself has no node_modules/@dsh-go (build 37's specialize died on that
+# read after the guest-anchor failure was fixed).
+TOOL_BROWSER_SRC_INDEX = 'runtime/tool-browser/lib/index.js'
+TOOL_BROWSER_SRC_PACKAGE = 'runtime/tool-browser/package.json'
 PRELOAD = 'runtime/ohos/preload.mjs'
 RELOCATION_FILES = ('runtime/ios/storage/relocate.mjs', 'runtime/ios/storage/preload.mjs')
 PRELOAD_BEFORE = "await import('./publication/preload.mjs');\n"
@@ -309,8 +315,8 @@ def specialize(expanded, out, composer):
     ish_bridge = (Path(__file__).resolve().parents[2] / ISH_BRIDGE).read_bytes()
     browser_bridge = (Path(__file__).resolve().parents[2] / BROWSER_BRIDGE).read_bytes()
     ish_adapter = (Path(__file__).resolve().parents[2] / ISH_ADAPTER).read_bytes()
-    tool_browser_index = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_INDEX).read_bytes()
-    tool_browser_package = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_PACKAGE).read_bytes()
+    tool_browser_index = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_SRC_INDEX).read_bytes()
+    tool_browser_package = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_SRC_PACKAGE).read_bytes()
     relocation = {name: (Path(__file__).resolve().parents[2] / name).read_bytes()
                   for name in (*RELOCATION_FILES, *guest.FILES)}
     preload = (expanded / 'files' / PRELOAD).read_text()
