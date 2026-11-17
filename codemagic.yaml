@@ -161,10 +161,12 @@ workflows:
           #   - stages app/ios/Engine/: runtime.zip,
           #     NodeMobile.xcframework, addons/{flock,require-builtin,
           #     node-addon-api}, include/, .ready
-          # Engine work dir is kept inside the checkout (Codemagic
-          # builders are ephemeral; the $HOME/Library/Caches default
-          # would not survive to the next build either).
-          export DSH_IOS_ENGINE_WORK="$PWD/engine-work"
+          # Engine work dir MUST live outside the checkout:
+          # prepare-inputs.py refuses any --out path inside the
+          # repository (build 36 failed on exactly this). Codemagic
+          # builders are ephemeral anyway, so nothing here survives
+          # to the next build either way.
+          export DSH_IOS_ENGINE_WORK="$HOME/dsh-ios-engine-work"
           bash tooling/ios/prepare-engine.sh 2>&1 | tee build-logs/04-prepare-engine.log
           test -f app/ios/Engine/.ready
           test -s app/ios/Engine/runtime.zip
@@ -499,7 +501,9 @@ workflows:
       - name: Prepare engine (upstream 1.1.1 flow)
         script: |
           set -euo pipefail
-          export DSH_IOS_ENGINE_WORK="$PWD/engine-work"
+          # Same constraint as ios-stage2-verify: prepare-inputs.py
+          # refuses any work path inside the repository (build 36).
+          export DSH_IOS_ENGINE_WORK="$HOME/dsh-ios-engine-work"
           bash tooling/ios/prepare-engine.sh 2>&1 | tee build-logs/04-prepare-engine.log
           test -f app/ios/Engine/.ready
           test -s app/ios/Engine/runtime.zip
