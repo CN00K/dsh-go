@@ -1332,10 +1332,20 @@ private final class WorkerSession {
   private func sendLine(stream: String, lineData: Data) {
     let line = String(decoding: lineData, as: UTF8.self)
     var isProtocol = false
+    // P0-1 fix: NEVER complete the run from inside sendLine before this
+    // line's own NDJSON frame is on the wire. tryCompleteFromMarker()
+    // fires completeRun(), which emits the terminal frame and the chunked
+    // terminal 0-chunk; a frame enqueued after that (the
+    // __DSH_JOBPIDS_END__ protocol frame) is data after the terminal
+    // chunk, and Node llhttp rejects the response with
+    // HPE_CLOSED_CONNECTION ("Data after `Connection: close`").
+    // Defer the completion check until after sendJSONFrame.
+    var shouldTryComplete = false
     if stream == "stderr" {
       if line.hasPrefix("__DSH_END__\(nonce):") {
         isProtocol = true
         parseEndMarker(line)
+        shouldTryComplete = true
       } else if line == "__DSH_JOBS_BEGIN__\(nonce)" {
         isProtocol = true
         inJobsBlock = true
@@ -1351,7 +1361,7 @@ private final class WorkerSession {
         sawJobsEnd = true
         worker?.jobPids = Set(collectedJobPids.map { NSNumber(value: $0) })
         collectedJobPids.removeAll()
-        tryCompleteFromMarker()
+        shouldTryComplete = true
       } else if inJobsBlock {
         isProtocol = true
       } else if inJobpidsBlock {
@@ -1365,6 +1375,9 @@ private final class WorkerSession {
       partialOutput += line + "\n"
     }
     sendJSONFrame(["stream": stream, "line": line])
+    if shouldTryComplete {
+      tryCompleteFromMarker()
+    }
   }
 
   /// Parse `__DSH_END__<nonce>:<exitCode>:<cwd>` (stderr). A malformed
@@ -1387,7 +1400,11 @@ private final class WorkerSession {
       NSLog("ish-loopback: worker run END marker without jobs snapshot; completing anyway")
       self.tryCompleteFromMarker(forceJobs: true)
     }
-    tryCompleteFromMarker()
+    // P0-1 fix: do NOT call tryCompleteFromMarker() here. parseEndMarker
+    // runs from inside sendLine, before the END marker line's own frame
+    // is sent; completing here would emit the terminal frame and the
+    // chunked 0-chunk ahead of that frame. sendLine defers the
+    // completion check until after sendJSONFrame (see shouldTryComplete).
   }
 
   private func tryCompleteFromMarker(forceJobs: Bool = false) {

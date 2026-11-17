@@ -101,8 +101,168 @@
 # openat2 / epoll_pwait2 / io_uring_setup are deliberate stubs with
 # working libc fallbacks; the pty question is app-layer (agent exec
 # uses pipes by design; the interactive terminal already has a pty).
+# P1-4 (ip hangs, ifconfig ENOTTY; build 34 device report 2026-11-17):
+#   fs/sock.c — (a) the netlink stub only intercepted send()/sendto()/
+#   sendmsg(); busybox 1.37's rtnl layer issues requests with plain
+#   write() (xwrite), so the bytes sat unread in the socketpair and the
+#   guest's recvmsg blocked forever. sock_write() now routes write() on
+#   a netlink stub fd through the reply builder. (b) the reply builder
+#   no longer answers every request with a bare NLMSG_DONE: it walks all
+#   nlmsghdrs in the request buffer and answers RTM_GETLINK with
+#   RTM_NEWLINK lo + eth0 (IFLA_IFNAME/MTU/ADDRESS/OPERSTATE) and
+#   RTM_GETADDR with RTM_NEWADDR 127.0.0.1/8 on lo, each as its own
+#   SOCK_DGRAM datagram, then NLMSG_DONE; RTM_GETROUTE and anything else
+#   still get an empty dump (no guest route table). (c) SIOCGIFCONF and
+#   friends (SIOCGIFNAME/INDEX/FLAGS/ADDR/DSTADDR/BRDADDR/NETMASK/MTU/
+#   HWADDR) are answered by new sock_ioctl_size/sock_ioctl wired into
+#   socket_fdops, from the same static lo+eth0 table, so ifconfig works
+#   instead of failing ENOTTY; anything else still goes to realfs.
+# P1-5 (/proc gaps; build 34 device report 2026-11-17): fs/proc/net.c —
+#   /proc/net/tcp, tcp6, route added as header-only files (Linux column
+#   headers, no rows: the guest has no socket/route registry, and a
+#   header with no rows is the honest stub; netstat -ltn / ss / route -n
+#   exit 0 instead of ENOENT). fs/proc/sys.c (new) + fs/proc/root.c +
+#   meson.build — /proc/sys/kernel/{hostname,ostype,osrelease,version}
+#   read from do_uname(), so they always agree with uname(). fs/proc/
+#   ish.c — proc_ish_version defaults to "iSH 0fd17a13 (dsh-go)" instead
+#   of "" (upstream sets it from the app bundle; dsh-go's ISHKernel.m
+#   never assigns it, so /proc/ish/version read empty; the app can
+#   still override it by assignment).
+# P1-6 (/proc/meminfo placeholder; build 34 device report 2026-11-17):
+#   platform/platform.h + platform/darwin.c + platform/linux.c —
+#   struct mem_usage gains `available` (Darwin: (free + inactive +
+#   speculative) * page_size, because iOS keeps free pages low; Linux:
+#   host MemAvailable, else free + inactive). fs/proc/root.c —
+#   MemShared was usage.free (plain wrong) and is now 0 (the guest has
+#   no tmpfs/shared accounting); MemAvailable is printed (clamped to the
+#   capped total). The 4 GiB MEMINFO_MAX_RAM cap is UNCHANGED and still
+#   matches GUEST_MAX_RAM in kernel/uname.c (V8 heap / Go arena); the
+diff --git a/fs/adhoc.c b/fs/adhoc.c
+index a56a3bc..3d12627 100644
+--- a/fs/adhoc.c
++++ b/fs/adhoc.c
+@@ -3,6 +3,7 @@
+ #include "debug.h"
+ #include "kernel/fs.h"
+ #include "fs/fd.h"
++#include "fs/tty.h"
+ #include "kernel/errno.h"
+ 
+ static struct mount adhoc_mount;
+@@ -17,6 +18,31 @@ struct fd *adhoc_fd_create(const struct fd_ops *ops) {
+     return fd;
+ }
+ 
++// Guest-side inode numbers for anonymous fds (pipes, sockets).
++//
++// Linux gives every pipe and socket a stable inode number (pipefs /
++// sockfs), and /proc/<pid>/fd/N readlink prints it as pipe:[ino] /
++// socket:[ino]. iSH never assigned one: fd->stat.inode stayed 0 for
++// pipes and sockets, so adhoc_getpath could only print
++// "anon_inode:[unknown]". Darwin's fstat cannot fill the gap — it
++// reports st_ino 0 for pipes and sockets, which is exactly why the
++// defect report saw anon_inode:[unknown] for piped stdio (see
++// open_fd_from_actual_fd, which copies the host st_ino verbatim).
++//
++// Allocate here instead. The counter starts at 2^32, above the range
++// host APFS cnids occupy in practice, so a guest pipe/socket inode is
++// unlikely to collide numerically with a real file's host inode. A
++// dup/fork shares the struct fd, so it shares the number too — same as
++// Linux. Wrapping is a non-issue (64-bit, one increment per pipe/socket
++// created). _Atomic, like tmpfs's next_inode: creation sites run
++// concurrently.
++#define ADHOC_INODE_BASE ((ino_t) 0x100000000ULL)
++static _Atomic ino_t next_adhoc_inode = ADHOC_INODE_BASE;
++
++ino_t adhoc_alloc_inode(void) {
++    return next_adhoc_inode++;
++}
++
+ static int adhoc_fstat(struct fd *fd, struct statbuf *stat) {
+     *stat = fd->stat;
+     return 0;
+@@ -40,11 +66,74 @@ static int adhoc_fsetattr(struct fd *fd, struct attr attr) {
+ }
+ 
+ static int adhoc_getpath(struct fd *fd, char *buf) {
+-    const char *type = "unknown"; // TODO allow this to be customized
+-    if (fd->stat.inode == 0)
+-        sprintf(buf, "anon_inode:[%s]", type);
+-    else
+-        sprintf(buf, "%s:[%lu]", type, (unsigned long) fd->stat.inode);
++    // Pipes, sockets and anonymous fds have no pathname: Linux reports
++    // them as pipe:[ino], socket:[ino] or anon_inode:[type], and that is
++    // what /proc/<pid>/fd/N readlink must return (it is also what
++    // `ls -l /proc/self/fd` prints). The old code printed
++    // "anon_inode:[unknown]" for all of them: the type was hardcoded and
++    // fd->stat.inode was never filled in for pipes/sockets.
++    //
++    // Dispatch order matters: a tty fd is identified by fd->tty, not by
++    // its mode (a pty slave is S_IFCHR, same as any char device).
++    if (fd->tty != NULL) {
++        // Pty slave -> /dev/pts/N, master -> /dev/pts/ptmx (Linux).
++        // Other tty drivers (console) have no pty number to report, and
++        // an adhoc-mounted fd has no /dev node to resolve either (this
++        // branch is only reached for the create_stdio fallback), so they
++        // keep anon_inode below. (Fakefs-mounted tty fds never reach
++        // here: proc_pid_fd_readlink intercepts pty fds first, and
++        // generic_getpath already returns /dev/console, /dev/tty1 etc.
++        // for the rest.)
++        if (tty_fd_target(fd, buf) == 0)
++            return 0;
++        // Not a pty (e.g. console fallback stdio): there is no guest
++        // pathname that identifies it, so keep anon_inode below.
++    } else if (S_ISFIFO(fd->stat.mode)) {
++        // Both ends of one pipe share the inode (allocated once in
++        // sys_pipe2); a dup/fork shares the struct fd, so it shares the
++        // number too — same as Linux's one pipe_inode_info.
++        if (fd->stat.inode != 0) {
++            sprintf(buf, "pipe:[%lu]", (unsigned long) fd->stat.inode);
++            return 0;
++        }
++    } else if (S_ISSOCK(fd->stat.mode)) {
++        // Each socket has its own inode (allocated in sock_fd_create);
++        // the two ends of a socketpair do NOT share one, same as Linux.
++        if (fd->stat.inode != 0) {
++            sprintf(buf, "socket:[%lu]", (unsigned long) fd->stat.inode);
++            return 0;
++        }
++    } else if (fd->stat.mode == 0) {
++        // Anonymous fds with no mode and no pathname: eventfd, timerfd,
++        // epoll, inotify, pidfd. Linux names the subtype; these fds have
++        // no inode, so there is no number to print. The ops pointers are
++        // the only thing distinguishing them (their ops structs are
++        // non-static for exactly this comparison).
++        const char *type = NULL;
++        if (fd->ops == &eventfd_ops)
++            type = "eventfd";
++        else if (fd->ops == &timerfd_ops)
++            type = "timerfd";
++        else if (fd->ops == &epoll_ops)
++            type = "epoll";
++        else if (fd->ops == &inotify_ops)
++            type = "inotify";
++        else if (fd->ops == &pidfd_ops)
++            type = "pidfd";
++        if (type != NULL) {
++            sprintf(buf, "anon_inode:[%s]", type);
++            return 0;
++        }
++    }
++    // Anything left has no derivable target, and none is fabricated:
++    //  - a regular file passed in as stdio: the guest never learns its
++    //    host path (F_GETPATH would return a host path outside the guest
++    //    namespace, which must not leak into a guest readlink);
++    //  - stdio from a host tty fd: no guest /dev/pts/N corresponds to it
++    //    (the in-guest pty numbers are allocated separately);
++    //  - a pipe/socket whose inode is 0 (should not happen after the
++    //    creation-site fixes, kept as a guard).
++    sprintf(buf, "anon_inode:[unknown]");
+     return 0;
+ }
+ 
 diff --git a/fs/fake.c b/fs/fake.c
-index ab3f82b7..e6c2d1e0 100644
+index ab3f82b..e6c2d1e 100644
 --- a/fs/fake.c
 +++ b/fs/fake.c
 @@ -5,6 +5,7 @@
@@ -179,8 +339,115 @@ index ab3f82b7..e6c2d1e0 100644
      .open = fakefs_open,
      .readlink = fakefs_readlink,
      .link = fakefs_link,
+diff --git a/fs/pipe.c b/fs/pipe.c
+index ff900e6..0938811 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -5,7 +5,7 @@
+ #include "fs/real.h"
+ #include "debug.h"
+ 
+-static fd_t pipe_f_create(int pipe_fd, int flags) {
++static fd_t pipe_f_create(int pipe_fd, int flags, ino_t inode) {
+     struct fd *fd = adhoc_fd_create(&realfs_fdops);
+     if (fd == NULL)
+         return _ENOMEM;
+@@ -13,6 +13,11 @@ static fd_t pipe_f_create(int pipe_fd, int flags) {
+     fd->stat.mode = S_IFIFO | 0660;
+     fd->stat.uid = current->uid;
+     fd->stat.gid = current->gid;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("pipe:[ino]") and
++    // for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
++    // pipes, so there is no host number to use). Both ends share the one
++    // inode allocated by the caller — Linux: one pipe_inode_info.
++    fd->stat.inode = inode;
+     return f_install(fd, flags);
+ }
+ 
+@@ -28,11 +33,13 @@ int_t sys_pipe2(addr_t pipe_addr, int_t flags) {
+     if (err < 0)
+         return err;
+ 
++    // One inode for the pipe, shared by both ends (see pipe_f_create).
++    ino_t inode = adhoc_alloc_inode();
+     int fp[2];
+-    err = fp[0] = pipe_f_create(p[0], flags);
++    err = fp[0] = pipe_f_create(p[0], flags, inode);
+     if (fp[0] < 0)
+         goto close_pipe;
+-    err = fp[1] = pipe_f_create(p[1], flags);
++    err = fp[1] = pipe_f_create(p[1], flags, inode);
+     if (fp[1] < 0)
+         goto close_fake_0;
+ 
+diff --git a/fs/proc/ish.c b/fs/proc/ish.c
+index ac54d5f..37cb77b 100644
+--- a/fs/proc/ish.c
++++ b/fs/proc/ish.c
+@@ -9,7 +9,12 @@
+ #include <string.h>
+ #include <sys/stat.h>
+ 
+-const char *proc_ish_version = "";
++// [P1-5] Non-empty default: upstream iSH sets this from the app
++// (AppDelegate: "iSH <CFBundleShortVersionString> (<build>)"), but
++// dsh-go's ISHKernel.m never assigns it, so /proc/ish/version read
++// empty. The kernel now defaults to the pinned iSH commit; the app
++// can still override it by assignment at startup.
++const char *proc_ish_version = "iSH 0fd17a13 (dsh-go)";
+ char **(*get_all_defaults_keys)(void);
+ char *(*get_friendly_name)(const char *name);
+ char *(*get_underlying_name)(const char *name);
+diff --git a/fs/proc/net.c b/fs/proc/net.c
+index 2d7fe9a..56111d2 100644
+--- a/fs/proc/net.c
++++ b/fs/proc/net.c
+@@ -21,9 +21,35 @@ static int proc_show_net_dev(struct proc_entry *UNUSED(entry), struct proc_data
+     return 0;
+ }
+ 
++// /proc/net/tcp - TCP socket table (header only; the guest has no
++// socket registry, and iSH does not track guest TCP state -- a header
++// with no rows is the honest stub. Lets `netstat -ltn` / `ss` exit 0
++// instead of failing on a missing file.)
++static int proc_show_net_tcp(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    proc_printf(buf, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
++    return 0;
++}
++
++// /proc/net/tcp6 - same, IPv6 addresses (32 hex chars, no rows).
++static int proc_show_net_tcp6(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    proc_printf(buf, "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
++    return 0;
++}
++
++// /proc/net/route - routing table (header only; the guest has no route
++// table -- traffic goes through the host stack). Lets `route -n` /
++// `ip route` (the /proc fallback) report an empty table instead of ENOENT.
++static int proc_show_net_route(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    proc_printf(buf, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
++    return 0;
++}
++
+ // /proc/net directory entries
+ struct proc_dir_entry proc_net_entries[] = {
+     {"dev", .show = proc_show_net_dev},
++    {"tcp", .show = proc_show_net_tcp},
++    {"tcp6", .show = proc_show_net_tcp6},
++    {"route", .show = proc_show_net_route},
+ };
+ #define PROC_NET_LEN (sizeof(proc_net_entries)/sizeof(proc_net_entries[0]))
+ 
+@@ -39,4 +65,7 @@ static bool proc_net_readdir(struct proc_entry *UNUSED(entry), unsigned long *in
+ // Exported /proc/net directory entry
+ struct proc_children proc_net_children = PROC_CHILDREN({
+     {"dev", .show = proc_show_net_dev},
++    {"tcp", .show = proc_show_net_tcp},
++    {"tcp6", .show = proc_show_net_tcp6},
++    {"route", .show = proc_show_net_route},
+ });
 diff --git a/fs/proc/pid.c b/fs/proc/pid.c
-index 2920f525..107ddcea 100644
+index 2920f52..c92d4e1 100644
 --- a/fs/proc/pid.c
 +++ b/fs/proc/pid.c
 @@ -207,6 +207,26 @@ out_free_task:
@@ -210,7 +477,25 @@ index 2920f525..107ddcea 100644
  void proc_maps_dump(struct task *task, struct proc_data *buf) {
      struct mem *mem = task->mem;
      if (mem == NULL)
-@@ -407,6 +427,7 @@ static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
+@@ -355,6 +375,17 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
+     proc_put_task(task); // releases pids_lock
+     if (fd == NULL)
+         return _ENOENT;
++    // Pty fds: /dev/pts/N for a slave, /dev/pts/ptmx for a master
++    // (Linux). generic_getpath would return the /dev node the fd was
++    // opened from instead (/dev/ptmx, /dev/tty) — meaningful, but not
++    // the device the fd actually is (a /dev/tty fd IS the pts slave).
++    // Other tty drivers (console) fall through: their /dev-node path
++    // (/dev/console, /dev/tty1) is already correct. Pipes, sockets and
++    // anonymous fds are handled one layer down, in adhoc_getpath.
++    if (tty_fd_target(fd, buf) == 0) {
++        fd_close(fd);
++        return 0;
++    }
+     int err = generic_getpath(fd, buf);
+     fd_close(fd);
+     return err;
+@@ -407,6 +438,7 @@ static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
  struct proc_children proc_pid_children = PROC_CHILDREN({
      {"auxv", .show = proc_pid_auxv_show},
      {"cmdline", .show = proc_pid_cmdline_show},
@@ -218,11 +503,374 @@ index 2920f525..107ddcea 100644
      {"cwd", S_IFLNK, .readlink = proc_pid_cwd_readlink},
      {"exe", S_IFLNK, .readlink = proc_pid_exe_readlink},
      {"fd", S_IFDIR, .readdir = proc_pid_fd_readdir},
+diff --git a/fs/proc/root.c b/fs/proc/root.c
+index 27dc77d..5953e51 100644
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -64,10 +64,18 @@ static int proc_show_meminfo(struct proc_entry *UNUSED(entry), struct proc_data
+         usage.total = MEMINFO_MAX_RAM;
+     if (usage.free > MEMINFO_MAX_RAM)
+         usage.free = MEMINFO_MAX_RAM;
++    // [P1-6] MemAvailable can exceed the capped total on hosts with >4GiB
++    // RAM; clamp it to the reported total so `free` never shows
++    // available > total.
++    if (usage.available > usage.total)
++        usage.available = usage.total;
+ #endif
+     show_kb(buf, "MemTotal:       ", usage.total);
+     show_kb(buf, "MemFree:        ", usage.free);
+-    show_kb(buf, "MemShared:      ", usage.free);
++    show_kb(buf, "MemAvailable:   ", usage.available);
++    // [P1-6] Was usage.free -- plain wrong (shared memory is not free
++    // memory). The guest has no tmpfs/shared accounting, so report 0.
++    show_kb(buf, "MemShared:      ", 0);
+     // a bunch of crap busybox top needs to see or else it gets stack garbage
+     show_kb(buf, "Shmem:          ", 0);
+     show_kb(buf, "Buffers:        ", 0);
+@@ -139,6 +147,8 @@ static int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *
+ 
+ // Forward declaration for /proc/net
+ extern struct proc_children proc_net_children;
++// Forward declaration for /proc/sys
++extern struct proc_children proc_sys_children;
+ 
+ // in alphabetical order
+ struct proc_dir_entry proc_root_entries[] = {
+@@ -149,6 +159,7 @@ struct proc_dir_entry proc_root_entries[] = {
+     {"net", S_IFDIR, .children = &proc_net_children},
+     {"self", S_IFLNK, .readlink = proc_readlink_self},
+     {"stat", .show = proc_show_stat},
++    {"sys", S_IFDIR, .children = &proc_sys_children},
+     {"uptime", .show = proc_show_uptime},
+     {"version", .show = proc_show_version},
+ };
+diff --git a/ish-pristine/fs/proc/sys.c b/fs/proc/sys.c
+new file mode 100644
+index 0000000..aaee795
+--- /dev/null
++++ b/fs/proc/sys.c
+@@ -0,0 +1,53 @@
++#include <stddef.h>
++#include <stdbool.h>
++#include <sys/stat.h> // S_IFDIR
++#include "fs/proc.h"
++#include "kernel/calls.h"
++
++// [P1-5, dsh-go 2026-11-17] /proc/sys/kernel/{hostname,ostype,osrelease,
++// version} -- read from the same utsname do_uname() fills
++// (system="Linux", hostname=host nodename, release="4.20.69-ish",
++// version="SUPER AWESOME <date> <time>"), so the /proc view always
++// agrees with the uname() syscall. Linux's /proc/sys/kernel/* files
++// print the value followed by '\n'.
++static int proc_show_sys_hostname(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    struct uname uts;
++    do_uname(&uts);
++    proc_printf(buf, "%s\n", uts.hostname);
++    return 0;
++}
++
++static int proc_show_sys_ostype(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    struct uname uts;
++    do_uname(&uts);
++    proc_printf(buf, "%s\n", uts.system);
++    return 0;
++}
++
++static int proc_show_sys_osrelease(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    struct uname uts;
++    do_uname(&uts);
++    proc_printf(buf, "%s\n", uts.release);
++    return 0;
++}
++
++static int proc_show_sys_version(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
++    struct uname uts;
++    do_uname(&uts);
++    proc_printf(buf, "%s\n", uts.version);
++    return 0;
++}
++
++// /proc/sys/kernel directory entries
++struct proc_children proc_sys_kernel_children = PROC_CHILDREN({
++    {"hostname", .show = proc_show_sys_hostname},
++    {"ostype", .show = proc_show_sys_ostype},
++    {"osrelease", .show = proc_show_sys_osrelease},
++    {"version", .show = proc_show_sys_version},
++});
++
++// /proc/sys directory entries (kernel only for now; more subdirs can be
++// added the same way if a tool ever needs them).
++struct proc_children proc_sys_children = PROC_CHILDREN({
++    {"kernel", S_IFDIR, .children = &proc_sys_kernel_children},
++});
 diff --git a/fs/sock.c b/fs/sock.c
-index 58dc3e32..fc692386 100644
+index 58dc3e3..4dfdaad 100644
 --- a/fs/sock.c
 +++ b/fs/sock.c
-@@ -428,6 +428,17 @@ static void unix_abstract_release(struct unix_abstract *name) {
+@@ -77,21 +77,154 @@ bool ish_netlink_stub_enabled(void) {
+     return cached == 1;
+ }
+ 
+-// A netlink fd is backed by a real host socketpair(AF_UNIX, SOCK_DGRAM):
+-// fd->real_fd is the guest-facing end, netlink_peer_fd the end this stub
+-// writes replies into. That buys working poll/epoll/read/close/refcounting
+-// from the existing socket_fdops machinery for free -- only sendto/recvfrom
+-// semantics are special-cased.
+-static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
+-    // Answer every well-formed request with an empty dump: one NLMSG_DONE
+-    // echoing the request's seq and pid. A malformed/short request gets the
+-    // same treatment (seq=0) rather than an error -- keeps the probe simple.
+-    uint32_t seq = 0, pid = 0;
+-    if (req != NULL && req_len >= sizeof(struct nlmsghdr_)) {
+-        const struct nlmsghdr_ *h = req;
+-        seq = h->nlmsg_seq;
+-        pid = h->nlmsg_pid;
++// [P1-4, dsh-go 2026-11-17] The guest's interfaces, mirroring
++// /proc/net/dev (fs/proc/net.c): lo + eth0. The guest has no IP of its
++// own (host-stack passthrough), so only lo carries an address
++// (127.0.0.1/8); eth0 is up with no address. Shared by the netlink
++// dump below and the SIOCGIF* ioctls, so `ip` and `ifconfig` agree.
++#define IFF_UP_        0x1
++#define IFF_BROADCAST_ 0x2
++#define IFF_LOOPBACK_  0x8
++#define IFF_RUNNING_   0x40
++#define IFF_MULTICAST_ 0x1000
++#define ARPHRD_ETHER_    1
++#define ARPHRD_LOOPBACK_ 772
++struct ish_iface_ {
++    const char *name;
++    int index;
++    uint16_t type;      // ARPHRD_*
++    uint32_t flags;     // IFF_*
++    uint32_t mtu;
++    uint8_t addr[4];    // IPv4 bytes, {0,0,0,0} = none
++    uint8_t netmask[4];
++    uint8_t prefixlen;
++};
++static const struct ish_iface_ ish_ifaces_[] = {
++    { "lo",   1, ARPHRD_LOOPBACK_, IFF_UP_|IFF_LOOPBACK_|IFF_RUNNING_, 65536,
++      {127,0,0,1}, {255,0,0,0}, 8 },
++    { "eth0", 2, ARPHRD_ETHER_, IFF_UP_|IFF_BROADCAST_|IFF_RUNNING_|IFF_MULTICAST_, 1500,
++      {0,0,0,0}, {0,0,0,0}, 0 },
++};
++
++// Netlink message builders (Linux wire layout, all little-endian on arm64).
++#define RTM_NEWLINK_ 16
++#define RTM_GETLINK_ 18
++#define RTM_NEWADDR_ 20
++#define RTM_GETADDR_ 22
++#define RTM_GETROUTE_ 26
++#define NLM_F_MULTI_ 2
++#define RTA_ALIGN_(len) (((len) + 3) & ~3u)
++#define RTA_LENGTH_(len) (RTA_ALIGN_(sizeof(struct rtattr_) + (len)))
++struct rtattr_ {
++    uint16_t rta_len;
++    uint16_t rta_type;
++};
++struct ifinfomsg_ {
++    uint8_t ifi_family;
++    uint8_t ifi_pad;
++    uint16_t ifi_type;
++    int32_t ifi_index;
++    uint32_t ifi_flags;
++    uint32_t ifi_change;
++};
++struct ifaddrmsg_ {
++    uint8_t ifa_family;
++    uint8_t ifa_prefixlen;
++    uint8_t ifa_flags;
++    uint8_t ifa_scope;
++    uint32_t ifa_index;
++};
++#define IFLA_ADDRESS_   1
++#define IFLA_IFNAME_    3
++#define IFLA_MTU_       4
++#define IFLA_OPERSTATE_ 16
++#define IFA_ADDRESS_ 1
++#define IFA_LOCAL_   2
++#define IFA_LABEL_   3
++#define IFA_F_PERMANENT_ 0x80
++#define RT_SCOPE_HOST_ 254
++
++static size_t nl_put_rta(uint8_t *buf, size_t off, uint16_t type, const void *data, size_t len) {
++    // Like the kernel's nla_put: rta_len is the EXACT length (header +
++    // payload, NOT aligned -- e.g. a 6-byte hwaddr has rta_len 10), while
++    // the stride to the next attribute is the aligned length. Getting
++    // this wrong makes RTA_PAYLOAD report padding as data (busybox would
++    // print an 8-byte "MAC" for eth0).
++    struct rtattr_ *rta = (struct rtattr_ *)(buf + off);
++    rta->rta_len = sizeof(*rta) + len;
++    rta->rta_type = type;
++    if (len)
++        memcpy(buf + off + sizeof(*rta), data, len);
++    return off + RTA_LENGTH_(len);
++}
++
++static size_t nl_build_newlink(uint8_t *buf, uint32_t seq, uint32_t pid, const struct ish_iface_ *ifa) {
++    struct nlmsghdr_ *h = (struct nlmsghdr_ *)buf;
++    struct ifinfomsg_ *ifi = (struct ifinfomsg_ *)(buf + sizeof(*h));
++    h->nlmsg_type = RTM_NEWLINK_;
++    h->nlmsg_flags = NLM_F_MULTI_;
++    h->nlmsg_seq = seq;
++    h->nlmsg_pid = pid;
++    ifi->ifi_family = 0; // AF_UNSPEC
++    ifi->ifi_pad = 0;
++    ifi->ifi_type = ifa->type;
++    ifi->ifi_index = ifa->index;
++    ifi->ifi_flags = ifa->flags;
++    ifi->ifi_change = 0;
++    size_t off = sizeof(*h) + sizeof(*ifi);
++    off = nl_put_rta(buf, off, IFLA_IFNAME_, ifa->name, strlen(ifa->name) + 1);
++    off = nl_put_rta(buf, off, IFLA_MTU_, &ifa->mtu, sizeof(ifa->mtu));
++    { static const uint8_t zero6[6] = {0,0,0,0,0,0};
++      off = nl_put_rta(buf, off, IFLA_ADDRESS_, zero6, 6); }
++    { uint8_t operstate = 6; // OPERSTATE_UP
++      off = nl_put_rta(buf, off, IFLA_OPERSTATE_, &operstate, 1); }
++    h->nlmsg_len = NLMSG_ALIGN_(off);
++    return h->nlmsg_len;
++}
++
++static size_t nl_build_newaddr(uint8_t *buf, uint32_t seq, uint32_t pid, const struct ish_iface_ *ifa) {
++    struct nlmsghdr_ *h = (struct nlmsghdr_ *)buf;
++    struct ifaddrmsg_ *am = (struct ifaddrmsg_ *)(buf + sizeof(*h));
++    h->nlmsg_type = RTM_NEWADDR_;
++    h->nlmsg_flags = NLM_F_MULTI_;
++    h->nlmsg_seq = seq;
++    h->nlmsg_pid = pid;
++    am->ifa_family = 2; // AF_INET
++    am->ifa_prefixlen = ifa->prefixlen;
++    am->ifa_flags = IFA_F_PERMANENT_;
++    am->ifa_scope = RT_SCOPE_HOST_;
++    am->ifa_index = ifa->index;
++    size_t off = sizeof(*h) + sizeof(*am);
++    off = nl_put_rta(buf, off, IFA_LOCAL_, ifa->addr, 4);
++    off = nl_put_rta(buf, off, IFA_ADDRESS_, ifa->addr, 4);
++    off = nl_put_rta(buf, off, IFA_LABEL_, ifa->name, strlen(ifa->name) + 1);
++    h->nlmsg_len = NLMSG_ALIGN_(off);
++    return h->nlmsg_len;
++}
++
++// Answer one request header. Each message is written as its own datagram
++// (the backing socketpair is SOCK_DGRAM), so the guest's recvmsg/recvfrom
++// gets one nlmsg per call, in order. Returns 0 or a negative errno.
++static int netlink_stub_reply_one(struct fd *fd, uint16_t type, uint32_t seq, uint32_t pid, uint8_t family) {
++    int peer = fd->socket.netlink_peer_fd;
++    if (peer < 0)
++        return _EINVAL;
++    uint8_t buf[512];
++    if (type == RTM_GETLINK_) {
++        for (size_t i = 0; i < sizeof(ish_ifaces_)/sizeof(ish_ifaces_[0]); i++) {
++            size_t n = nl_build_newlink(buf, seq, pid, &ish_ifaces_[i]);
++            if (write(peer, buf, n) < 0)
++                return errno_map();
++        }
++    } else if (type == RTM_GETADDR_) {
++        // Only lo has an address, and only for AF_UNSPEC/AF_INET dumps.
++        if (family == 0 || family == 2) {
++            size_t n = nl_build_newaddr(buf, seq, pid, &ish_ifaces_[0]);
++            if (write(peer, buf, n) < 0)
++                return errno_map();
++        }
+     }
++    // RTM_GETROUTE and anything else: empty dump (no guest route table).
+     struct nlmsghdr_ done = {
+         .nlmsg_len = NLMSG_ALIGN_(sizeof(struct nlmsghdr_)),
+         .nlmsg_type = NLMSG_DONE_,
+@@ -99,20 +232,57 @@ static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
+         .nlmsg_seq = seq,
+         .nlmsg_pid = pid,
+     };
+-    int peer = fd->socket.netlink_peer_fd;
+-    if (peer < 0)
+-        return _EINVAL;
+     if (write(peer, &done, sizeof(done)) < 0)
+         return errno_map();
+-    {   // [STAGE-0 PROBE] log the request's RTM type so we can see exactly
+-        // which netlink queries the guest actually issues.
+-        uint16_t rtm = 0;
+-        if (req != NULL && req_len >= sizeof(struct nlmsghdr_))
+-            rtm = ((const struct nlmsghdr_ *) req)->nlmsg_type;
+-        const char *name = rtm == 18 ? "RTM_GETLINK" : rtm == 22 ? "RTM_GETADDR" :
+-                           rtm == 26 ? "RTM_GETROUTE" : "other";
+-        TRACE("NETLINK_STUB reply NLMSG_DONE seq=%u pid=%u req_type=%u(%s) (empty dump)\n",
+-               seq, pid, rtm, name);
++    return 0;
++}
++
++// A netlink fd is backed by a real host socketpair(AF_UNIX, SOCK_DGRAM):
++// fd->real_fd is the guest-facing end, netlink_peer_fd the end this stub
++// writes replies into. That buys working poll/epoll/read/close/refcounting
++// from the existing socket_fdops machinery for free -- only sendto/recvfrom
++// semantics are special-cased.
++static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
++    // Walk every nlmsghdr in the request buffer (a client may batch
++    // several requests in one write/sendmsg) and answer each in order.
++    // A malformed/short request gets one bare NLMSG_DONE (seq=0) rather
++    // than an error -- keeps the probe simple.
++    size_t off = 0;
++    int answered = 0;
++    while (req != NULL && off + sizeof(struct nlmsghdr_) <= req_len) {
++        const struct nlmsghdr_ *h = (const struct nlmsghdr_ *)((const char *)req + off);
++        if (h->nlmsg_len < sizeof(struct nlmsghdr_) || off + h->nlmsg_len > req_len)
++            break;
++        uint8_t family = 0;
++        if ((h->nlmsg_type == RTM_GETLINK_ || h->nlmsg_type == RTM_GETADDR_) &&
++            h->nlmsg_len >= sizeof(*h) + 1)
++            family = *((const uint8_t *)req + off + sizeof(*h)); // rtgen_family
++        int r = netlink_stub_reply_one(fd, h->nlmsg_type, h->nlmsg_seq, h->nlmsg_pid, family);
++        if (r < 0)
++            return r;
++        answered++;
++        {   // [STAGE-0 PROBE] log the request's RTM type so we can see exactly
++            // which netlink queries the guest actually issues.
++            const char *name = h->nlmsg_type == 18 ? "RTM_GETLINK" : h->nlmsg_type == 22 ? "RTM_GETADDR" :
++                               h->nlmsg_type == 26 ? "RTM_GETROUTE" : "other";
++            TRACE("NETLINK_STUB reply seq=%u pid=%u req_type=%u(%s)\n",
++                   h->nlmsg_seq, h->nlmsg_pid, h->nlmsg_type, name);
++        }
++        off += NLMSG_ALIGN_(h->nlmsg_len);
++    }
++    if (!answered) {
++        struct nlmsghdr_ done = {
++            .nlmsg_len = NLMSG_ALIGN_(sizeof(struct nlmsghdr_)),
++            .nlmsg_type = NLMSG_DONE_,
++            .nlmsg_flags = 0,
++            .nlmsg_seq = 0,
++            .nlmsg_pid = 0,
++        };
++        int peer = fd->socket.netlink_peer_fd;
++        if (peer < 0)
++            return _EINVAL;
++        if (write(peer, &done, sizeof(done)) < 0)
++            return errno_map();
+     }
+     return (int) req_len;
+ }
+@@ -192,6 +362,10 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
+         return _ENOMEM;
+     }
+     fd->stat.mode = S_IFSOCK | 0666;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
++    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0
++    // for sockets). One inode per socket.
++    fd->stat.inode = adhoc_alloc_inode();
+     fd->real_fd = sv[0];
+     fd->socket.domain = AF_NETLINK_;
+     fd->socket.type = type & SOCKET_TYPE_MASK;
+@@ -218,6 +392,12 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+     if (fd == NULL)
+         return _ENOMEM;
+     fd->stat.mode = S_IFSOCK | 0666;
++    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
++    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
++    // sockets). One inode per socket: socket(), accept() and each end of
++    // socketpair() all come through here and each get their own, same as
++    // Linux (a socketpair's two ends do NOT share an inode).
++    fd->stat.inode = adhoc_alloc_inode();
+     fd->real_fd = sock_fd;
+     fd->socket.domain = domain;
+     fd->socket.type = type & SOCKET_TYPE_MASK;
+@@ -428,6 +608,17 @@ static void unix_abstract_release(struct unix_abstract *name) {
  
  const char *sock_tmp_prefix = "/tmp/ishsock";
  
@@ -240,7 +888,7 @@ index 58dc3e32..fc692386 100644
  static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
      // Make sure we can read things without overflowing buffers
      if (*sockaddr_len < 2)
-@@ -477,7 +488,14 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
+@@ -477,7 +668,14 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
              }
  
              struct sockaddr_un *real_addr_un = sockaddr;
@@ -256,8 +904,164 @@ index 58dc3e32..fc692386 100644
              // The call to real bind will fail if the backing socket already
              // exists from a previous run or something. We already checked that
              // the fake file doesn't exist in unix_socket_get, so try a simple
+@@ -1771,6 +1969,15 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
+ }
+ 
+ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
++    // [P1-4] busybox's netlink layer writes requests with plain write()
++    // (xwrite), not send()/sendmsg() -- the stub only intercepted sendto.
++    // Route write() on a netlink stub fd through the reply builder too;
++    // otherwise the bytes sit unread in the socketpair and the guest's
++    // recvmsg blocks forever (the `ip` 60s hang).
++    if (fd->socket.netlink_peer_fd >= 0) {
++        int r = netlink_stub_reply(fd, buf, size);
++        return r < 0 ? r : (ssize_t)size;
++    }
+     int err;
+     int eintr_count = 0;
+     for (;;) {
+@@ -1821,6 +2028,128 @@ static int sock_close(struct fd *fd) {
+     return realfs_close(fd);
+ }
+ 
++// [P1-4] Linux SIOCGIF* ioctls (ifconfig). The host (Darwin) does not
++// know the Linux numbers, so realfs_ioctl_size rejects them and fd_ioctl
++// returns ENOTTY; answer them here from the same static interface table
++// as the netlink dump, so `ifconfig` and `ip` agree. Everything else is
++// delegated to realfs_ioctl(_size).
++#define SIOCGIFNAME_   0x8910
++#define SIOCGIFCONF_   0x8912
++#define SIOCGIFFLAGS_  0x8913
++#define SIOCGIFADDR_   0x8915
++#define SIOCGIFDSTADDR_ 0x8917
++#define SIOCGIFBRDADDR_ 0x8919
++#define SIOCGIFNETMASK_ 0x891b
++#define SIOCGIFMTU_    0x8921
++#define SIOCGIFHWADDR_ 0x8927
++#define SIOCGIFINDEX_  0x8933
++
++// Guest struct ifreq (Linux, 40 bytes: 16 name + 24 union) and ifconf
++// (Linux arm64, 16 bytes: int len + 4 pad + guest pointer).
++struct ifreq_ {
++    char ifrn_name[16];
++    union {
++        struct sockaddr_ addr; // 16 bytes
++        int32_t flags;
++        int32_t mtu;
++        int32_t ivalue;
++        uint8_t raw[24];
++    } ifru;
++};
++struct ifconf_ {
++    int32_t ifc_len;
++    uint32_t _pad;
++    uint64_t ifc_buf; // guest pointer
++};
++
++static const struct ish_iface_ *ish_iface_by_name(const char *name) {
++    // The guest name field is 16 bytes and may not be NUL-terminated;
++    // copy it to a local buffer and terminate explicitly.
++    char safe[17];
++    size_t i;
++    for (i = 0; i < 16; i++)
++        safe[i] = name[i];
++    safe[16] = '\0';
++    for (i = 0; i < sizeof(ish_ifaces_)/sizeof(ish_ifaces_[0]); i++)
++        if (strcmp(ish_ifaces_[i].name, safe) == 0)
++            return &ish_ifaces_[i];
++    return NULL;
++}
++
++static const struct ish_iface_ *ish_iface_by_index(int index) {
++    for (size_t i = 0; i < sizeof(ish_ifaces_)/sizeof(ish_ifaces_[0]); i++)
++        if (ish_ifaces_[i].index == index)
++            return &ish_ifaces_[i];
++    return NULL;
++}
++
++static void ish_sockaddr_in(struct sockaddr_ *sa, const uint8_t addr[4]) {
++    // sockaddr_in: family(2) + port(2) + addr(4) + zero(8); sockaddr_ is
++    // family(2) + data[14], so sin_port = data[0..1], sin_addr = data[2..5].
++    memset(sa, 0, sizeof(*sa));
++    sa->family = 2; // AF_INET
++    memcpy(&sa->data[2], addr, 4);
++}
++
++static ssize_t sock_ioctl_size(int cmd) {
++    switch (cmd) {
++        case SIOCGIFCONF_: return sizeof(struct ifconf_);
++        case SIOCGIFNAME_: case SIOCGIFINDEX_: case SIOCGIFFLAGS_:
++        case SIOCGIFADDR_: case SIOCGIFDSTADDR_: case SIOCGIFBRDADDR_:
++        case SIOCGIFNETMASK_: case SIOCGIFMTU_: case SIOCGIFHWADDR_:
++            return sizeof(struct ifreq_);
++        default: return realfs_ioctl_size(cmd);
++    }
++}
++
++static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
++    if (cmd == SIOCGIFCONF_) {
++        struct ifconf_ *ifc = arg;
++        int32_t avail = ifc->ifc_len;
++        int32_t used = 0;
++        for (size_t i = 0; i < sizeof(ish_ifaces_)/sizeof(ish_ifaces_[0]); i++) {
++            if (used + (int32_t)sizeof(struct ifreq_) > avail)
++                break;
++            struct ifreq_ ifr;
++            memset(&ifr, 0, sizeof(ifr));
++            strcpy(ifr.ifrn_name, ish_ifaces_[i].name);
++            ish_sockaddr_in(&ifr.ifru.addr, ish_ifaces_[i].addr);
++            if (user_write((addr_t)ifc->ifc_buf + used, &ifr, sizeof(ifr)))
++                return _EFAULT;
++            used += sizeof(struct ifreq_);
++        }
++        ifc->ifc_len = used;
++        return 0;
++    }
++    struct ifreq_ *ifr = arg;
++    if (cmd == SIOCGIFNAME_) {
++        const struct ish_iface_ *ifa = ish_iface_by_index(ifr->ifru.ivalue);
++        if (ifa == NULL)
++            return _ENODEV;
++        memset(ifr->ifrn_name, 0, sizeof(ifr->ifrn_name));
++        strcpy(ifr->ifrn_name, ifa->name);
++        return 0;
++    }
++    const struct ish_iface_ *ifa = ish_iface_by_name(ifr->ifrn_name);
++    if (ifa == NULL)
++        return _ENODEV;
++    switch (cmd) {
++        case SIOCGIFFLAGS_: ifr->ifru.flags = (int32_t)ifa->flags; return 0;
++        case SIOCGIFADDR_: ish_sockaddr_in(&ifr->ifru.addr, ifa->addr); return 0;
++        case SIOCGIFDSTADDR_: ish_sockaddr_in(&ifr->ifru.addr, ifa->addr); return 0;
++        case SIOCGIFBRDADDR_: { static const uint8_t zero[4] = {0,0,0,0};
++                                ish_sockaddr_in(&ifr->ifru.addr, zero); return 0; }
++        case SIOCGIFNETMASK_: ish_sockaddr_in(&ifr->ifru.addr, ifa->netmask); return 0;
++        case SIOCGIFMTU_: ifr->ifru.mtu = (int32_t)ifa->mtu; return 0;
++        case SIOCGIFHWADDR_:
++            memset(&ifr->ifru.addr, 0, sizeof(ifr->ifru.addr));
++            ifr->ifru.addr.family = ifa->type; // hwaddr bytes stay zero
++            return 0;
++        case SIOCGIFINDEX_: ifr->ifru.ivalue = ifa->index; return 0;
++        default: return realfs_ioctl(fd, cmd, arg);
++    }
++}
++
+ const struct fd_ops socket_fdops = {
+     .read = sock_read,
+     .write = sock_write,
+@@ -1828,8 +2157,8 @@ const struct fd_ops socket_fdops = {
+     .poll = realfs_poll,
+     .getflags = realfs_getflags,
+     .setflags = realfs_setflags,
+-    .ioctl_size = realfs_ioctl_size,
+-    .ioctl = realfs_ioctl,
++    .ioctl_size = sock_ioctl_size,
++    .ioctl = sock_ioctl,
+ };
+ 
+ #if defined(__GNUC__) && __GNUC__ >= 8
 diff --git a/fs/sock.h b/fs/sock.h
-index ed34b517..51262c95 100644
+index ed34b51..51262c9 100644
 --- a/fs/sock.h
 +++ b/fs/sock.h
 @@ -9,6 +9,20 @@
@@ -282,7 +1086,7 @@ index ed34b517..51262c95 100644
  
  int_t sys_socket(dword_t domain, dword_t type, dword_t protocol);
 diff --git a/fs/stat.c b/fs/stat.c
-index 33f0234f..0647f068 100644
+index 33f0234..0647f06 100644
 --- a/fs/stat.c
 +++ b/fs/stat.c
 @@ -1,3 +1,4 @@
@@ -368,8 +1172,171 @@ index 33f0234f..0647f068 100644
      char path[MAX_PATH];
      int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
      if (err < 0)
+diff --git a/fs/tty.c b/fs/tty.c
+index b289a74..f8df904 100644
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -130,6 +130,21 @@ static void tty_set_controlling(struct tgroup *group, struct tty *tty) {
+ int console_major = TTY_CONSOLE_MAJOR;
+ int console_minor = 1;
+ 
++int tty_fd_target(struct fd *fd, char *buf) {
++    if (fd->tty == NULL)
++        return -1;
++    struct tty *tty = fd->tty;
++    if (tty->driver->major == TTY_PSEUDO_SLAVE_MAJOR) {
++        sprintf(buf, "/dev/pts/%d", tty->num);
++        return 0;
++    }
++    if (tty->driver->major == TTY_PSEUDO_MASTER_MAJOR) {
++        strcpy(buf, "/dev/pts/ptmx");
++        return 0;
++    }
++    return -1;
++}
++
+ int tty_open(struct tty *tty, struct fd *fd) {
+     fd->tty = tty;
+ 
+diff --git a/fs/tty.h b/fs/tty.h
+index ff70dc4..7a46d0b 100644
+--- a/fs/tty.h
++++ b/fs/tty.h
+@@ -160,6 +160,15 @@ int tty_open(struct tty *tty, struct fd *fd);
+ extern lock_t ttys_lock;
+ void tty_release(struct tty *tty); // must be called with ttys_lock
+ 
++// /proc/<pid>/fd/N readlink target for a pty fd: /dev/pts/N for a slave,
++// /dev/pts/ptmx for a master (Linux semantics). Returns 0 on success, -1
++// if the fd is not attached to a pty — other tty drivers (console) keep
++// the /dev-node path generic_getpath already returns, so they fall
++// through to it. Safe to call on a retained fd: the fd holds a tty
++// reference (tty_get refcount++ at open, released at close), and num /
++// driver->major never change after tty_alloc, so no lock is needed here.
++int tty_fd_target(struct fd *fd, char *buf);
++
+ extern struct dev_ops tty_dev;
+ extern struct dev_ops ptmx_dev;
+ 
+diff --git a/kernel/calls.c b/kernel/calls.c
+index 6295ad7..a88c7c0 100644
+--- a/kernel/calls.c
++++ b/kernel/calls.c
+@@ -1340,6 +1340,22 @@ static inline int fast_fstat64(struct cpu_state *cpu) {
+     fake_stat.ctime_nsec = real_stat.st_ctim.tv_nsec;
+ #endif
+ 
++    // Anonymous fds (pipes, stdio pipes) have no host inode: Darwin's
++    // fstat reports st_ino 0 for them, but the guest-side stat (slow path
++    // sys_fstat64 -> adhoc_fstat, and stat -L via the ENV-09 hook) reports
++    // the inode allocated at creation time (adhoc_alloc_inode). Use that
++    // number here too, so fstat and stat -L agree on the same fd — without
++    // it, `stat -c %i /proc/self/fd/0` and fstat(0) would report different
++    // inodes for the same pipe. The override is unconditional when the
++    // guest has a number: on a Linux host, host fstat returns the host
++    // pipefs inode, which is a host detail that must not leak into the
++    // guest (the guest's pipe inode namespace is the allocator). For a
++    // real file passed in as stdio the guest number IS the host inode
++    // (copied at creation, and an open file's inode cannot change), so
++    // the override is a no-op there.
++    if (is_adhoc_fd(fd) && fd->stat.inode != 0)
++        fake_stat.inode = fd->stat.inode;
++
+     // Convert to ARM64 stat structure
+     struct stat_arm64 arm64stat = {};
+     arm64stat.dev = fake_stat.dev;
+diff --git a/kernel/epoll.c b/kernel/epoll.c
+index ed4f0c4..db1ea92 100644
+--- a/kernel/epoll.c
++++ b/kernel/epoll.c
+@@ -2,7 +2,7 @@
+ #include "kernel/calls.h"
+ #include "fs/poll.h"
+ 
+-static struct fd_ops epoll_ops;
++struct fd_ops epoll_ops;
+ 
+ fd_t sys_epoll_create(int_t flags) {
+     STRACE("epoll_create(%#x)", flags);
+@@ -157,6 +157,6 @@ static int epoll_close(struct fd *fd) {
+     return 0;
+ }
+ 
+-static struct fd_ops epoll_ops = {
++struct fd_ops epoll_ops = {
+     .close = epoll_close,
+ };
+diff --git a/kernel/eventfd.c b/kernel/eventfd.c
+index f4ba285..7503042 100644
+--- a/kernel/eventfd.c
++++ b/kernel/eventfd.c
+@@ -2,7 +2,7 @@
+ #include "kernel/fs.h"
+ #include "fs/poll.h"
+ 
+-static struct fd_ops eventfd_ops;
++struct fd_ops eventfd_ops;
+ 
+ int_t sys_eventfd2(uint_t initval, int_t flags) {
+     STRACE("eventfd(%d, %#x)", initval, flags);
+@@ -80,7 +80,7 @@ static int eventfd_poll(struct fd *fd) {
+     return types;
+ }
+ 
+-static struct fd_ops eventfd_ops = {
++struct fd_ops eventfd_ops = {
+     .read = eventfd_read,
+     .write = eventfd_write,
+     .poll = eventfd_poll,
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 26fd317..c8fbd66 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -879,25 +879,31 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
+     // Force-inject environment variables into every execve'd process.
+     // mode=0: inject only if not present, mode=1: replace existing value
+     static const struct { const char *kv; size_t prefix_len; int mode; } inject_envs[] = {
+-        { "PYTHONMALLOC=malloc", 13, 1 },      // FORCE bypass pymalloc arenas (mode=1: always replace)
++        // ENV-13 (dsh-go, 2026-11-17): PYTHONMALLOC=malloc (mode=1, forced)
++        // and PYTHONDONTWRITEBYTECODE=1 were injected here and are now
++        // REMOVED. PYTHONMALLOC=malloc disabled pymalloc (slower Python)
++        // and PYTHONDONTWRITEBYTECODE=1 blocked all .pyc caching, which
++        // made pip recompile ~100 modules from source on every run
++        // (ENV-03: pip --version routinely exceeded the 60s timeout).
++        // The bridge also sets PYTHONDONTWRITEBYTECODE=0 (guestEnv),
++        // which neutralises pre-patch kernels (mode-0: only if absent).
+         { "NO_COLOR=1", 9, 0 },                // Disable color output
+         { "PIP_PROGRESS_BAR=off", 17, 0 },     // Disable pip progress bar
+-        { "PYTHONDONTWRITEBYTECODE=1", 25, 0 }, // Skip .pyc generation to reduce allocs
+         // Go async preemption sends SIGURG and reads/modifies mcontext at a
+         // fixed offset. Our JIT delivers signals at gadget boundaries, not at
+         // the exact interrupted instruction, so the PC in the signal frame is
+         // imprecise. cpu_poke reduces latency but can't fix PC precision.
+         // Cooperative preemption (function-call checkpoints) works correctly.
+         { "GODEBUG=asyncpreemptoff=1", 8, 0 }, // Disable Go async preemption
+-        // Limit Go threads to reduce TLB stale-pointer crashes from concurrent
+-        // page table modifications. GOMAXPROCS=2 is sufficient for most Go CLI
+-        // tools and eliminates nearly all multi-thread race conditions.
+-        { "GOMAXPROCS=2", 11, 0 },             // Limit Go thread count
+-        // libuv's default worker pool is 4 threads. On iSH jitless node,
+-        // short scripts never use them but pay the futex sync cost. Setting
+-        // to 1 saves ~1s on `node -e 0`. Apps that genuinely need more
+-        // worker threads can override via the user environment (mode=0).
+-        { "UV_THREADPOOL_SIZE=1", 19, 0 },
++        // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS was force-injected
++        // here (=2) and is now REMOVED — Go defaults to runtime.NumCPU.
++        // (The old cap's rationale — fewer TLB stale-pointer crashes
++        // from concurrent page-table writes — is a known risk; if Go
++        // multi-thread crashes reappear, re-add a cap, scaled, not 2.)
++        // ENV-13 (dsh-go, 2026-11-17): UV_THREADPOOL_SIZE was
++        // force-injected here (=1) and is now REMOVED — libuv defaults
++        // to 4. (The old =1 saved ~1s on `node -e 0`; the bridge no
++        // longer re-adds it either — see ish-bridge.mjs guestEnv.)
+     };
+     for (size_t vi = 0; vi < sizeof(inject_envs)/sizeof(inject_envs[0]); vi++) {
+         char *e = envp;
 diff --git a/kernel/fs.c b/kernel/fs.c
-index 554d8220..d6f07289 100644
+index 554d822..d6f0728 100644
 --- a/kernel/fs.c
 +++ b/kernel/fs.c
 @@ -66,12 +66,153 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags)
@@ -527,7 +1494,7 @@ index 554d8220..d6f07289 100644
          apply_umask(&mode);
  
 diff --git a/kernel/fs.h b/kernel/fs.h
-index 0e9c2103..0a41ffeb 100644
+index 0e9c210..7cd5387 100644
 --- a/kernel/fs.h
 +++ b/kernel/fs.h
 @@ -63,6 +63,12 @@ int generic_seek(struct fd *fd, off_t_ off, int whence, size_t size);
@@ -543,437 +1510,7 @@ index 0e9c2103..0a41ffeb 100644
  int generic_setattrat(struct fd *at, const char *path, struct attr attr, bool follow_links);
  int generic_utime(struct fd *at, const char *path, struct timespec atime, struct timespec mtime, bool follow_links);
  ssize_t generic_readlinkat(struct fd *at, const char *path, char *buf, size_t bufsize);
-diff --git a/kernel/init.c b/kernel/init.c
-index 5fb8db9d..416011d7 100644
---- a/kernel/init.c
-+++ b/kernel/init.c
-@@ -41,7 +41,18 @@ static struct rlimit_ init_rlimits[16] = {
-     [RLIMIT_CORE_]       = {0, RLIM_INFINITY_},
-     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
-     [RLIMIT_NPROC_]      = {1024, 1024},
--    [RLIMIT_NOFILE_]     = {1024, 4096},
-+    // ENV-05: the soft limit is what `ulimit -n` reports and what the fd
-+    // table enforces (f_install_start / fdtable_expand in fs/fd.c refuse
-+    // new fds at rlimit(RLIMIT_NOFILE_)), so 1024 was the real ceiling for
-+    // npm/tsc-style workloads. Soft 4096 is the target; hard 8192 lets a
-+    // process raise itself further (ulimit -n 8192 / setrlimit) when the
-+    // host allows it. Note the outer bound is the HOST process's own
-+    // RLIMIT_NOFILE: every guest fd that maps to a real file, pipe or
-+    // socket consumes a host fd, so the app must also raise the host limit
-+    // at startup (ISHKernel.m, before the kernel starts) for the full
-+    // 4096 to be usable. If the host limit is lower, host open() fails
-+    // with EMFILE and the guest sees EMFILE — graceful, never a crash.
-+    [RLIMIT_NOFILE_]     = {4096, 8192},
-     [RLIMIT_MEMLOCK_]    = {64*1024, 64*1024},
-     [RLIMIT_AS_]         = {RLIM_INFINITY_, RLIM_INFINITY_},
-     [RLIMIT_LOCKS_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
-diff --git a/kernel/exec.c b/kernel/exec.c
-index 26fd317..c8fbd66 100644
---- a/kernel/exec.c
-+++ b/kernel/exec.c
-@@ -879,25 +879,31 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
-     // Force-inject environment variables into every execve'd process.
-     // mode=0: inject only if not present, mode=1: replace existing value
-     static const struct { const char *kv; size_t prefix_len; int mode; } inject_envs[] = {
--        { "PYTHONMALLOC=malloc", 13, 1 },      // FORCE bypass pymalloc arenas (mode=1: always replace)
-+        // ENV-13 (dsh-go, 2026-11-17): PYTHONMALLOC=malloc (mode=1, forced)
-+        // and PYTHONDONTWRITEBYTECODE=1 were injected here and are now
-+        // REMOVED. PYTHONMALLOC=malloc disabled pymalloc (slower Python)
-+        // and PYTHONDONTWRITEBYTECODE=1 blocked all .pyc caching, which
-+        // made pip recompile ~100 modules from source on every run
-+        // (ENV-03: pip --version routinely exceeded the 60s timeout).
-+        // The bridge also sets PYTHONDONTWRITEBYTECODE=0 (guestEnv),
-+        // which neutralises pre-patch kernels (mode-0: only if absent).
-         { "NO_COLOR=1", 9, 0 },                // Disable color output
-         { "PIP_PROGRESS_BAR=off", 17, 0 },     // Disable pip progress bar
--        { "PYTHONDONTWRITEBYTECODE=1", 25, 0 }, // Skip .pyc generation to reduce allocs
-         // Go async preemption sends SIGURG and reads/modifies mcontext at a
-         // fixed offset. Our JIT delivers signals at gadget boundaries, not at
-         // the exact interrupted instruction, so the PC in the signal frame is
-         // imprecise. cpu_poke reduces latency but can't fix PC precision.
-         // Cooperative preemption (function-call checkpoints) works correctly.
-         { "GODEBUG=asyncpreemptoff=1", 8, 0 }, // Disable Go async preemption
--        // Limit Go threads to reduce TLB stale-pointer crashes from concurrent
--        // page table modifications. GOMAXPROCS=2 is sufficient for most Go CLI
--        // tools and eliminates nearly all multi-thread race conditions.
--        { "GOMAXPROCS=2", 11, 0 },             // Limit Go thread count
--        // libuv's default worker pool is 4 threads. On iSH jitless node,
--        // short scripts never use them but pay the futex sync cost. Setting
--        // to 1 saves ~1s on `node -e 0`. Apps that genuinely need more
--        // worker threads can override via the user environment (mode=0).
--        { "UV_THREADPOOL_SIZE=1", 19, 0 },
-+        // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS was force-injected
-+        // here (=2) and is now REMOVED — Go defaults to runtime.NumCPU.
-+        // (The old cap's rationale — fewer TLB stale-pointer crashes
-+        // from concurrent page-table writes — is a known risk; if Go
-+        // multi-thread crashes reappear, re-add a cap, scaled, not 2.)
-+        // ENV-13 (dsh-go, 2026-11-17): UV_THREADPOOL_SIZE was
-+        // force-injected here (=1) and is now REMOVED — libuv defaults
-+        // to 4. (The old =1 saved ~1s on `node -e 0`; the bridge no
-+        // longer re-adds it either — see ish-bridge.mjs guestEnv.)
-     };
-     for (size_t vi = 0; vi < sizeof(inject_envs)/sizeof(inject_envs[0]); vi++) {
-         char *e = envp;
-
-diff --git a/xX_main_Xx.h b/xX_main_Xx.h
-index 22f1435..3e22217 100644
---- a/xX_main_Xx.h
-+++ b/xX_main_Xx.h
-@@ -207,13 +207,11 @@ do_exec:
-         // These are injected only if not already present.
-         static const char *inject_vars[] = {
-             "GODEBUG=asyncpreemptoff=1",  // Disable Go async preemption
--            "GOMAXPROCS=2",               // Limit Go thread count
-             "NO_COLOR=1",                 // Disable color output
--            "PYTHONMALLOC=malloc",        // Bypass pymalloc arenas
--            "PYTHONDONTWRITEBYTECODE=1",  // Skip .pyc generation
--            // Reduce libuv worker pool from 4→1: short scripts never use them
--            // but pay the futex sync cost. Saves ~1s on `node -e 0`.
--            "UV_THREADPOOL_SIZE=1",
-+            // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS, PYTHONMALLOC,
-+            // PYTHONDONTWRITEBYTECODE and UV_THREADPOOL_SIZE were
-+            // injected here and are now REMOVED (same reason as the
-+            // sys_execve table in kernel/exec.c). Kept: GODEBUG, NO_COLOR.
-         };
-         for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
-             // Check if already present (search by prefix up to '=')
-
-diff --git a/fs/adhoc.c b/fs/adhoc.c
-index a56a3bc..3d12627 100644
---- a/fs/adhoc.c
-+++ b/fs/adhoc.c
-@@ -3,6 +3,7 @@
- #include "debug.h"
- #include "kernel/fs.h"
- #include "fs/fd.h"
-+#include "fs/tty.h"
- #include "kernel/errno.h"
- 
- static struct mount adhoc_mount;
-@@ -17,6 +18,31 @@ struct fd *adhoc_fd_create(const struct fd_ops *ops) {
-     return fd;
- }
- 
-+// Guest-side inode numbers for anonymous fds (pipes, sockets).
-+//
-+// Linux gives every pipe and socket a stable inode number (pipefs /
-+// sockfs), and /proc/<pid>/fd/N readlink prints it as pipe:[ino] /
-+// socket:[ino]. iSH never assigned one: fd->stat.inode stayed 0 for
-+// pipes and sockets, so adhoc_getpath could only print
-+// "anon_inode:[unknown]". Darwin's fstat cannot fill the gap — it
-+// reports st_ino 0 for pipes and sockets, which is exactly why the
-+// defect report saw anon_inode:[unknown] for piped stdio (see
-+// open_fd_from_actual_fd, which copies the host st_ino verbatim).
-+//
-+// Allocate here instead. The counter starts at 2^32, above the range
-+// host APFS cnids occupy in practice, so a guest pipe/socket inode is
-+// unlikely to collide numerically with a real file's host inode. A
-+// dup/fork shares the struct fd, so it shares the number too — same as
-+// Linux. Wrapping is a non-issue (64-bit, one increment per pipe/socket
-+// created). _Atomic, like tmpfs's next_inode: creation sites run
-+// concurrently.
-+#define ADHOC_INODE_BASE ((ino_t) 0x100000000ULL)
-+static _Atomic ino_t next_adhoc_inode = ADHOC_INODE_BASE;
-+
-+ino_t adhoc_alloc_inode(void) {
-+    return next_adhoc_inode++;
-+}
-+
- static int adhoc_fstat(struct fd *fd, struct statbuf *stat) {
-     *stat = fd->stat;
-     return 0;
-@@ -40,11 +66,74 @@ static int adhoc_fsetattr(struct fd *fd, struct attr attr) {
- }
- 
- static int adhoc_getpath(struct fd *fd, char *buf) {
--    const char *type = "unknown"; // TODO allow this to be customized
--    if (fd->stat.inode == 0)
--        sprintf(buf, "anon_inode:[%s]", type);
--    else
--        sprintf(buf, "%s:[%lu]", type, (unsigned long) fd->stat.inode);
-+    // Pipes, sockets and anonymous fds have no pathname: Linux reports
-+    // them as pipe:[ino], socket:[ino] or anon_inode:[type], and that is
-+    // what /proc/<pid>/fd/N readlink must return (it is also what
-+    // `ls -l /proc/self/fd` prints). The old code printed
-+    // "anon_inode:[unknown]" for all of them: the type was hardcoded and
-+    // fd->stat.inode was never filled in for pipes/sockets.
-+    //
-+    // Dispatch order matters: a tty fd is identified by fd->tty, not by
-+    // its mode (a pty slave is S_IFCHR, same as any char device).
-+    if (fd->tty != NULL) {
-+        // Pty slave -> /dev/pts/N, master -> /dev/pts/ptmx (Linux).
-+        // Other tty drivers (console) have no pty number to report, and
-+        // an adhoc-mounted fd has no /dev node to resolve either (this
-+        // branch is only reached for the create_stdio fallback), so they
-+        // keep anon_inode below. (Fakefs-mounted tty fds never reach
-+        // here: proc_pid_fd_readlink intercepts pty fds first, and
-+        // generic_getpath already returns /dev/console, /dev/tty1 etc.
-+        // for the rest.)
-+        if (tty_fd_target(fd, buf) == 0)
-+            return 0;
-+        // Not a pty (e.g. console fallback stdio): there is no guest
-+        // pathname that identifies it, so keep anon_inode below.
-+    } else if (S_ISFIFO(fd->stat.mode)) {
-+        // Both ends of one pipe share the inode (allocated once in
-+        // sys_pipe2); a dup/fork shares the struct fd, so it shares the
-+        // number too — same as Linux's one pipe_inode_info.
-+        if (fd->stat.inode != 0) {
-+            sprintf(buf, "pipe:[%lu]", (unsigned long) fd->stat.inode);
-+            return 0;
-+        }
-+    } else if (S_ISSOCK(fd->stat.mode)) {
-+        // Each socket has its own inode (allocated in sock_fd_create);
-+        // the two ends of a socketpair do NOT share one, same as Linux.
-+        if (fd->stat.inode != 0) {
-+            sprintf(buf, "socket:[%lu]", (unsigned long) fd->stat.inode);
-+            return 0;
-+        }
-+    } else if (fd->stat.mode == 0) {
-+        // Anonymous fds with no mode and no pathname: eventfd, timerfd,
-+        // epoll, inotify, pidfd. Linux names the subtype; these fds have
-+        // no inode, so there is no number to print. The ops pointers are
-+        // the only thing distinguishing them (their ops structs are
-+        // non-static for exactly this comparison).
-+        const char *type = NULL;
-+        if (fd->ops == &eventfd_ops)
-+            type = "eventfd";
-+        else if (fd->ops == &timerfd_ops)
-+            type = "timerfd";
-+        else if (fd->ops == &epoll_ops)
-+            type = "epoll";
-+        else if (fd->ops == &inotify_ops)
-+            type = "inotify";
-+        else if (fd->ops == &pidfd_ops)
-+            type = "pidfd";
-+        if (type != NULL) {
-+            sprintf(buf, "anon_inode:[%s]", type);
-+            return 0;
-+        }
-+    }
-+    // Anything left has no derivable target, and none is fabricated:
-+    //  - a regular file passed in as stdio: the guest never learns its
-+    //    host path (F_GETPATH would return a host path outside the guest
-+    //    namespace, which must not leak into a guest readlink);
-+    //  - stdio from a host tty fd: no guest /dev/pts/N corresponds to it
-+    //    (the in-guest pty numbers are allocated separately);
-+    //  - a pipe/socket whose inode is 0 (should not happen after the
-+    //    creation-site fixes, kept as a guard).
-+    sprintf(buf, "anon_inode:[unknown]");
-     return 0;
- }
- 
-diff --git a/fs/pipe.c b/fs/pipe.c
-index ff900e6..0938811 100644
---- a/fs/pipe.c
-+++ b/fs/pipe.c
-@@ -5,7 +5,7 @@
- #include "fs/real.h"
- #include "debug.h"
- 
--static fd_t pipe_f_create(int pipe_fd, int flags) {
-+static fd_t pipe_f_create(int pipe_fd, int flags, ino_t inode) {
-     struct fd *fd = adhoc_fd_create(&realfs_fdops);
-     if (fd == NULL)
-         return _ENOMEM;
-@@ -13,6 +13,11 @@ static fd_t pipe_f_create(int pipe_fd, int flags) {
-     fd->stat.mode = S_IFIFO | 0660;
-     fd->stat.uid = current->uid;
-     fd->stat.gid = current->gid;
-+    // Guest-side inode for /proc/<pid>/fd/N readlink ("pipe:[ino]") and
-+    // for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
-+    // pipes, so there is no host number to use). Both ends share the one
-+    // inode allocated by the caller — Linux: one pipe_inode_info.
-+    fd->stat.inode = inode;
-     return f_install(fd, flags);
- }
- 
-@@ -28,11 +33,13 @@ int_t sys_pipe2(addr_t pipe_addr, int_t flags) {
-     if (err < 0)
-         return err;
- 
-+    // One inode for the pipe, shared by both ends (see pipe_f_create).
-+    ino_t inode = adhoc_alloc_inode();
-     int fp[2];
--    err = fp[0] = pipe_f_create(p[0], flags);
-+    err = fp[0] = pipe_f_create(p[0], flags, inode);
-     if (fp[0] < 0)
-         goto close_pipe;
--    err = fp[1] = pipe_f_create(p[1], flags);
-+    err = fp[1] = pipe_f_create(p[1], flags, inode);
-     if (fp[1] < 0)
-         goto close_fake_0;
- 
-diff --git a/fs/proc/pid.c b/fs/proc/pid.c
-index 107ddce..c92d4e1 100644
---- a/fs/proc/pid.c
-+++ b/fs/proc/pid.c
-@@ -375,6 +375,17 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
-     proc_put_task(task); // releases pids_lock
-     if (fd == NULL)
-         return _ENOENT;
-+    // Pty fds: /dev/pts/N for a slave, /dev/pts/ptmx for a master
-+    // (Linux). generic_getpath would return the /dev node the fd was
-+    // opened from instead (/dev/ptmx, /dev/tty) — meaningful, but not
-+    // the device the fd actually is (a /dev/tty fd IS the pts slave).
-+    // Other tty drivers (console) fall through: their /dev-node path
-+    // (/dev/console, /dev/tty1) is already correct. Pipes, sockets and
-+    // anonymous fds are handled one layer down, in adhoc_getpath.
-+    if (tty_fd_target(fd, buf) == 0) {
-+        fd_close(fd);
-+        return 0;
-+    }
-     int err = generic_getpath(fd, buf);
-     fd_close(fd);
-     return err;
-diff --git a/fs/sock.c b/fs/sock.c
-index fc69238..759e423 100644
---- a/fs/sock.c
-+++ b/fs/sock.c
-@@ -192,6 +192,10 @@ static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
-         return _ENOMEM;
-     }
-     fd->stat.mode = S_IFSOCK | 0666;
-+    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
-+    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0
-+    // for sockets). One inode per socket.
-+    fd->stat.inode = adhoc_alloc_inode();
-     fd->real_fd = sv[0];
-     fd->socket.domain = AF_NETLINK_;
-     fd->socket.type = type & SOCKET_TYPE_MASK;
-@@ -218,6 +222,12 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
-     if (fd == NULL)
-         return _ENOMEM;
-     fd->stat.mode = S_IFSOCK | 0666;
-+    // Guest-side inode for /proc/<pid>/fd/N readlink ("socket:[ino]")
-+    // and for fstat/stat -L (was 0: Darwin's fstat reports st_ino 0 for
-+    // sockets). One inode per socket: socket(), accept() and each end of
-+    // socketpair() all come through here and each get their own, same as
-+    // Linux (a socketpair's two ends do NOT share an inode).
-+    fd->stat.inode = adhoc_alloc_inode();
-     fd->real_fd = sock_fd;
-     fd->socket.domain = domain;
-     fd->socket.type = type & SOCKET_TYPE_MASK;
-diff --git a/fs/tty.c b/fs/tty.c
-index b289a74..f8df904 100644
---- a/fs/tty.c
-+++ b/fs/tty.c
-@@ -130,6 +130,21 @@ static void tty_set_controlling(struct tgroup *group, struct tty *tty) {
- int console_major = TTY_CONSOLE_MAJOR;
- int console_minor = 1;
- 
-+int tty_fd_target(struct fd *fd, char *buf) {
-+    if (fd->tty == NULL)
-+        return -1;
-+    struct tty *tty = fd->tty;
-+    if (tty->driver->major == TTY_PSEUDO_SLAVE_MAJOR) {
-+        sprintf(buf, "/dev/pts/%d", tty->num);
-+        return 0;
-+    }
-+    if (tty->driver->major == TTY_PSEUDO_MASTER_MAJOR) {
-+        strcpy(buf, "/dev/pts/ptmx");
-+        return 0;
-+    }
-+    return -1;
-+}
-+
- int tty_open(struct tty *tty, struct fd *fd) {
-     fd->tty = tty;
- 
-diff --git a/fs/tty.h b/fs/tty.h
-index ff70dc4..7a46d0b 100644
---- a/fs/tty.h
-+++ b/fs/tty.h
-@@ -160,6 +160,15 @@ int tty_open(struct tty *tty, struct fd *fd);
- extern lock_t ttys_lock;
- void tty_release(struct tty *tty); // must be called with ttys_lock
- 
-+// /proc/<pid>/fd/N readlink target for a pty fd: /dev/pts/N for a slave,
-+// /dev/pts/ptmx for a master (Linux semantics). Returns 0 on success, -1
-+// if the fd is not attached to a pty — other tty drivers (console) keep
-+// the /dev-node path generic_getpath already returns, so they fall
-+// through to it. Safe to call on a retained fd: the fd holds a tty
-+// reference (tty_get refcount++ at open, released at close), and num /
-+// driver->major never change after tty_alloc, so no lock is needed here.
-+int tty_fd_target(struct fd *fd, char *buf);
-+
- extern struct dev_ops tty_dev;
- extern struct dev_ops ptmx_dev;
- 
-diff --git a/kernel/calls.c b/kernel/calls.c
-index 6295ad7..a88c7c0 100644
---- a/kernel/calls.c
-+++ b/kernel/calls.c
-@@ -1340,6 +1340,22 @@ static inline int fast_fstat64(struct cpu_state *cpu) {
-     fake_stat.ctime_nsec = real_stat.st_ctim.tv_nsec;
- #endif
- 
-+    // Anonymous fds (pipes, stdio pipes) have no host inode: Darwin's
-+    // fstat reports st_ino 0 for them, but the guest-side stat (slow path
-+    // sys_fstat64 -> adhoc_fstat, and stat -L via the ENV-09 hook) reports
-+    // the inode allocated at creation time (adhoc_alloc_inode). Use that
-+    // number here too, so fstat and stat -L agree on the same fd — without
-+    // it, `stat -c %i /proc/self/fd/0` and fstat(0) would report different
-+    // inodes for the same pipe. The override is unconditional when the
-+    // guest has a number: on a Linux host, host fstat returns the host
-+    // pipefs inode, which is a host detail that must not leak into the
-+    // guest (the guest's pipe inode namespace is the allocator). For a
-+    // real file passed in as stdio the guest number IS the host inode
-+    // (copied at creation, and an open file's inode cannot change), so
-+    // the override is a no-op there.
-+    if (is_adhoc_fd(fd) && fd->stat.inode != 0)
-+        fake_stat.inode = fd->stat.inode;
-+
-     // Convert to ARM64 stat structure
-     struct stat_arm64 arm64stat = {};
-     arm64stat.dev = fake_stat.dev;
-diff --git a/kernel/epoll.c b/kernel/epoll.c
-index ed4f0c4..db1ea92 100644
---- a/kernel/epoll.c
-+++ b/kernel/epoll.c
-@@ -2,7 +2,7 @@
- #include "kernel/calls.h"
- #include "fs/poll.h"
- 
--static struct fd_ops epoll_ops;
-+struct fd_ops epoll_ops;
- 
- fd_t sys_epoll_create(int_t flags) {
-     STRACE("epoll_create(%#x)", flags);
-@@ -157,6 +157,6 @@ static int epoll_close(struct fd *fd) {
-     return 0;
- }
- 
--static struct fd_ops epoll_ops = {
-+struct fd_ops epoll_ops = {
-     .close = epoll_close,
- };
-diff --git a/kernel/eventfd.c b/kernel/eventfd.c
-index f4ba285..7503042 100644
---- a/kernel/eventfd.c
-+++ b/kernel/eventfd.c
-@@ -2,7 +2,7 @@
- #include "kernel/fs.h"
- #include "fs/poll.h"
- 
--static struct fd_ops eventfd_ops;
-+struct fd_ops eventfd_ops;
- 
- int_t sys_eventfd2(uint_t initval, int_t flags) {
-     STRACE("eventfd(%d, %#x)", initval, flags);
-@@ -80,7 +80,7 @@ static int eventfd_poll(struct fd *fd) {
-     return types;
- }
- 
--static struct fd_ops eventfd_ops = {
-+struct fd_ops eventfd_ops = {
-     .read = eventfd_read,
-     .write = eventfd_write,
-     .poll = eventfd_poll,
-diff --git a/kernel/fs.h b/kernel/fs.h
-index 0a41ffe..7cd5387 100644
---- a/kernel/fs.h
-+++ b/kernel/fs.h
-@@ -184,6 +184,21 @@ struct mount *find_mount_and_trim_path(char *path);
+@@ -178,6 +184,21 @@ struct mount *find_mount_and_trim_path(char *path);
  struct fd *adhoc_fd_create(const struct fd_ops *ops);
  // this is for the "wtf is apple smoking" section
  bool is_adhoc_fd(struct fd *fd);
@@ -996,10 +1533,30 @@ index 0a41ffe..7cd5387 100644
  // filesystems
  extern const struct fs_ops procfs;
 diff --git a/kernel/init.c b/kernel/init.c
-index 416011d..8129196 100644
+index 5fb8db9..8129196 100644
 --- a/kernel/init.c
 +++ b/kernel/init.c
-@@ -201,6 +201,17 @@ static struct fd *open_fd_from_actual_fd(int fd_no) {
+@@ -41,7 +41,18 @@ static struct rlimit_ init_rlimits[16] = {
+     [RLIMIT_CORE_]       = {0, RLIM_INFINITY_},
+     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
+     [RLIMIT_NPROC_]      = {1024, 1024},
+-    [RLIMIT_NOFILE_]     = {1024, 4096},
++    // ENV-05: the soft limit is what `ulimit -n` reports and what the fd
++    // table enforces (f_install_start / fdtable_expand in fs/fd.c refuse
++    // new fds at rlimit(RLIMIT_NOFILE_)), so 1024 was the real ceiling for
++    // npm/tsc-style workloads. Soft 4096 is the target; hard 8192 lets a
++    // process raise itself further (ulimit -n 8192 / setrlimit) when the
++    // host allows it. Note the outer bound is the HOST process's own
++    // RLIMIT_NOFILE: every guest fd that maps to a real file, pipe or
++    // socket consumes a host fd, so the app must also raise the host limit
++    // at startup (ISHKernel.m, before the kernel starts) for the full
++    // 4096 to be usable. If the host limit is lower, host open() fails
++    // with EMFILE and the guest sees EMFILE — graceful, never a crash.
++    [RLIMIT_NOFILE_]     = {4096, 8192},
+     [RLIMIT_MEMLOCK_]    = {64*1024, 64*1024},
+     [RLIMIT_AS_]         = {RLIM_INFINITY_, RLIM_INFINITY_},
+     [RLIMIT_LOCKS_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
+@@ -190,6 +201,17 @@ static struct fd *open_fd_from_actual_fd(int fd_no) {
              fd->stat.rdev = dev_make(TTY_PSEUDO_SLAVE_MAJOR, 0);
          }
      }
@@ -1083,3 +1640,93 @@ index 6dee9ac..1228ff7 100644
      .read = timerfd_read,
      .poll = timerfd_poll,
      .close = timerfd_close,
+diff --git a/meson.build b/meson.build
+index 890ce19..6780896 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1755,6 +1755,7 @@ if get_option('kernel') == 'ish'
+         'fs/proc/net.c',
+         'fs/proc/root.c',
+         'fs/proc/pid.c',
++        'fs/proc/sys.c',
+ 
+         'fs/dyndev.c',
+ 
+diff --git a/platform/darwin.c b/platform/darwin.c
+index 290a5cc..8578e00 100644
+--- a/platform/darwin.c
++++ b/platform/darwin.c
+@@ -56,6 +56,7 @@ struct mem_usage get_mem_usage() {
+         fallback.free = memsize / 4;
+         fallback.active = memsize / 4;
+         fallback.inactive = memsize / 4;
++        fallback.available = fallback.free + fallback.inactive;
+         return fallback;
+     }
+ 
+@@ -64,6 +65,11 @@ struct mem_usage get_mem_usage() {
+     usage.free = vm.free_count * vm_page_size;
+     usage.active = vm.active_count * vm_page_size;
+     usage.inactive = vm.inactive_count * vm_page_size;
++    // [P1-6] iOS keeps free pages low (the kernel hoards them as
++    // inactive/speculative), so MemFree alone understates what the guest
++    // can allocate. MemAvailable = free + inactive + speculative, the
++    // same pages the host would hand out under pressure.
++    usage.available = (vm.free_count + vm.inactive_count + vm.speculative_count) * vm_page_size;
+     last_good = usage;
+     have_last_good = true;
+     return usage;
+diff --git a/platform/linux.c b/platform/linux.c
+index e4d9583..efada3f 100644
+--- a/platform/linux.c
++++ b/platform/linux.c
+@@ -36,6 +36,12 @@ struct mem_usage get_mem_usage() {
+     sscanf(buf, "Active: %"PRIu64" kB\n", &usage.active);
+     read_proc_line("/proc/meminfo", "Inactive:", buf);
+     sscanf(buf, "Inactive: %"PRIu64" kB\n", &usage.inactive);
++    // [P1-6] Host MemAvailable when present, else free + inactive.
++    usage.available = 0;
++    read_proc_line("/proc/meminfo", "MemAvailable:", buf);
++    sscanf(buf, "MemAvailable: %"PRIu64" kB\n", &usage.available);
++    if (usage.available == 0)
++        usage.available = usage.free + usage.inactive;
+ 
+     return usage;
+ }
+diff --git a/platform/platform.h b/platform/platform.h
+index c265fdc..66f9621 100644
+--- a/platform/platform.h
++++ b/platform/platform.h
+@@ -16,6 +16,10 @@ struct mem_usage {
+     uint64_t free;
+     uint64_t active;
+     uint64_t inactive;
++    // Memory the guest could actually allocate: free + reclaimable
++    // (inactive + speculative on Darwin, host MemAvailable on Linux).
++    // Same units as the other fields (bytes on Darwin, kB on Linux).
++    uint64_t available;
+ };
+ struct mem_usage get_mem_usage(void);
+ 
+diff --git a/xX_main_Xx.h b/xX_main_Xx.h
+index 22f1435..3e22217 100644
+--- a/xX_main_Xx.h
++++ b/xX_main_Xx.h
+@@ -207,13 +207,11 @@ do_exec:
+         // These are injected only if not already present.
+         static const char *inject_vars[] = {
+             "GODEBUG=asyncpreemptoff=1",  // Disable Go async preemption
+-            "GOMAXPROCS=2",               // Limit Go thread count
+             "NO_COLOR=1",                 // Disable color output
+-            "PYTHONMALLOC=malloc",        // Bypass pymalloc arenas
+-            "PYTHONDONTWRITEBYTECODE=1",  // Skip .pyc generation
+-            // Reduce libuv worker pool from 4→1: short scripts never use them
+-            // but pay the futex sync cost. Saves ~1s on `node -e 0`.
+-            "UV_THREADPOOL_SIZE=1",
++            // ENV-13 (dsh-go, 2026-11-17): GOMAXPROCS, PYTHONMALLOC,
++            // PYTHONDONTWRITEBYTECODE and UV_THREADPOOL_SIZE were
++            // injected here and are now REMOVED (same reason as the
++            // sys_execve table in kernel/exec.c). Kept: GODEBUG, NO_COLOR.
+         };
+         for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
+             // Check if already present (search by prefix up to '=')

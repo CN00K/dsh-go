@@ -124,3 +124,48 @@
 +		// The old early return ran super.execute() unconfined, which
 +		// always fails on iOS with spawn EPERM (device test, build 52).
  		let confined;
+--- a/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js
+@@ -343,8 +343,41 @@
+ */
+ var SandboxUnavailableError = class extends HarnessError {
+ 	constructor(mode, detail) {
+-		super(`sandbox mode "${mode}" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) — otherwise switch the consumer to danger-full-access.` + (detail === void 0 ? "" : ` Runner failure: ${detail}`), SANDBOX_UNAVAILABLE);
++		super(SandboxUnavailableError.messageFor(mode, detail), SANDBOX_UNAVAILABLE);
+ 		this.name = "SandboxUnavailableError";
++	}
++	// iSH Linux sandbox (Stage 5.4, dsh-go; P0-2): layer the error so a
++	// bridge transport failure is not reported as "no sandbox backend".
++	// The /ish-runner sentinel is not a host sandbox backend; when it
++	// fails, the cause is the bridge/guest, not missing confinement.
++	// Bridge messages deliberately omit the "no sandbox backend is
++	// usable" marker so the UI shows them as real errors, not the
++	// neutral "needs authorization" card (tool_view.dart matches on it).
++	// danger-full-access never suggests switching to itself.
++	static messageFor(mode, detail) {
++		const detailText = detail === void 0 ? "" : String(detail);
++		const lowered = detailText.toLowerCase();
++		if (lowered.includes("ish bridge unavailable") || lowered.includes("ish_not_booted") || lowered.includes("/ish-runner")) {
++			const kind = lowered.includes("ish_not_booted")
++				? "ish bridge not ready"
++				: lowered.includes("parse error") || lowered.includes("hpe_")
++					? "ish bridge protocol error"
++					: "ish bridge transport error";
++			return `executor error: ${kind} (cause: ${detailText}). This is not a sandbox issue — the iSH bridge to the guest failed; the sandbox backend itself is not the problem.`;
++		}
++		if (mode === "danger-full-access") {
++			return `sandbox mode "danger-full-access" is requested but the command could not run` + (detail === void 0 ? "." : ` (cause: ${detailText}).`) + ` There is no wider mode to switch to.` + (SandboxUnavailableError.isDSHGoIOS() ? ` On iOS there is no host sandbox backend; only full-access mode (via the iSH guest) is available.` : ``);
++		}
++		if (SandboxUnavailableError.isDSHGoIOS()) {
++			return `sandbox mode "${mode}" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. On iOS there is no host sandbox backend; only full-access mode (via the iSH guest) is available.` + (detail === void 0 ? "" : ` Runner failure: ${detailText}`);
++		}
++		return `sandbox mode "${mode}" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) — otherwise switch the consumer to danger-full-access.` + (detail === void 0 ? "" : ` Runner failure: ${detailText}`);
++	}
++	// dsh-go on iOS installs the direct-runtime hook at startup
++	// (ish-bridge.mjs sets globalThis[Symbol.for("dsh.go.direct")]);
++	// desktop DSH never sets it.
++	static isDSHGoIOS() {
++		return typeof globalThis !== "undefined" && globalThis[Symbol.for("dsh.go.direct")] !== void 0;
+ 	}
+ };
+ /** The selected backend is available but cannot enforce the requested policy. */

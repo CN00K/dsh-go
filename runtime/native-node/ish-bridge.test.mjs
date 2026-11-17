@@ -97,10 +97,20 @@ function bearerOk(req) {
 // Path translation (design §3.5)
 // ---------------------------------------------------------------------------
 
-test('toGuest maps the workspace and tmp, rejects everything else', () => {
+/** Guest rootfs data dir under the fake HOME (mirrors hostRoots() in the bridge). */
+const fakeData = join(fakeHome, '..', '..', 'iSH', 'rootfs', 'data');
+
+test('toGuest maps the workspace and the rootfs data dir, rejects everything else', () => {
   assert.equal(toGuest(join(fakeHome, 'workspace', 'a.txt')), '/home/workspace/a.txt');
   assert.equal(toGuest(join(fakeHome, 'workspace')), '/home/workspace');
-  assert.equal(toGuest(join(fakeRoot, 'tmp', 'x')), '/tmp/x');
+  // Guest /tmp lives under the rootfs data dir, not under <root>/tmp
+  // (that is the host-only TMPDIR — the old mapping claimed host temp
+  // files were guest /tmp files).
+  assert.equal(toGuest(join(fakeData, 'tmp', 'x')), '/tmp/x');
+  assert.equal(toGuest(join(fakeData, 'etc', 'passwd')), '/etc/passwd');
+  assert.equal(toGuest(fakeData), '/');
+  // Host-only tmp is no longer guest /tmp.
+  assert.equal(toGuest(join(fakeRoot, 'tmp', 'x')), null);
   // ".." escape out of the workspace is rejected (resolve normalises it).
   assert.equal(toGuest(join(fakeHome, 'workspace', '..', 'secret.txt')), null);
   assert.equal(toGuest(join(fakeHome, 'workspace', '..', '..', 'etc', 'passwd')), null);
@@ -110,14 +120,35 @@ test('toGuest maps the workspace and tmp, rejects everything else', () => {
   assert.equal(toGuest(''), null);
 });
 
-test('toHost is the inverse of toGuest for shared dirs', () => {
+test('toHost maps guest paths into the rootfs data dir', () => {
   assert.equal(toHost('/home/workspace/a.txt'), join(fakeHome, 'workspace', 'a.txt'));
   assert.equal(toHost('/home/workspace'), join(fakeHome, 'workspace'));
-  assert.equal(toHost('/tmp/x'), join(fakeRoot, 'tmp', 'x'));
-  // Guest-only paths have no host equivalent; returned unchanged (the
-  // callers fall back to the input when the hook is absent).
-  assert.equal(toHost('/etc/passwd'), '/etc/passwd');
-  assert.equal(toHost('/root/.profile'), '/root/.profile');
+  assert.equal(toHost('/tmp/x'), join(fakeData, 'tmp', 'x'));
+  assert.equal(toHost('/tmp'), join(fakeData, 'tmp'));
+  // Every other guest path lives under the rootfs data dir (P2-9:
+  // the old code returned these unchanged, so the engine read the
+  // iOS host's /etc).
+  assert.equal(toHost('/etc/passwd'), join(fakeData, 'etc', 'passwd'));
+  assert.equal(toHost('/root/.profile'), join(fakeData, 'root', '.profile'));
+  assert.equal(toHost('/'), fakeData);
+  // Relative paths are left alone (resolved by the caller).
+  assert.equal(toHost('relative/path'), 'relative/path');
+  // Host paths already under a host root pass through unchanged.
+  assert.equal(toHost(join(fakeHome, 'workspace', 'a.txt')), join(fakeHome, 'workspace', 'a.txt'));
+  assert.equal(toHost(join(fakeData, 'etc', 'passwd')), join(fakeData, 'etc', 'passwd'));
+});
+
+test('toHost throws for kernel-virtual guest paths', () => {
+  // /proc, /sys and /dev have no file in the rootfs; the shell is the
+  // only way to read them. The error must say so (P2-9 hint).
+  assert.throws(() => toHost('/proc/version'), /shell instead/);
+  assert.throws(() => toHost('/proc/self/fd/0'), /shell instead/);
+  assert.throws(() => toHost('/proc'), /shell instead/);
+  assert.throws(() => toHost('/sys/kernel/hostname'), /shell instead/);
+  assert.throws(() => toHost('/dev/null'), /shell instead/);
+  // Prefix lookalikes are not virtual.
+  assert.equal(toHost('/procx/x'), join(fakeData, 'procx', 'x'));
+  assert.equal(toHost('/devices'), join(fakeData, 'devices'));
 });
 
 // ---------------------------------------------------------------------------

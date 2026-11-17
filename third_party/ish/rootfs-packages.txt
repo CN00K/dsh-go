@@ -7,7 +7,35 @@
 # recorded in rootfs-packages.lock.
 #
 # Versions below were pinned 2026-11-17 against the live Alpine 3.21
-# aarch64 APKINDEX (main repo; all 18 packages are in main).
+# aarch64 APKINDEX (main repo; all 25 packages are in main).
+#
+# 2026-11-17 build 35: +7 tools the user asked for on device
+# (build 34): vim, nano, openssh-client-default (ssh), openssh-server
+# (sshd), tmux, tree, htop. Verified against the same live index.
+#   vim        — real vim 9.1 (the base image only has the busybox vi
+#                applet at /usr/bin/vi; `vim` itself was missing). NOTE:
+#                the vim package does NOT ship /usr/bin/vi — vi stays
+#                the busybox applet (already in the image, indexed in
+#                meta.db); vim is the new /usr/bin/vim. vim-common is
+#                ~26.6 MiB installed (the runtime/syntax files) — the
+#                big part of this round's +36 MiB.
+#   nano       — nano 8.2, small terminal editor
+#   openssh-client-default — `ssh` (Alpine 3.21 has NO real package
+#                named `openssh-client`; it is a virtual provide. The
+#                real package is openssh-client-default, which provides
+#                cmd:ssh; the krb5 variant is the heavier alternative
+#                and is NOT used). Pulls in openssh-client-common (scp,
+#                sftp, ssh-agent, ssh-add, ssh-copy-id) and ssh-keygen.
+#   openssh-server — `sshd` (/usr/sbin/sshd). Host keys + actually
+#                running the daemon in the guest are a device follow-up;
+#                this change only installs the binaries.
+#   tmux       — terminal multiplexer 3.5a (pulls in libevent)
+#   tree       — real `tree` 2.2.1 (replaces the busybox tree applet
+#                symlink at /usr/bin/tree in place — takeover, same as
+#                the GNU coreutils takeovers in the ENV round)
+#   htop       — interactive process viewer 3.3.0
+#   NOTE: the xxd package (a vim dependency) likewise takes over the
+#   busybox xxd applet symlink at /usr/bin/xxd in place.
 #
 # What ships (and why):
 #   bash       — the sandbox shell (the DSH "bash" tool runs /bin/bash;
@@ -73,3 +101,10 @@ jq=1.8.2-r0
 make=4.4.1-r2
 build-base=0.5-r3
 util-linux-misc=2.40.4-r1
+vim=9.1.1105-r0
+nano=8.2-r0
+openssh-client-default=9.9_p2-r1
+openssh-server=9.9_p2-r1
+tmux=3.5a-r0
+tree=2.2.1-r0
+htop=3.3.0-r0

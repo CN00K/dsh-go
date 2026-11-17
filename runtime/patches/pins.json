@@ -1803,6 +1803,10 @@
         "node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js": {
           "before": "0f788f99113ba7411eb33af71cdafabd07b73cf012c1715c819e03f3f77f342d",
           "after": "7bc07d311ccf2a5cbca226d1f7e8a8de9bfd49724c2b4e98692837504a9f8283"
+        },
+        "node_modules/@deepseek-ai/dsh-sandbox/lib/index.js": {
+          "before": "cc4f6b7e84eaff0bb692413f59c1bc8de457dbe5569d02985ea8e87f68281ea7",
+          "after": "44b2f7b069bb007a1d233fef45f82061d000526fd4fd66e6de386c0e16e052f2"
         }
       }
     }

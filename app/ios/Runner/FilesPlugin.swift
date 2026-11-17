@@ -112,6 +112,37 @@ public final class FilesPlugin: NSObject, FlutterPlugin, UIDocumentInteractionCo
     private static func resolveGuest(_ path: String) -> URL? {
         guard path.hasPrefix("/") else { return nil }
         let fm = FileManager.default
+        // (build 35) A path the 文件 page hands us is already a HOST
+        // path: the session cwd is the host workspace
+        // (.../NativeNode/home/workspace), so workspaceHostPath builds
+        // host paths and runArtifactAction passes them straight to
+        // materialize → resolveGuest. The walk below only understands
+        // guest paths (/home/workspace/...); a host path walked as a
+        // guest path finds nothing under the rootfs data dir and
+        // returns nil — that is why share/save failed on build 34
+        // with "missing" even though the ENV fix made guest paths
+        // work. Accept a host workspace path as-is when it is a
+        // readable regular file. Only the workspace is accepted this
+        // way: it is the one host dir shared with the guest, so
+        // nothing new becomes reachable. Compare canonically — the
+        // engine may spell the workspace with /private/var/... while
+        // FileManager spells it /var/mobile/... (/var is a symlink
+        // to /private/var).
+        let workspacePath = ISHRuntime.hostWorkspaceURL.resolvingSymlinksInPath().path
+        let inputPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        if inputPath == workspacePath || inputPath.hasPrefix(workspacePath + "/") {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue,
+               fm.isReadableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+            // Not in the host workspace (a failed bind mount leaves
+            // the file under data/home/workspace instead): map it
+            // back to the guest path and run the normal walk below.
+            let rel = String(inputPath.dropFirst(workspacePath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return resolveGuest("/home/workspace/" + rel)
+        }
         var segments = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         var resolved: [String] = []
         var links = 0
