@@ -77,6 +77,7 @@ enum SettingsPageId {
   linuxEnvironment,
   webSearch,
   media,
+  browser,
   plugins,
   appearance,
   pets,
@@ -494,6 +495,18 @@ final _pages = <SettingsPageMeta>[
     keywords: (l) => l.searchKwMediaGeneration,
     freq: Freq.medium,
     links: const ['media'],
+  ),
+  // Agent browser (browser_use): the visible browser page. Title/keywords
+  // are hardcoded Chinese for v1, like browser_page.dart itself — move
+  // them into l10n (browser_zh/en.arb + search arb) when the page is
+  // localized (see VERIFY.md §3 item 9).
+  SettingsPageMeta(
+    SettingsPageId.browser,
+    title: (l) => '浏览器',
+    group: _abilities,
+    keywords: (l) => '浏览器,browser,网页,标签页',
+    freq: Freq.medium,
+    links: const ['browser'],
   ),
   SettingsPageMeta(
     SettingsPageId.plugins,

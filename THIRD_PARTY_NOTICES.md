@@ -1003,3 +1003,40 @@ the SDK or promise to clear or stop sending previously accumulated SDK statistic
 The dsh-go anonymous usage statistics switch does not control this SDK.
 The Apache 2.0 license for documentation sample code is not the license for
 this SDK binary. This notice does not replace Google's SDK terms.
+
+<!-- PORT-MERGE (manual, 2026-11-17): the two sections below are the iSH /
+Alpine notices hand-appended from feat/ish-linux-sandbox. This file is a
+generated document: re-run the notices generator to confirm them instead
+of editing them further. Feat's NodeMobile and Flutter sections were NOT
+appended — upstream 1.1.1 already covers those. See NOTES.md. -->
+
+## iSH — Linux shell environment
+
+- **What:** iSH, the user-mode Linux kernel + Alpine userland that powers the
+  in-app Linux sandbox and shell (terminal + agent `bash`).
+- **Version/pin:** OpenMinis/ish-arm64 @ `0fd17a135e78b7a0cf08a4f5831217bbb76ed22f`
+  (see `third_party/ish/source.json`).
+- **License:** GNU General Public License v3 (GPLv3). Contributions after
+  commit `0e3a4144` are additionally licensed under GPLv2. The additional
+  terms in `LICENSE.IOS` also apply (App Store distribution waiver).
+- **Source:** <https://github.com/openminis/ish-arm64>
+- **License texts:** `LICENSE.md` and `LICENSE.IOS` in the iSH source tree.
+- **Note:** Even when distributed as a sideloaded IPA, the GPL requires
+  providing the corresponding source. This fork's branch above is the
+  corresponding source for the iSH code as built here, including the
+  dsh-go-specific changes (crash-handler park branch, `ISHKernel` /
+  `ISHShellExecutor` / `RootfsManager` integration).
+
+## Alpine Linux — guest root filesystem
+
+- **What:** Alpine Linux 3.21.0 minirootfs, converted to the fakefs format
+  iSH runs (`alpine-rootfs.zip`, deterministic build — see
+  `third_party/ish/prepare-rootfs.sh`).
+- **License:** Alpine is a collection of packages under their own licenses
+  (MIT, BSD, GPL, Apache, and others). The full per-package license list is
+  in the Alpine package database for 3.21.0.
+- **Source:** <https://alpinelinux.org> and
+  <https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/>.
+- **AOT-recorded modules** (from this rootfs, recorded into `libish_aot.a`):
+  musl (MIT), busybox (GPLv2), zlib (zlib license), OpenSSL libcrypto /
+  libssl 3.3.2 (Apache License 2.0), pcre2 10.43 (BSD 3-Clause).

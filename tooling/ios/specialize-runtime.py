@@ -23,10 +23,37 @@ BOUNDED = 'return ohosBuffer.from(t,"utf8").toString("latin1")'
 ATTACHMENTS = 'node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js'
 IMAGE_CODEC = 'node_modules/@deepseek-ai/dsh-attachment-local/lib/ios-sharp.cjs'
 WORKER_ENV = 'runtime/ios/process/worker-env.mjs'
+# dsh-go iSH guest (port 1.1.1): loopback bridges + the virtual-runtime
+# adapter. iOS-only files, copied into the composed runtime like
+# WORKER_ENV; the composed tree must not already contain them.
+ISH_BRIDGE = 'runtime/ios/process/ish-bridge.mjs'
+BROWSER_BRIDGE = 'runtime/ios/process/browser-bridge.mjs'
+ISH_ADAPTER = 'runtime/ios/process/ish-adapter.mjs'
+# dsh-go browser_use (port 1.1.1): the local Cordis tool package. It is
+# registered by runtime/bridge/dsh-go-bridge/cordis.patch.yml
+# (tool-browser) and resolved from the composed runtime's node_modules,
+# like the feat build's install step did in the old dsh-prefix tree.
+TOOL_BROWSER_INDEX = 'node_modules/@dsh-go/dsh-tool-browser/lib/index.js'
+TOOL_BROWSER_PACKAGE = 'node_modules/@dsh-go/dsh-tool-browser/package.json'
 PRELOAD = 'runtime/ohos/preload.mjs'
 RELOCATION_FILES = ('runtime/ios/storage/relocate.mjs', 'runtime/ios/storage/preload.mjs')
 PRELOAD_BEFORE = "await import('./publication/preload.mjs');\n"
 PRELOAD_AFTER = PRELOAD_BEFORE + "await import('../ios/storage/preload.mjs');\n"
+# Install the iSH bridges before the engine boots (same main-thread-only
+# pattern as guest-preload.js.txt; installIshBridge never throws — when
+# the loopback service is not up yet the shims fail closed per call).
+# Runs after the child-process stub import, so installSpawnPatch wraps
+# the stub: '/ish-runner' goes to the guest, everything else still
+# throws ERR_OHOS_NO_SPAWN.
+ISH_BRIDGE_PRELOAD = (
+    "// dsh-go iSH guest (port 1.1.1): install the loopback bridges.\n"
+    "if ((await import('node:worker_threads')).isMainThread) {\n"
+    "  const { installIshBridge } = await import('../ios/process/ish-bridge.mjs');\n"
+    "  installIshBridge();\n"
+    "  const { installBrowserBridge } = await import('../ios/process/browser-bridge.mjs');\n"
+    "  installBrowserBridge();\n"
+    "}\n"
+)
 # Keep platform diagnostics local to the iOS output; each exact edit must match once.
 DIAGNOSTIC_EDITS = {
     'runtime/ohos/process/rg.mjs': (
@@ -44,10 +71,19 @@ DIAGNOSTIC_EDITS = {
         ('候选文件数超过鸿蒙本机上限', '候选文件数超过 iOS 本机上限'),
     ),
     'runtime/ohos/process/runtime.mjs': (
-        ("import { randomUUID } from 'node:crypto';", "import { randomUUID } from 'node:crypto';\nimport { workerEnvironment } from '../../ios/process/worker-env.mjs';"),
+        ("import { randomUUID } from 'node:crypto';", "import { randomUUID } from 'node:crypto';\nimport { workerEnvironment } from '../../ios/process/worker-env.mjs';\nimport { ishSpawnFor, ishSpawnTerminalFor } from '../../ios/process/ish-adapter.mjs';"),
         ("          const workerEnv = { ...env };", "          const workerEnv = workerEnvironment(env);"),
         ("prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
-        ('鸿蒙本机没有 PTY，可以连接电脑执行', 'iOS 本机没有 PTY，可以连接电脑执行'),
+        # dsh-go iSH guest: delegate PTY terminals to the guest. Replaces
+        # the old string-only edit: the fallback keeps the iOS message.
+        ("  async spawnTerminal() {\n    throw Object.assign(new Error('鸿蒙本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }",
+         "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec);\n    if (ish) return ish;\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }"),
+        # dsh-go iSH guest: delegate agent bash to the guest. The ticket
+        # unwrap above has already run; ishSpawnFor returns undefined
+        # when the bridge is not installed or the argv is not bash -c,
+        # and the virtual shell below runs exactly as in 1.1.1.
+        ("    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];",
+         "    const ishHandle = ishSpawnFor(argv, spec, { temporaryRoot: this.temporaryRoot, onSpillFailure: this.onSpillFailure });\n    if (ishHandle) return ishHandle;\n    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];"),
         ("spawn(spec) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "spawn(spec) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
         ('无效或已使用的鸿蒙执行票据', '无效或已使用的 iOS 执行票据'),
         ('鸿蒙虚拟进程临时根的身份已改变，拒绝删除替换目录', 'iOS 虚拟进程临时根的身份已改变，拒绝删除替换目录'),
@@ -270,6 +306,11 @@ def specialize(expanded, out, composer):
         guest_overrides[target] = guest.specialize(name, data)
     codec = (Path(__file__).resolve().parents[2] / 'runtime/ios/image/ios-sharp.cjs').read_bytes()
     worker_env = (Path(__file__).resolve().parents[2] / WORKER_ENV).read_bytes()
+    ish_bridge = (Path(__file__).resolve().parents[2] / ISH_BRIDGE).read_bytes()
+    browser_bridge = (Path(__file__).resolve().parents[2] / BROWSER_BRIDGE).read_bytes()
+    ish_adapter = (Path(__file__).resolve().parents[2] / ISH_ADAPTER).read_bytes()
+    tool_browser_index = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_INDEX).read_bytes()
+    tool_browser_package = (Path(__file__).resolve().parents[2] / TOOL_BROWSER_PACKAGE).read_bytes()
     relocation = {name: (Path(__file__).resolve().parents[2] / name).read_bytes()
                   for name in (*RELOCATION_FILES, *guest.FILES)}
     preload = (expanded / 'files' / PRELOAD).read_text()
@@ -277,7 +318,7 @@ def specialize(expanded, out, composer):
         raise ValueError('iOS relocation preload differs from the shared input')
     guest_preload = (Path(__file__).with_name('guest-preload.js.txt')).read_text()
     guest_boot = preload.replace(PRELOAD_BEFORE, PRELOAD_AFTER + guest_preload)
-    preload = preload.replace(PRELOAD_BEFORE, PRELOAD_AFTER).encode()
+    preload = preload.replace(PRELOAD_BEFORE, PRELOAD_AFTER + ISH_BRIDGE_PRELOAD).encode()
     relocation.update(guest_overrides)
     relocation['runtime/ios/guest/overrides.json'] = composer.json_bytes(guest_mapping)
     relocation['runtime/ohos/preload-guest.mjs'] = ("await import('../ios/guest/overrides.mjs');\n" + guest_boot).encode()
@@ -308,7 +349,10 @@ def specialize(expanded, out, composer):
         stage = Path(temp) / 'result'
         tree = stage / 'expanded/dsh-runtime'
         shutil.copytree(expanded, tree)
-        for name, data in {IMAGE_CODEC: codec, WORKER_ENV: worker_env, **relocation}.items():
+        for name, data in {IMAGE_CODEC: codec, WORKER_ENV: worker_env, ISH_BRIDGE: ish_bridge,
+                           BROWSER_BRIDGE: browser_bridge, ISH_ADAPTER: ish_adapter,
+                           TOOL_BROWSER_INDEX: tool_browser_index,
+                           TOOL_BROWSER_PACKAGE: tool_browser_package, **relocation}.items():
             if name in entries:
                 raise ValueError('The shared composition already has an iOS-only file: ' + name)
             row = {'path': name, 'size': len(data), 'sha256': composer.digest(data)}

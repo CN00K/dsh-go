@@ -128,6 +128,30 @@
         }
       }
     },
+    "ish-sandbox-backend.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-base/cordis.patch.yml": {
+          "after": "6216a72b13100af03f9d55173f164e80158d8fe64f928cf3e7119846f29cbf9f",
+          "before": "b65a86e55f02d863286bb6faac8ae292c18fffca3c8aa4491b600fa4dd6b48d0"
+        },
+        "node_modules/@deepseek-ai/dsh-bash-sandbox/lib/index.js": {
+          "after": "7bc07d311ccf2a5cbca226d1f7e8a8de9bfd49724c2b4e98692837504a9f8283",
+          "before": "0f788f99113ba7411eb33af71cdafabd07b73cf012c1715c819e03f3f77f342d"
+        },
+        "node_modules/@deepseek-ai/dsh-sandbox/lib/index.js": {
+          "after": "44b2f7b069bb007a1d233fef45f82061d000526fd4fd66e6de386c0e16e052f2",
+          "before": "cc4f6b7e84eaff0bb692413f59c1bc8de457dbe5569d02985ea8e87f68281ea7"
+        },
+        "node_modules/@deepseek-ai/dsh-subprocess-local/lib/index.js": {
+          "after": "0665a14e2dcefd3f596a589a77c1ea42e16466159ca89c36c92508409c66dca3",
+          "before": "4784084d8dd7abf217b75fe546dec6c87975a167e1a20ed035e220d279080d1c"
+        },
+        "node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js": {
+          "after": "debd0633440548723955c62a0f2a30c1a2eea652671a935f673d0faf8f3a3e79",
+          "before": "6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153"
+        }
+      }
+    },
     "jsonl-materialize-rename.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js": {
@@ -387,7 +411,7 @@
     "ohos-virtual-process.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js": {
-          "after": "1774c13dca648dbffc7449f226de9a2f11a696eae3dbc18aaf729d996438d74d",
+          "after": "3ce8057d57b8c5e8c6bdd9c9c8a2c255a6a75071a99fcccbf561a7b4e4bf0692",
           "before": "7f5a2c438a9b32eb5c7beac97a6e589e1908b3df79b18abebb22ea192300cad1"
         },
         "node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js": {
@@ -1414,6 +1438,14 @@
         }
       }
     },
+    "zzzzzzzz-sandbox-source-boundary.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js": {
+          "after": "df45f6872063c557755f47b448eb9b637fef4eb3879c10ccbbb1612b3b75104b",
+          "before": "c6d6038845450f422eeb7d1a563af8eda1df94637840dcd8a4a731d0f15e59a8"
+        }
+      }
+    },
     "zzzzzzzz-schedule-authorization.diff": {
       "0.2.1-rc.4": {
         "node_modules/@deepseek-ai/dsh-schedule/lib/index.js": {
@@ -1433,6 +1465,14 @@
         "node_modules/@deepseek-ai/dsh-tool-schedule/lib/index.js": {
           "after": "42988ed17a706b69a190db1117b7acf067a6a0418d778353ce247f874b6e646b",
           "before": "d6c3f9b7a3287b4dd15e8fd9573ba7ceb6ce45851c3a03772a3520b9634674fd"
+        }
+      }
+    },
+    "zzzzzzzz-time-zone-fallback.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml": {
+          "after": "ecff295c0c6b8ce6c3c0f706a39fa56eb7c853e5d721a8dfb564d89cccf2e170",
+          "before": "3006cc3780cddaa7fb0089e5854e6bbef4409cf1d425930fd835226b95660afd"
         }
       }
     },
@@ -1689,8 +1729,8 @@
     "zzzzzzzzzz-ohos-shell-limit-description.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js": {
-          "after": "165a6be735c9268d1918a7345f975e2b47c90f452457388dbeef48dceff9c8a7",
-          "before": "1774c13dca648dbffc7449f226de9a2f11a696eae3dbc18aaf729d996438d74d"
+          "after": "c6d6038845450f422eeb7d1a563af8eda1df94637840dcd8a4a731d0f15e59a8",
+          "before": "3ce8057d57b8c5e8c6bdd9c9c8a2c255a6a75071a99fcccbf561a7b4e4bf0692"
         }
       }
     },
@@ -2673,7 +2713,10 @@
       "ohos-piai-empty-models.diff",
       "ohos-mcp-start-close.diff",
       "ohos-jobs-active.diff",
-      "ohos-piai-text-preabort.diff"
+      "ohos-piai-text-preabort.diff",
+      "ish-sandbox-backend.diff",
+      "zzzzzzzz-sandbox-source-boundary.diff",
+      "zzzzzzzz-time-zone-fallback.diff"
     ]
   }
 }

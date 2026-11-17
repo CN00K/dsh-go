@@ -9,8 +9,11 @@ import 'companion/companion_initiative_owner.dart' show companionInitiativeProvi
 import 'l10n/l10n.dart';
 import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
+import 'runtime/runtime_bridge.dart';
+import 'runtime/runtime_state.dart';
 import 'state/app_info.dart';
 import 'state/appearance_state.dart';
+import 'state/connection_state.dart';
 import 'state/locale_state.dart';
 import 'state/star_prompt.dart' show starPromptGateProvider, starPromptProvider;
 import 'state/tile_style_state.dart';
@@ -18,6 +21,7 @@ import 'ui/chat/dsh_ui/dsh_ui_model.dart' show DshUiAppAccent;
 import 'ui/common/keyboard_motion.dart';
 import 'ui/common/side_insets.dart';
 import 'ui/launch/launch_overlay.dart';
+import 'ui/remote/transfer_consent_dialog.dart';
 import 'ui/shell/root_gate.dart';
 import 'ui/theme/theme.dart';
 import 'ui_config/ui_config_state.dart';
@@ -99,6 +103,25 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   /// transitions are chosen in [build], so they would keep the old answer.
   @override
   void didChangeAccessibilityFeatures() => setState(() {});
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!Platform.isIOS) return;
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_resumeLocalRuntime());
+    } else {
+      unawaited(ref.read(runtimeBridgeProvider).appLifecycle(state.name));
+    }
+  }
+
+  Future<void> _resumeLocalRuntime() async {
+    final status = await ref.read(localRuntimeProvider.notifier).resumeFromNative();
+    if (!mounted) return;
+    if (status.phase == RuntimePhase.running) {
+      // A fresh authenticated loopback connection checks the existing endpoint.
+      ref.invalidate(localConnectionProvider);
+    }
+  }
 
   void _themesFor(AppAccent accent, bool english, bool glassBlur, bool instantPages, bool fluid) {
     if (accent == _accent &&
@@ -196,6 +219,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
       locale: locale,
       supportedLocales: AppLocale.supported,
       localizationsDelegates: const [L10n.delegate, ...GlobalMaterialLocalizations.delegates],
+      navigatorKey: appNavigatorKey,
       // A phone on its side: the cutout's inset on both sides (side_insets). Over everything,
       // the launch screen of a cold start (启动画面).
       builder: (context, child) {

@@ -1,0 +1,625 @@
+# codemagic.yaml — dsh-go iOS unsigned IPA, port/1.1.1-ish
+#
+# Place this file at the repository root of the port branch (CN00K/dsh-go,
+# branch port/1.1.1-ish) and run the "ios-stage2-verify" workflow on
+# Codemagic (mac_mini_m2, team zzuu account as currently used).
+#
+# What it does (1.1.1 engine assembly, D1c step 1: loopback HTTP bridge kept):
+#   1. flutter pub get + analyze (+ l10n check)
+#   2. Verifies the hash-pinned patch registration (195, see step note).
+#      The patches themselves are applied INSIDE prepare-engine.sh:
+#      runtime/ohos/package/prepare-inputs.py runs
+#      `rtbuild.py patch-dsh --target ohos` on a fresh npm prefix.
+#   3. tooling/ios/prepare-engine.sh assembles app/ios/Engine/:
+#      pinned NodeMobile 24.22.1-0 + compose-runtime.py + specialize-runtime.py
+#      -> app/ios/Engine/runtime.zip (+ addons sources + include/).
+#   4. Verify engine hook (ish-bridge / browser-bridge / tool-browser):
+#      the hook lives in tooling/ios/specialize-runtime.py (run inside
+#      prepare-engine.sh); this step only verifies runtime.zip contents.
+#   5. iSH libs (our 0fd17a13 kernel, third_party/ish/build-ish.sh) +
+#      rootfs staging (Alpine 3.21, prepare-rootfs.sh) + AOT staging
+#      (build-aot.sh, download mode from release aot-minimal-1f3bb5a0).
+#   6. xcodebuild directly (no codesign), with the Runner target's
+#      "Embed DSH Engine" build phase (tooling/ios/embed-engine.sh) doing
+#      the native frameworks + upstream guest addon build. The engine
+#      runtime.zip is BUNDLED into the IPA (DSH_IOS_BUNDLE_RUNTIME=YES),
+#      like the feat builds — no download server is needed at install time.
+#   7. Packages Runner.app as an unsigned Payload/*.ipa (AltStore / ESign).
+#
+# No Apple signing materials are needed or used.
+#
+# Workflows:
+#   ios-stage2-verify — the port build: full chain above (engine + iSH +
+#                       rootfs + AOT + IPA). This is the workflow name the
+#                       Codemagic app is already configured for; do NOT
+#                       rename it or the app side needs reconfiguring.
+#   ios-unsigned      — engine-only baseline: same chain minus the iSH
+#                       lib / rootfs / AOT steps. Kept because the change
+#                       from the feat file is small (three steps removed).
+#
+# Deleted vs the feat codemagic.yaml (see BUILD_CHAIN_NOTES.md):
+#   prototype-ish-coexist — deleted, prototype/ISHCoexist/ is discarded.
+#   ios-aot-record        — deleted, AOT is already recorded (release
+#                           aot-minimal-1f3bb5a0); build-aot.sh downloads it.
+#
+# Free-minutes note (Codemagic free tier: 500 min/month):
+#   Codemagic builders are ephemeral: there is no cross-build cache for
+#   the engine work dir, the iSH build, or the rootfs. The FIRST run of
+#   this workflow re-downloads and rebuilds everything (Node 24.22.1,
+#   NodeMobile, npm trees, iSH Meson build, rootfs fakefsify) and is the
+#   expensive one. The in-repo manifest skip guards (ish-manifest.json /
+#   rootfs-manifest.json) only help when the files are already present in
+#   the checkout — they do NOT persist across Codemagic runs. Do not
+#   delete those manifests "to be safe" inside a run; that is exactly
+#   what burns the free minutes. Check the remaining quota on the
+#   account that will run the build BEFORE triggering it.
+#   max_build_duration 120 for ios-stage2-verify is provisional: the
+#   1.1.1 engine preparation has never been timed on Codemagic. Measure
+#   the first run and tighten it after.
+workflows:
+  ios-stage2-verify:
+    name: iOS stage 2 verify (1.1.1 port, iSH, unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      flutter: 3.47.7
+      xcode: latest
+    scripts:
+      - name: Check tools
+        script: |
+          set -euo pipefail
+          mkdir -p build-logs
+          {
+            echo "== versions =="
+            xcodebuild -version
+            flutter --version
+            node --version
+            npm --version
+            python3 --version
+            # prepare-engine.sh refuses python3 < 3.11 itself; fail here
+            # with a readable message instead of halfway through the
+            # engine download.
+            python3 -c "import sys; assert sys.version_info >= (3, 11), sys.version; print('python3 >= 3.11 OK:', sys.version.split()[0])"
+            echo "== required tools =="
+            # NOTE: meson / ninja / brew llvm+lld are NOT checked here.
+            # They are installed by the later "Install iSH build tools"
+            # step (upstream guest build needs them; our own
+            # third_party/ish/build-ish.sh installs its own brew deps
+            # when missing). Checking here would only duplicate that
+            # logic and block the install step.
+            # NOTE: `pod` is intentionally absent: 1.1.1 has no Podfile
+            # (plugins use Swift Package Manager); there is no pod
+            # install step in this workflow any more.
+            for t in rsync unzip tar curl shasum file zip ditto; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            echo "== disk =="
+            df -h "$PWD" | tail -1
+          } 2>&1 | tee build-logs/00-tools.log
+
+      - name: Flutter pub get and analyze
+        script: |
+          set -euo pipefail
+          cd app
+          # Upstream CI runs l10n_merge --no-gen before pub get; the
+          # local contract is --check (see port AGENTS.md). Generated
+          # l10n output is not hand-edited; a drift here fails fast.
+          python3 tool/l10n_merge.py --check 2>&1 | tee ../build-logs/01-l10n-check.log
+          flutter pub get 2>&1 | tee ../build-logs/01-flutter-pub-get.log
+          # Non-blocking: lint findings must not block the IPA.
+          flutter analyze 2>&1 | tee ../build-logs/02-flutter-analyze.log \
+            || echo "flutter analyze reported issues (non-blocking)"
+
+      - name: Verify patch registration (195, hash-pinned)
+        script: |
+          set -euo pipefail
+          # The patch set is APPLIED inside prepare-engine.sh
+          # (prepare-inputs.py runs `rtbuild.py patch-dsh --target ohos`
+          # on a fresh npm prefix, then compose-runtime.py re-verifies
+          # the patch identity from the target report). This step only
+          # verifies REGISTRATION before the long download: every .diff
+          # in runtime/patches/series must be registered in pins.json
+          # targetSets.ohos, and the ohos set must count EXPECTED.
+          #
+          # Count settled (2026-11-17): upstream series is 194 LINES but
+          # 192 ENTRIES (2 comment lines); pins.json targetSets.ohos =
+          # 192, android = 150. 192 + our 3 diffs = 195. Verified by a
+          # full `rtbuild.py patch-dsh --target ohos --record` run
+          # (195/195 applied) and a non---record verification run.
+          # Do NOT "fix" the series file to match a different number.
+          python3 - <<'PYEOF' 2>&1 | tee build-logs/03-patch-count.log
+          import json, sys
+          sys.path.insert(0, 'runtime/lib')
+          import rtbuild
+          pins = json.load(open('runtime/patches/pins.json'))
+          names, all_names = rtbuild.select_dsh_patches(pins, 'runtime/patches', 'ohos')
+          expected = 195
+          print('ohos target set:', len(names), '| declared total:', len(all_names), '| expected:', expected)
+          print('our 3 diffs present:', [n for n in ('ish-sandbox-backend.diff', 'zzzzzzzz-sandbox-source-boundary.diff', 'zzzzzzzz-time-zone-fallback.diff') if n in names])
+          assert len(names) == expected, 'patch count %d != expected %d (see step comment: measured upstream entries are 192, 192+3=195)' % (len(names), expected)
+          print('patch registration OK:', len(names))
+          PYEOF
+
+      - name: Prepare engine (upstream 1.1.1 flow)
+        script: |
+          set -euo pipefail
+          # Replaces the feat flow's hand-rolled npm ci + patch-dsh +
+          # stage-engine + NativeNodeArtifacts steps. Do NOT bring those
+          # back: they reference runtime/native-node/, which upstream
+          # 1.1.1 deleted.
+          #
+          # prepare-engine.sh (needs python3 >= 3.11, curl, network):
+          #   - downloads host Node 24.22.1 (darwin-arm64) + npm 11.9.0
+          #     into $DSH_IOS_ENGINE_WORK, NodeMobile 24.22.1-0
+          #     (fogtape/nodejs-mobile — note the fork changed from the
+          #     feat build's digidem 24.20.0-0), the require-builtin
+          #     addon tarball (a58d3599...), node-addon-api 8.9.2
+          #   - prepare-inputs.py: npm ci dsh 0.2.2-rc.1 + process tree,
+          #     patch-dsh --target ohos (the 195 patches), target report
+          #   - compose-runtime.py + specialize-runtime.py: compose and
+          #     iOS-specialize the runtime -> runtime.zip
+          #   - stages app/ios/Engine/: runtime.zip,
+          #     NodeMobile.xcframework, addons/{flock,require-builtin,
+          #     node-addon-api}, include/, .ready
+          # Engine work dir is kept inside the checkout (Codemagic
+          # builders are ephemeral; the $HOME/Library/Caches default
+          # would not survive to the next build either).
+          export DSH_IOS_ENGINE_WORK="$PWD/engine-work"
+          bash tooling/ios/prepare-engine.sh 2>&1 | tee build-logs/04-prepare-engine.log
+          test -f app/ios/Engine/.ready
+          test -s app/ios/Engine/runtime.zip
+          test -d app/ios/Engine/NodeMobile.xcframework/ios-arm64/NodeMobile.framework
+          test -f app/ios/Engine/include/node/node_api.h
+          echo "Engine prepared:"
+          du -sh app/ios/Engine
+          ls app/ios/Engine
+
+      - name: Verify engine hook (ish-bridge / browser-bridge / tool-browser)
+        script: |
+          set -euo pipefail
+          # The hook itself lives in tooling/ios/specialize-runtime.py
+          # (run inside prepare-engine.sh): it copies the iSH bridges
+          # + adapter into the composed runtime, installs them from
+          # preload.mjs, wires ishSpawnFor/ishSpawnTerminalFor into
+          # runtime.mjs, and copies the local @dsh-go/dsh-tool-browser
+          # package into the composed node_modules. This step only
+          # VERIFIES the prepared runtime.zip — it writes nothing.
+          test -f app/ios/Engine/.ready
+          test -s app/ios/Engine/runtime.zip
+          # 1. Bridge unit tests (repo files, no engine needed).
+          node --test runtime/ios/process/ish-bridge.test.mjs 2>&1 | tee build-logs/05-ish-bridge-test.log
+          # 2. The hook files must be inside runtime.zip (files/ prefix).
+          for entry in \
+            files/runtime/ios/process/ish-bridge.mjs \
+            files/runtime/ios/process/browser-bridge.mjs \
+            files/runtime/ios/process/ish-adapter.mjs \
+            files/node_modules/@dsh-go/dsh-tool-browser/lib/index.js \
+            files/node_modules/@dsh-go/dsh-tool-browser/package.json; do
+            unzip -l app/ios/Engine/runtime.zip "$entry" | grep -q "$entry" \
+              || { echo "MISSING in runtime.zip: $entry"; exit 1; }
+          done
+          # 3. preload.mjs inside the zip must install the bridges.
+          unzip -p app/ios/Engine/runtime.zip files/runtime/ohos/preload.mjs \
+            | grep -q installIshBridge \
+            || { echo "preload.mjs does not install the iSH bridge"; exit 1; }
+          echo "Engine hook verified: bridges + adapter + tool-browser in runtime.zip"
+          unzip -l app/ios/Engine/runtime.zip | grep -E "ish-bridge|ish-adapter|browser-bridge|dsh-tool-browser" || true
+          du -sh app/ios/Engine/runtime.zip
+
+      - name: Install iSH build tools
+        script: |
+          set -euo pipefail
+          # Same set as upstream .github/workflows/ios-compile.yml
+          # ("Install the iSH build tools"): brew llvm + lld, pip
+          # meson==1.7.2 + ninja==1.11.1.4 in a venv. Brew's own meson
+          # is NOT used: the pinned pip versions are what upstream CI
+          # builds the guest with.
+          # These tools are needed by the UPSTREAM guest build
+          # (tooling/ios/build-ish.sh, called from embed-engine.sh
+          # during xcodebuild). Our own third_party/ish/build-ish.sh
+          # installs its brew deps itself when missing.
+          # Codemagic steps do not reliably share exported PATH, so the
+          # paths are also written to build-logs/ish-tools-env.sh and
+          # sourced again in the xcodebuild step (see there).
+          for pkg in llvm lld; do
+            if brew list "$pkg" >/dev/null 2>&1; then
+              echo "brew package present: $pkg"
+            else
+              echo "Installing brew package: $pkg ..."
+              brew install "$pkg"
+            fi
+          done
+          python3 -m venv "$PWD/engine-build/ish-tools-venv"
+          "$PWD/engine-build/ish-tools-venv/bin/pip" install --quiet meson==1.7.2 ninja==1.11.1.4 2>&1 | tee build-logs/05-ish-tools.log
+          {
+            echo "export PATH=\"$PWD/engine-build/ish-tools-venv/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:\$PATH\""
+          } > build-logs/ish-tools-env.sh
+          # shellcheck disable=SC1091
+          . build-logs/ish-tools-env.sh
+          command -v meson >/dev/null || { echo "meson not found after install"; exit 1; }
+          command -v ninja >/dev/null || { echo "ninja not found after install"; exit 1; }
+          meson --version
+          ninja --version
+          PATH="$(brew --prefix lld)/bin:$PATH" ld.lld --version | head -n 1
+
+      - name: Build iSH libs
+        script: |
+          set -euo pipefail
+          # OUR iSH kernel (D2a: 0fd17a13 + 1732-line kernel patch set).
+          # This is third_party/ish/build-ish.sh — NOT upstream's
+          # tooling/ios/build-ish.sh (different script, different
+          # output: upstream builds DshGuest.framework into
+          # app/ios/Engine/build/<sdk>/guest; this one builds
+          # libish.a / libish_emu.a / libfakefs.a + the ARM64 VDSO into
+          # app/ios/IShArtifacts/). Do not confuse the two paths.
+          # Skip guard: rebuild only when the pinned iSH input changed.
+          # build-ish.sh itself is idempotent (cached tarball,
+          # incremental ninja), but this guard avoids even invoking it
+          # on re-runs. Order matters: run this BEFORE prepare-rootfs.sh
+          # (fakefsify is built from the iSH source tree this step
+          # downloads).
+          manifest=app/ios/IShArtifacts/ish-manifest.json
+          pinned="$(python3 -c "import json; print(json.load(open('third_party/ish/source.json'))['commit'])")"
+          if [ -f "$manifest" ] \
+             && [ -f app/ios/IShArtifacts/lib/libish.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libish_emu.a ] \
+             && [ -f app/ios/IShArtifacts/lib/libfakefs.a ] \
+             && [ -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf ] \
+             && python3 -c "import json,sys; sys.exit(0 if json.load(open('$manifest')).get('ish_commit')=='$pinned' else 1)"; then
+            echo "iSH libs already built for commit $pinned, skipping rebuild"
+            exit 0
+          fi
+          bash third_party/ish/build-ish.sh 2>&1 | tee build-logs/06-build-ish.log
+          # The script asserts the VDSO itself; re-assert here so the log
+          # shows the check even on a skipped-then-rebuilt run.
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+
+      - name: Stage iSH artifacts (rootfs)
+        script: |
+          set -euo pipefail
+          # prepare-rootfs.sh has its own manifest skip guard (Alpine
+          # tarball SHA256 + iSH commit + package-list SHA256); this
+          # step always runs it (cheap when skipped) and then verifies
+          # the contract the Runner target depends on.
+          # Alpine 3.21.0 aarch64 minirootfs (D3a) + 25 packages from
+          # rootfs-packages.txt (incl. the 7 CLI tools from build 35:
+          # vim, nano, openssh-client/server, tmux, tree, htop).
+          # Marker comparison is inside prepare-rootfs.sh: editing
+          # rootfs-packages.txt changes its SHA256 and forces a rebuild.
+          bash third_party/ish/prepare-rootfs.sh 2>&1 | tee build-logs/07-prepare-rootfs.log
+          test -f app/ios/IShArtifacts/alpine-rootfs.zip
+          test -f app/ios/IShArtifacts/rootfs-manifest.json
+          test -f app/ios/IShArtifacts/lib/libish.a
+          test -f app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          test -s app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf
+          file app/ios/IShArtifacts/vdso/arm64/libvdso.so.elf | grep -q "ELF"
+          echo "IShArtifacts OK:"
+          du -sh app/ios/IShArtifacts
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/rootfs-manifest.json')); print('rootfs zip SHA256:', m['rootfs_zip_sha256'])"
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/ish-manifest.json')); print('ish commit:', m['ish_commit'], '| vdso SHA256:', m['vdso']['sha256'])"
+
+      - name: Stage AOT image (download, recorded set)
+        script: |
+          set -euo pipefail
+          # build-aot.sh stages libish_aot.a into app/ios/IShArtifacts/lib/
+          # for the Runner target (-force_load). Download mode (D3a):
+          # the 6-image set recorded in build 30-33 is already on the
+          # GitHub release aot-minimal-1f3bb5a0; build-aot.sh downloads
+          # it SHA256-verified (see third_party/ish/aot-manifest.json:
+          # sha256 950fe2c4..., 46,947,640 bytes, 6 images). No
+          # re-recording on Codemagic — the ios-aot-record workflow
+          # that did it was deleted with this port (see header).
+          bash third_party/ish/build-aot.sh 2>&1 | tee build-logs/08-build-aot.log
+          test -f app/ios/IShArtifacts/lib/libish_aot.a
+          test -f app/ios/IShArtifacts/aot-manifest.json
+          python3 -c "import json; m=json.load(open('app/ios/IShArtifacts/aot-manifest.json')); print('AOT mode:', m['mode'], '| images:', len(m.get('images', [])), '| libish_aot_a SHA256:', m['libish_aot_a']['sha256'][:12]); assert len(m.get('images', []))==6, m.get('images')"
+
+      - name: Prepare phone self-runner (best effort)
+        script: |
+          set -euo pipefail
+          # Mirrors tooling/ios/build.sh's first step: build the shared
+          # Rust CoreDevice/XCTest owner (pinned toolchain 1.99.1) into
+          # app/ios/PhoneSelfRunnerNative/ + PhoneSelfRunner.xcconfig.
+          # BEST EFFORT, not fatal: the Flutter Debug/Release.xcconfig
+          # include it with `#include?` (optional), and the
+          # embed-phone-self-runner-notices.sh build phase skips cleanly
+          # when DSH_PHONE_SELF_RUNNER_ENABLED is unset. If cargo is
+          # absent from the Codemagic image the build continues without
+          # the phone self-runner feature (see BUILD_CHAIN_NOTES.md
+          # open item O-3 — coordinator to decide if that is acceptable
+          # for the port IPA, or if rustup must be installed first).
+          # If cargo IS present, a failure here is fatal on purpose:
+          # a half-prepared native owner must not ship silently.
+          if command -v cargo >/dev/null 2>&1; then
+            bash tooling/ios/build-phone-self-runner.sh 2>&1 | tee build-logs/09-phone-self-runner.log
+            test -f app/ios/PhoneSelfRunnerNative/PhoneSelfRunner.xcconfig
+            echo "phone self-runner prepared"
+          else
+            echo "WARNING: cargo not found on this Codemagic image; skipping build-phone-self-runner.sh."
+            echo "Phone self-runner stays disabled for this build (optional xcconfig include; notices phase skips)."
+          fi
+
+      - name: Flutter config-only (Generate.xcconfig)
+        script: |
+          set -euo pipefail
+          # Same pre-step as upstream tooling/ios/check-archive.sh:
+          # writes app/ios/Flutter/Generated.xcconfig before xcodebuild
+          # reads the Flutter xcconfigs. Only writes config; does not
+          # compile, sign, or need a Development Team.
+          cd app
+          flutter build ios --release --no-codesign --config-only 2>&1 | tee ../build-logs/10-flutter-config-only.log
+          test -f ios/Flutter/Generated.xcconfig
+
+      - name: Build iOS (xcodebuild, no codesign)
+        script: |
+          set -euo pipefail
+          # Bypass `flutter build ios`: its post-build Development Team
+          # check fails on Flutter 3.47.7 even though the Xcode build
+          # succeeds, and it leaves no Runner.app behind (feat builds
+          # 31/32/33). Build with xcodebuild directly; the Runner
+          # target's script phase builds App.framework (Dart AOT).
+          # Then copy the .app into place.
+          #
+          # What runs inside this xcodebuild (do NOT add separate steps
+          # for them — the build phases own them):
+          #   - "Embed DSH Engine" (tooling/ios/embed-engine.sh):
+          #     validates the prepared runtime.zip loader layout, then
+          #     compiles DshNodeHost/DshFlock/DshRequireBuiltin via
+          #     build-engine-native.sh (stamp-cached under
+          #     app/ios/Engine/build/iphoneos/) and the upstream guest
+          #     addon via build-guest-addon.sh (which runs upstream
+          #     tooling/ios/build-ish.sh for DshGuest.framework).
+          #     It copies NodeMobile + the 5 frameworks into the app
+          #     and, because DSH_IOS_BUNDLE_RUNTIME=YES below, bundles
+          #     app/ios/Engine/runtime.zip as dsh-runtime/runtime.zip.
+          #   - The upstream guest (DshGuest.framework, iSH c5c264da)
+          #     is bundled but inert: no kernel starts until the user
+          #     installs Linux. Our live iSH is the 0fd17a13 lib set
+          #     from the earlier steps (D2a). Two iSH kernels in one
+          #     IPA is expected in this port step; see NOTES.md.
+          # DSH_IOS_BUNDLE_RUNTIME=YES is a deliberate port decision
+          # (see NOTES.md O-4): the port branch's
+          # app/ios/runtime-download.json still points at the local
+          # debug URL http://127.0.0.1:8787/..., and a Release build
+          # with download mode would fail embed-engine.sh's HTTPS
+          # requirement. Bundling matches the feat builds (engine
+          # built into the IPA, no download server needed at install).
+          ENV_FILE="$PWD/build-logs/ish-tools-env.sh"
+          [ -f "$ENV_FILE" ] && . "$ENV_FILE"
+          cd app
+          DSH_IOS_BUNDLE_RUNTIME=YES xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tee ../build-logs/11-flutter-build-ios.log
+          mkdir -p build/ios/iphoneos
+          cp -R build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
+          test -d build/ios/iphoneos/Runner.app
+          du -sh build/ios/iphoneos/Runner.app
+
+      - name: Package unsigned IPA
+        script: |
+          set -euo pipefail
+          rm -rf Payload dsh-go-unsigned.ipa
+          mkdir -p Payload
+          # ditto preserves the framework symlinks (needed for re-signing).
+          ditto app/build/ios/iphoneos/Runner.app Payload/Runner.app
+          find Payload -name .DS_Store -delete || true
+          # -y stores symlinks as links (do not dereference them).
+          zip -r -y -X dsh-go-unsigned.ipa Payload 2>&1 | tee build-logs/12-package-ipa.log
+          ls -lh dsh-go-unsigned.ipa
+          shasum -a 256 dsh-go-unsigned.ipa
+          # NB: `unzip -l | head` exits 141 (SIGPIPE) under `pipefail` when
+          # head closes early, which would fail the step after a good IPA.
+          unzip -l dsh-go-unsigned.ipa | head -n 20 || true
+
+      - name: Verify packaged app
+        script: |
+          set -euo pipefail
+          # Lightweight equivalent of the checks in upstream
+          # tooling/ios/check-archive.sh (which needs a full `xcodebuild
+          # archive` + RUNNER_TEMP and is not run on Codemagic).
+          app=app/build/ios/iphoneos/Runner.app
+          echo "== engine frameworks =="
+          for f in DshNodeHost DshFlock DshRequireBuiltin DshGuest DshGuestBridge; do
+            test -f "$app/Frameworks/$f.framework/$f" || { echo "MISSING framework binary: $f"; exit 1; }
+          done
+          test -d "$app/Frameworks/NodeMobile.framework"
+          echo "== bundled runtime (DSH_IOS_BUNDLE_RUNTIME=YES) =="
+          found="$(find "$app" -name runtime.zip -print)"
+          [ "$(printf '%s' "$found" | grep -c .)" -eq 1 ] || { echo "expected exactly one runtime.zip in app, found: $found"; exit 1; }
+          echo "runtime.zip: $found"
+          echo "== AOT images in Runner binary (expect 6) =="
+          aot_count="$(nm -gU "$app/Runner" | grep -c '_ish_aot_module_' || true)"
+          echo "AOT module symbols: $aot_count"
+          [ "$aot_count" -eq 6 ] || { echo "AOT count $aot_count != 6"; exit 1; }
+          echo "== no loose native code outside frameworks =="
+          loose="$(find "$app" \( -name '*.dylib' -o -name '*.so' -o -name '*.node' \) -not -path '*/Frameworks/*.framework/*' | head -10)"
+          [ -z "$loose" ] || { echo "code outside a framework: $loose"; exit 1; }
+          echo "== sizes =="
+          du -sh "$app" dsh-go-unsigned.ipa
+          echo "VERIFY OK"
+
+    artifacts:
+      - dsh-go-unsigned.ipa
+      - build-logs/*.log
+
+  ios-unsigned:
+    name: iOS unsigned IPA (1.1.1 engine, no iSH)
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    environment:
+      flutter: 3.47.7
+      xcode: latest
+    scripts:
+      - name: Check tools
+        script: |
+          set -euo pipefail
+          mkdir -p build-logs
+          {
+            echo "== versions =="
+            xcodebuild -version
+            flutter --version
+            node --version
+            npm --version
+            python3 --version
+            python3 -c "import sys; assert sys.version_info >= (3, 11), sys.version; print('python3 >= 3.11 OK:', sys.version.split()[0])"
+            echo "== required tools =="
+            for t in rsync unzip tar curl shasum file zip ditto; do
+              command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            done
+            echo "== disk =="
+            df -h "$PWD" | tail -1
+          } 2>&1 | tee build-logs/00-tools.log
+
+      - name: Flutter pub get and analyze
+        script: |
+          set -euo pipefail
+          cd app
+          python3 tool/l10n_merge.py --check 2>&1 | tee ../build-logs/01-l10n-check.log
+          flutter pub get 2>&1 | tee ../build-logs/01-flutter-pub-get.log
+          flutter analyze 2>&1 | tee ../build-logs/02-flutter-analyze.log \
+            || echo "flutter analyze reported issues (non-blocking)"
+
+      - name: Verify patch registration (195, hash-pinned)
+        script: |
+          set -euo pipefail
+          # Same check as ios-stage2-verify (settled count: 195, see its
+          # step comment for the reconciliation note).
+          python3 - <<'PYEOF' 2>&1 | tee build-logs/03-patch-count.log
+          import json, sys
+          sys.path.insert(0, 'runtime/lib')
+          import rtbuild
+          pins = json.load(open('runtime/patches/pins.json'))
+          names, all_names = rtbuild.select_dsh_patches(pins, 'runtime/patches', 'ohos')
+          expected = 195
+          print('ohos target set:', len(names), '| declared total:', len(all_names), '| expected:', expected)
+          print('our 3 diffs present:', [n for n in ('ish-sandbox-backend.diff', 'zzzzzzzz-sandbox-source-boundary.diff', 'zzzzzzzz-time-zone-fallback.diff') if n in names])
+          assert len(names) == expected, 'patch count %d != expected %d (see ios-stage2-verify step comment)' % (len(names), expected)
+          print('patch registration OK:', len(names))
+          PYEOF
+
+      - name: Prepare engine (upstream 1.1.1 flow)
+        script: |
+          set -euo pipefail
+          export DSH_IOS_ENGINE_WORK="$PWD/engine-work"
+          bash tooling/ios/prepare-engine.sh 2>&1 | tee build-logs/04-prepare-engine.log
+          test -f app/ios/Engine/.ready
+          test -s app/ios/Engine/runtime.zip
+          test -d app/ios/Engine/NodeMobile.xcframework/ios-arm64/NodeMobile.framework
+          test -f app/ios/Engine/include/node/node_api.h
+          echo "Engine prepared:"
+          du -sh app/ios/Engine
+          ls app/ios/Engine
+
+      - name: Verify engine hook (ish-bridge / browser-bridge / tool-browser)
+        script: |
+          set -euo pipefail
+          # The hook itself lives in tooling/ios/specialize-runtime.py
+          # (run inside prepare-engine.sh): it copies the iSH bridges
+          # + adapter into the composed runtime, installs them from
+          # preload.mjs, wires ishSpawnFor/ishSpawnTerminalFor into
+          # runtime.mjs, and copies the local @dsh-go/dsh-tool-browser
+          # package into the composed node_modules. This step only
+          # VERIFIES the prepared runtime.zip — it writes nothing.
+          test -f app/ios/Engine/.ready
+          test -s app/ios/Engine/runtime.zip
+          # 1. Bridge unit tests (repo files, no engine needed).
+          node --test runtime/ios/process/ish-bridge.test.mjs 2>&1 | tee build-logs/05-ish-bridge-test.log
+          # 2. The hook files must be inside runtime.zip (files/ prefix).
+          for entry in \
+            files/runtime/ios/process/ish-bridge.mjs \
+            files/runtime/ios/process/browser-bridge.mjs \
+            files/runtime/ios/process/ish-adapter.mjs \
+            files/node_modules/@dsh-go/dsh-tool-browser/lib/index.js \
+            files/node_modules/@dsh-go/dsh-tool-browser/package.json; do
+            unzip -l app/ios/Engine/runtime.zip "$entry" | grep -q "$entry" \
+              || { echo "MISSING in runtime.zip: $entry"; exit 1; }
+          done
+          # 3. preload.mjs inside the zip must install the bridges.
+          unzip -p app/ios/Engine/runtime.zip files/runtime/ohos/preload.mjs \
+            | grep -q installIshBridge \
+            || { echo "preload.mjs does not install the iSH bridge"; exit 1; }
+          echo "Engine hook verified: bridges + adapter + tool-browser in runtime.zip"
+          unzip -l app/ios/Engine/runtime.zip | grep -E "ish-bridge|ish-adapter|browser-bridge|dsh-tool-browser" || true
+          du -sh app/ios/Engine/runtime.zip
+
+      - name: Prepare phone self-runner (best effort)
+        script: |
+          set -euo pipefail
+          # Best effort; see ios-stage2-verify's step comment. If cargo
+          # is present a failure here is fatal; if absent the build
+          # continues without the phone self-runner feature.
+          if command -v cargo >/dev/null 2>&1; then
+            bash tooling/ios/build-phone-self-runner.sh 2>&1 | tee build-logs/09-phone-self-runner.log
+            test -f app/ios/PhoneSelfRunnerNative/PhoneSelfRunner.xcconfig
+            echo "phone self-runner prepared"
+          else
+            echo "WARNING: cargo not found on this Codemagic image; skipping build-phone-self-runner.sh."
+            echo "Phone self-runner stays disabled for this build (optional xcconfig include; notices phase skips)."
+          fi
+
+      - name: Flutter config-only (Generate.xcconfig)
+        script: |
+          set -euo pipefail
+          cd app
+          flutter build ios --release --no-codesign --config-only 2>&1 | tee ../build-logs/10-flutter-config-only.log
+          test -f ios/Flutter/Generated.xcconfig
+
+      - name: Build iOS (xcodebuild, no codesign)
+        script: |
+          set -euo pipefail
+          # No "Install iSH build tools" step here: the upstream guest
+          # addon is still built by embed-engine.sh during xcodebuild,
+          # and it needs meson/ninja/llvm/lld. Install them in this
+          # step's own shell instead of relying on cross-step PATH.
+          for pkg in llvm lld; do
+            if brew list "$pkg" >/dev/null 2>&1; then
+              echo "brew package present: $pkg"
+            else
+              echo "Installing brew package: $pkg ..."
+              brew install "$pkg"
+            fi
+          done
+          python3 -m venv "$PWD/engine-build/ish-tools-venv"
+          "$PWD/engine-build/ish-tools-venv/bin/pip" install --quiet meson==1.7.2 ninja==1.11.1.4
+          export PATH="$PWD/engine-build/ish-tools-venv/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          command -v meson >/dev/null || { echo "meson not found after install"; exit 1; }
+          command -v ninja >/dev/null || { echo "ninja not found after install"; exit 1; }
+          cd app
+          DSH_IOS_BUNDLE_RUNTIME=YES xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/ios/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tee ../build-logs/11-flutter-build-ios.log
+          mkdir -p build/ios/iphoneos
+          cp -R build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
+          test -d build/ios/iphoneos/Runner.app
+          du -sh build/ios/iphoneos/Runner.app
+
+      - name: Package unsigned IPA
+        script: |
+          set -euo pipefail
+          rm -rf Payload dsh-go-unsigned.ipa
+          mkdir -p Payload
+          ditto app/build/ios/iphoneos/Runner.app Payload/Runner.app
+          find Payload -name .DS_Store -delete || true
+          zip -r -y -X dsh-go-unsigned.ipa Payload 2>&1 | tee build-logs/12-package-ipa.log
+          ls -lh dsh-go-unsigned.ipa
+          shasum -a 256 dsh-go-unsigned.ipa
+          unzip -l dsh-go-unsigned.ipa | head -n 20 || true
+
+      - name: Verify packaged app
+        script: |
+          set -euo pipefail
+          # Same checks as ios-stage2-verify, minus the AOT count
+          # (no iSH steps run in this workflow).
+          app=app/build/ios/iphoneos/Runner.app
+          for f in DshNodeHost DshFlock DshRequireBuiltin DshGuest DshGuestBridge; do
+            test -f "$app/Frameworks/$f.framework/$f" || { echo "MISSING framework binary: $f"; exit 1; }
+          done
+          test -d "$app/Frameworks/NodeMobile.framework"
+          found="$(find "$app" -name runtime.zip -print)"
+          [ "$(printf '%s' "$found" | grep -c .)" -eq 1 ] || { echo "expected exactly one runtime.zip in app, found: $found"; exit 1; }
+          echo "runtime.zip: $found"
+          loose="$(find "$app" \( -name '*.dylib' -o -name '*.so' -o -name '*.node' \) -not -path '*/Frameworks/*.framework/*' | head -10)"
+          [ -z "$loose" ] || { echo "code outside a framework: $loose"; exit 1; }
+          du -sh "$app" dsh-go-unsigned.ipa
+          echo "VERIFY OK"
+
+    artifacts:
+      - dsh-go-unsigned.ipa
+      - build-logs/*.log

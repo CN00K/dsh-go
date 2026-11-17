@@ -8,11 +8,21 @@
 
 /* Begin PBXBuildFile section */
 		0010E0FDE940E7200DF96F3A /* PetLiveActivityPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1157E1453906D5AABEAA30E8 /* PetLiveActivityPlugin.swift */; };
+		0AB16E47D874BB1DFAF56507 /* BrowserUsePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9307EA4705EC3A7E2379B520 /* BrowserUsePlugin.swift */; };
+		1039EFFA298C06426A355F0F /* FilesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9506F690F91F22D130097142 /* FilesPlugin.swift */; };
+		13635E8D3528A31E96A8C418 /* BrowserUseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA021E4CC54CBB1BDA7AA4B1 /* BrowserUseManager.swift */; };
 		1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */; };
+		20E83EA533E34E71F899DC4B /* DSHActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DC1D06875AE05912FCE617F /* DSHActivityAttributes.swift */; };
+		2CDDA9651C2F98BE1580BEB8 /* BrowserUseJavaScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B7E748C021BD716A3B62E28 /* BrowserUseJavaScript.swift */; };
+		32D09211AEC73762198E22E4 /* RootfsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C271016B9ACAA72454EB85AA /* RootfsManager.swift */; };
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
 		4728DB57F3CD1C364070AFD0 /* PetLiveActivity.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D23E3FBF909A3D28B7317F4C /* PetLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		58677CED83364C1001F2ED7D /* ISHCrashHandler.m in Sources */ = {isa = PBXBuildFile; fileRef = EB75C905400CCC8630A50127 /* ISHCrashHandler.m */; };
+		5DCDA1A50B1AE5162994A5B8 /* BrowserUseActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31E970803D3C0253AC6E8FB7 /* BrowserUseActions.swift */; };
+		632092DBA88F522024A7E314 /* ISHZip.m in Sources */ = {isa = PBXBuildFile; fileRef = 875A9F672386B3FEEE115E45 /* ISHZip.m */; };
 		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
+		777E0F8463FEBCB6A53ED642 /* ISHRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8710312B91FF92F326AC33B3 /* ISHRuntime.swift */; };
 		7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */; };
 		78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */ = {isa = PBXBuildFile; productRef = 78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */; };
 		7DA7F4A913154B857347B485 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 49D5A70C75C310CD8E17CCA9 /* Foundation.framework */; };
@@ -23,6 +33,12 @@
 		9DA4CCD005F1478331AD7A43 /* PetActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = D877E0F531097F288C739C49 /* PetActivityAttributes.swift */; };
 		A08400000000000000000002 /* UnicodeData-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = A08400000000000000000001 /* UnicodeData-LICENSE.txt */; };
 		B47B8C3D6986B5636F7898B2 /* pets in Resources */ = {isa = PBXBuildFile; fileRef = 2A7E7B0A781968184744E94C /* pets */; };
+		B89DC7E627C0FBD6987A5E82 /* DSHActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DC1D06875AE05912FCE617F /* DSHActivityAttributes.swift */; };
+		BF0E3E6081C69355B0C16B3E /* ISHResourceGovernor.m in Sources */ = {isa = PBXBuildFile; fileRef = AC18DBE03BD143BF7CCB9157 /* ISHResourceGovernor.m */; };
+		C32B9D260240DBF946B89B1D /* IShLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2519E913C98C9EA2048250D /* IShLoopbackService.swift */; };
+		C894F6947991CC8CAFE67753 /* BrowserTabPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4AFF1DD1874D5A97BC5B3C8 /* BrowserTabPool.swift */; };
+		C8BBF066111B6DFAFE3B96A8 /* ISHShellExecutor.m in Sources */ = {isa = PBXBuildFile; fileRef = 47E36332DF351BE53CA87F3D /* ISHShellExecutor.m */; };
+		D4248F0C803FD28D1E24E4A3 /* BrowserLoopbackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E6AAACBF42A0276B7E8DD51 /* BrowserLoopbackService.swift */; };
 		D5480000000000000000A001 /* DshPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5480000000000000000A002 /* DshPlugin.swift */; };
 		D5480000000000000000A003 /* VoiceChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5480000000000000000A004 /* VoiceChannel.swift */; };
 		D5480000000000000000A005 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = D5480000000000000000A006 /* InfoPlist.strings */; };
@@ -107,7 +123,9 @@
 		D55100000000000000000014 /* CompanionWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = D55100000000000000000001 /* CompanionWidget.swift */; };
 		D55100000000000000000015 /* CompanionWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D55100000000000000000004 /* CompanionWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		D56100000000000000000002 /* RuntimeDownload.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56100000000000000000001 /* RuntimeDownload.swift */; };
+		D716193723803F3DFBC25FDB /* ISHKernel.m in Sources */ = {isa = PBXBuildFile; fileRef = 3DDB03C634FB14AB72694FEC /* ISHKernel.m */; };
 		DCBF4C4331CDEE8174EB4A9B /* PetActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = D877E0F531097F288C739C49 /* PetActivityAttributes.swift */; };
+		EF652A83AF5CCD227DAC203A /* ISHFakefsMeta.m in Sources */ = {isa = PBXBuildFile; fileRef = 90B174E613A6177493FA4209 /* ISHFakefsMeta.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -172,16 +190,29 @@
 		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
 		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };
 		2A7E7B0A781968184744E94C /* pets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder; name = pets; path = ../assets/pets; sourceTree = SOURCE_ROOT; };
+		2DC1D06875AE05912FCE617F /* DSHActivityAttributes.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DSHActivityAttributes.swift; sourceTree = "<group>"; };
+		31E970803D3C0253AC6E8FB7 /* BrowserUseActions.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseActions.swift; sourceTree = "<group>"; };
 		331C807B294A618700263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		331C8081294A63A400263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = AppFrameworkInfo.plist; path = Flutter/AppFrameworkInfo.plist; sourceTree = "<group>"; };
+		3DDB03C634FB14AB72694FEC /* ISHKernel.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHKernel.m; sourceTree = "<group>"; };
+		47E36332DF351BE53CA87F3D /* ISHShellExecutor.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHShellExecutor.m; sourceTree = "<group>"; };
 		49D5A70C75C310CD8E17CCA9 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		544B7864BB86676E2D89DBC0 /* ISHResourceGovernor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHResourceGovernor.h; sourceTree = "<group>"; };
+		712816DD2BB38EEE0101905C /* ISHShellExecutor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHShellExecutor.h; sourceTree = "<group>"; };
 		735E2282E0F893677524A2E3 /* PetLiveActivity.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PetLiveActivity.swift; sourceTree = "<group>"; };
 		74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Runner-Bridging-Header.h"; sourceTree = "<group>"; };
 		74858FAE1ED2DC5600515810 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
 		78E0A7A72DC9AD7400C4905E /* FlutterGeneratedPluginSwiftPackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = FlutterGeneratedPluginSwiftPackage; path = Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage; sourceTree = "<group>"; };
 		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Release.xcconfig; path = Flutter/Release.xcconfig; sourceTree = "<group>"; };
+		7B316B46C77FF58A5BEC6033 /* ISHZip.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHZip.h; sourceTree = "<group>"; };
+		8710312B91FF92F326AC33B3 /* ISHRuntime.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ISHRuntime.swift; sourceTree = "<group>"; };
+		875A9F672386B3FEEE115E45 /* ISHZip.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHZip.m; sourceTree = "<group>"; };
+		8AF6CA4C8098300A2634A662 /* ISHFakefsMeta.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHFakefsMeta.h; sourceTree = "<group>"; };
+		90B174E613A6177493FA4209 /* ISHFakefsMeta.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHFakefsMeta.m; sourceTree = "<group>"; };
+		9307EA4705EC3A7E2379B520 /* BrowserUsePlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUsePlugin.swift; sourceTree = "<group>"; };
+		9506F690F91F22D130097142 /* FilesPlugin.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FilesPlugin.swift; sourceTree = "<group>"; };
 		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Debug.xcconfig; path = Flutter/Debug.xcconfig; sourceTree = "<group>"; };
 		9740EEB31CF90195004384FC /* Generated.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Generated.xcconfig; path = Flutter/Generated.xcconfig; sourceTree = "<group>"; };
 		97C146EE1CF9000F007C117D /* Runner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Runner.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -189,8 +220,14 @@
 		97C146FD1CF9000F007C117D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		9B7E748C021BD716A3B62E28 /* BrowserUseJavaScript.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseJavaScript.swift; sourceTree = "<group>"; };
+		9E6AAACBF42A0276B7E8DD51 /* BrowserLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserLoopbackService.swift; sourceTree = "<group>"; };
 		A08400000000000000000001 /* UnicodeData-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "UnicodeData-LICENSE.txt"; sourceTree = "<group>"; };
 		A0F3B61ECA828CAEA9BB4D1D /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2519E913C98C9EA2048250D /* IShLoopbackService.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IShLoopbackService.swift; sourceTree = "<group>"; };
+		AC18DBE03BD143BF7CCB9157 /* ISHResourceGovernor.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHResourceGovernor.m; sourceTree = "<group>"; };
+		C271016B9ACAA72454EB85AA /* RootfsManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RootfsManager.swift; sourceTree = "<group>"; };
+		CA021E4CC54CBB1BDA7AA4B1 /* BrowserUseManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserUseManager.swift; sourceTree = "<group>"; };
 		D1D21B17EAC0DD900AC3A6B5 /* PetLiveActivity.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = PetLiveActivity.entitlements; sourceTree = "<group>"; };
 		D23E3FBF909A3D28B7317F4C /* PetLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PetLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		D5480000000000000000A002 /* DshPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DshPlugin.swift; sourceTree = "<group>"; };
@@ -279,6 +316,10 @@
 		D55200000000000000000001 /* ShareExtension.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = ShareExtension.xcconfig; sourceTree = "<group>"; };
 		D56100000000000000000001 /* RuntimeDownload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeDownload.swift; sourceTree = "<group>"; };
 		D877E0F531097F288C739C49 /* PetActivityAttributes.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PetActivityAttributes.swift; sourceTree = "<group>"; };
+		E4AFF1DD1874D5A97BC5B3C8 /* BrowserTabPool.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserTabPool.swift; sourceTree = "<group>"; };
+		EB75C905400CCC8630A50127 /* ISHCrashHandler.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHCrashHandler.m; sourceTree = "<group>"; };
+		F62CA13816A0368EF1713246 /* ISHKernel.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHKernel.h; sourceTree = "<group>"; };
+		FDC2B28269A31EE277058F4F /* ISHCrashHandler.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHCrashHandler.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -321,6 +362,7 @@
 			isa = PBXGroup;
 			children = (
 				D877E0F531097F288C739C49 /* PetActivityAttributes.swift */,
+				2DC1D06875AE05912FCE617F /* DSHActivityAttributes.swift */,
 			);
 			name = Shared;
 			path = Shared;
@@ -465,6 +507,28 @@
 				D5480000000000000000B00E /* Runner.entitlements */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
+				F62CA13816A0368EF1713246 /* ISHKernel.h */,
+				3DDB03C634FB14AB72694FEC /* ISHKernel.m */,
+				712816DD2BB38EEE0101905C /* ISHShellExecutor.h */,
+				47E36332DF351BE53CA87F3D /* ISHShellExecutor.m */,
+				7B316B46C77FF58A5BEC6033 /* ISHZip.h */,
+				875A9F672386B3FEEE115E45 /* ISHZip.m */,
+				FDC2B28269A31EE277058F4F /* ISHCrashHandler.h */,
+				EB75C905400CCC8630A50127 /* ISHCrashHandler.m */,
+				8AF6CA4C8098300A2634A662 /* ISHFakefsMeta.h */,
+				90B174E613A6177493FA4209 /* ISHFakefsMeta.m */,
+				544B7864BB86676E2D89DBC0 /* ISHResourceGovernor.h */,
+				AC18DBE03BD143BF7CCB9157 /* ISHResourceGovernor.m */,
+				C271016B9ACAA72454EB85AA /* RootfsManager.swift */,
+				8710312B91FF92F326AC33B3 /* ISHRuntime.swift */,
+				A2519E913C98C9EA2048250D /* IShLoopbackService.swift */,
+				9506F690F91F22D130097142 /* FilesPlugin.swift */,
+				31E970803D3C0253AC6E8FB7 /* BrowserUseActions.swift */,
+				9B7E748C021BD716A3B62E28 /* BrowserUseJavaScript.swift */,
+				CA021E4CC54CBB1BDA7AA4B1 /* BrowserUseManager.swift */,
+				E4AFF1DD1874D5A97BC5B3C8 /* BrowserTabPool.swift */,
+				9307EA4705EC3A7E2379B520 /* BrowserUsePlugin.swift */,
+				9E6AAACBF42A0276B7E8DD51 /* BrowserLoopbackService.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -788,6 +852,7 @@
 			files = (
 				96A67D6348E9EF40D67E1114 /* PetLiveActivity.swift in Sources */,
 				DCBF4C4331CDEE8174EB4A9B /* PetActivityAttributes.swift in Sources */,
+				20E83EA533E34E71F899DC4B /* DSHActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -877,6 +942,23 @@
 				D5480000000000000000B006 /* ShareChannel.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
+				D716193723803F3DFBC25FDB /* ISHKernel.m in Sources */,
+				C8BBF066111B6DFAFE3B96A8 /* ISHShellExecutor.m in Sources */,
+				632092DBA88F522024A7E314 /* ISHZip.m in Sources */,
+				58677CED83364C1001F2ED7D /* ISHCrashHandler.m in Sources */,
+				EF652A83AF5CCD227DAC203A /* ISHFakefsMeta.m in Sources */,
+				BF0E3E6081C69355B0C16B3E /* ISHResourceGovernor.m in Sources */,
+				32D09211AEC73762198E22E4 /* RootfsManager.swift in Sources */,
+				777E0F8463FEBCB6A53ED642 /* ISHRuntime.swift in Sources */,
+				C32B9D260240DBF946B89B1D /* IShLoopbackService.swift in Sources */,
+				1039EFFA298C06426A355F0F /* FilesPlugin.swift in Sources */,
+				5DCDA1A50B1AE5162994A5B8 /* BrowserUseActions.swift in Sources */,
+				2CDDA9651C2F98BE1580BEB8 /* BrowserUseJavaScript.swift in Sources */,
+				13635E8D3528A31E96A8C418 /* BrowserUseManager.swift in Sources */,
+				C894F6947991CC8CAFE67753 /* BrowserTabPool.swift in Sources */,
+				0AB16E47D874BB1DFAF56507 /* BrowserUsePlugin.swift in Sources */,
+				D4248F0C803FD28D1E24E4A3 /* BrowserLoopbackService.swift in Sources */,
+				B89DC7E627C0FBD6987A5E82 /* DSHActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

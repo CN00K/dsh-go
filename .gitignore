@@ -44,3 +44,19 @@ site/build/
 runtime/ohos/process/build/
 # NodeMobile, the runtime archive and addon sources: tooling/ios/prepare-engine.sh
 app/ios/Engine/
+
+# iOS local-runtime payload archive (large, reproducible from payload/MANIFEST.json)
+payload/*.tar.gz
+
+# iSH build products (large, reproducible via third_party/ish/*.sh)
+# — never commit the built libs, the rootfs zip, the AOT images or the
+# extracted source; the scripts rebuild them from the pinned inputs.
+app/ios/IShArtifacts/
+third_party/ish-src/
+third_party/ish/.cache/
+third_party/ish/.work/
+# AOT images: recorded .S (hundreds of MB) + the assembled archive.
+# The manifest (third_party/ish/aot-manifest.json) IS committed — it is the
+# SHA256-pinned pointer to the recorded set, not the images themselves.
+third_party/ish/aot/
+third_party/ish/*.S

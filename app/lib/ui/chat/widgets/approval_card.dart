@@ -23,7 +23,7 @@ typedef ApprovalAllowAll = Future<void> Function(ApprovalRequest request);
 
 /// 审批卡:**屏幕上最显眼的东西,但不靠大红色**。
 ///
-/// 本机没有 bash 沙箱,审批是最后一道闸。外壳与标题行是 [ChatCard] 的
+/// 本机命令在 iSH Linux 沙箱内运行，审批仍是最后一道闸。外壳与标题行是 [ChatCard] 的
 /// 「警示」语气:警示色盾牌 + 1px 警示细线,标题直接问「允许运行这条命令？」。
 ///
 /// ```

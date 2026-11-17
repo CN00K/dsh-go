@@ -629,6 +629,14 @@ class RuntimeBridge {
   Future<void> install({bool dropKept = false}) =>
       _methods.invokeMethod<void>('install', dropKept ? const {'dropKept': true} : null);
 
+  /// iOS lifecycle metadata; portable runtimes keep their existing channel.
+  /// PORT-MERGE (minimal increment, 2026-11-17): no-op, matching feat —
+  /// feat's NativeNode bridge also left this unimplemented. It exists so
+  /// [LocalRuntimeController.resumeFromNative] (called from app.dart on
+  /// resume) keeps its shape; foreground synchronization must never start
+  /// or stop the resident iSH guest.
+  Future<void> appLifecycle(String event) async {}
+
   /// [phoneStorage] mounts the phone's shared storage at /sdcard (needs [requestStorage] first).
   /// [mode] null keeps the current mode; [EngineMode.normal] while in safe mode starts the
   /// two-minute trial back in normal mode. [visualReplies] writes the dsh-ui section

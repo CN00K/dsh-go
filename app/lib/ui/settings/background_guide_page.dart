@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,18 +13,24 @@ import '../../state/notify_state.dart';
 import '../common/brief_notice.dart';
 import '../shell/page_frame.dart';
 import '../theme/theme.dart';
+import 'notification_settings.dart';
 import 'settings_widgets.dart';
 import '../common/row_marks.dart';
 import '../common/smooth_size.dart';
 
-/// 后台运行: how to keep conversations running on Android; on HarmonyOS and iOS,
-/// where nothing does, what happens instead.
+/// 后台运行: how to keep conversations running on Android; on HarmonyOS,
+/// where nothing does, what happens instead. On iOS this opens the
+/// notification settings instead: continued run lives there (D5c fusion —
+/// the old IosBackgroundPage is gone, its switches moved to
+/// notification_settings.dart).
 class BackgroundGuidePage extends ConsumerWidget {
   const BackgroundGuidePage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) =>
-      ref.watch(androidSystemFeaturesProvider) ? const _KeepRunningGuide() : const _SuspendedPage();
+  Widget build(BuildContext context, WidgetRef ref) {
+    if (Platform.isIOS) return const NotificationSettingsPage();
+    return ref.watch(androidSystemFeaturesProvider) ? const _KeepRunningGuide() : const _SuspendedPage();
+  }
 }
 
 /// Keeping conversations running in the background: this phone maker's own

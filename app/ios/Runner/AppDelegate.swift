@@ -61,5 +61,21 @@ import UserNotifications
       IOSPetOverlay.shared.onTaskStopConfirmed = { IOSPhoneControl.shared.stopPhoneTaskConfirmed(id: $0) }
       IOSPetOverlay.shared.onTaskResumeConfirmed = { IOSPhoneControl.shared.resumePhoneTask(id: $0) }
     }
+    // Ported from feat (iSH Linux sandbox, D1c loopback bridge): the
+    // `dsh/ish` guest runtime, the `dsh/files` share/save channel and
+    // the `dsh/browser` agent-browser channel. NOT ported: DshNotify
+    // (feat's task-outcome notifications; upstream's notify system owns
+    // that now), DshNativeNode (no such bridge in 1.1.1 — `dsh/runtime`
+    // is the in-process NodeMobile host) and DshShellBox (deleted by
+    // D5c; background state is NotifyPrefs + ContinuedRun).
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshIshRuntime") {
+      ISHRuntime.register(with: registrar)
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshFiles") {
+      FilesPlugin.register(with: registrar)
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DshBrowser") {
+      BrowserUsePlugin.register(with: registrar)
+    }
   }
 }

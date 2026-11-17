@@ -314,8 +314,25 @@ class TerminalScreenState extends ConsumerState<TerminalScreen> with FieldPaste<
         key: const ValueKey('terminal-failed'),
         icon: AppIcons.terminal,
         title: tab.message ?? TerminalCopy.startFailed,
-        message: tab.message == TerminalCopy.limit ? appL10n.botsTerminalLimit : null,
-        action: _CardButton(label: appL10n.commonRetry, onPressed: () => unawaited(_workspace.retry(tab.id))),
+        message: tab.message == TerminalCopy.limit
+            ? appL10n.botsTerminalLimit
+            : tab.ishResetOffered
+                ? TerminalCopy.ishResetNote
+                : null,
+        action: tab.ishResetOffered
+            ? Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                alignment: WrapAlignment.center,
+                children: [
+                  _CardButton(label: appL10n.commonRetry, onPressed: () => unawaited(_workspace.retry(tab.id))),
+                  _CardButton(
+                    label: TerminalCopy.ishResetAction,
+                    onPressed: () => unawaited(_workspace.resetIshAndRetry(tab.id)),
+                  ),
+                ],
+              )
+            : _CardButton(label: appL10n.commonRetry, onPressed: () => unawaited(_workspace.retry(tab.id))),
       ),
       _ => null,
     };

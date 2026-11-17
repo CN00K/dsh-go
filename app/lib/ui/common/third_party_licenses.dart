@@ -13,8 +13,19 @@ import 'package:flutter/services.dart';
 /// THIRD_PARTY_NOTICES.md at the repository root; each package appears in exactly one entry.
 void registerThirdPartyLicenses({String? os}) {
   final harmony = (os ?? Platform.operatingSystem) == 'ohos';
+  final ios = (os ?? Platform.operatingSystem) == 'ios';
   LicenseRegistry.addLicense(
-    () => Stream<LicenseEntry>.fromIterable([..._copiedCode, ...harmony ? _inTheHap : _inTheApk, ..._iconsAndData]),
+    () => Stream<LicenseEntry>.fromIterable([
+      ..._copiedCode,
+      ...harmony ? _inTheHap : _inTheApk,
+      ..._iconsAndData,
+      // iOS Linux sandbox (iSH): only in the iOS build. Hand-merged from
+      // feat (see THIRD_PARTY_NOTICES.md); this file is generated from
+      // that document, so regenerate rather than editing the entries.
+      // PORT-MERGE (manual, 2026-11-17): entries appended by hand because
+      // the notices generator was not run locally; re-run it to confirm.
+      ...ios ? _iosLinuxSandbox : const <LicenseEntry>[],
+    ]),
   );
   LicenseRegistry.addLicense(() async* {
     // The HAP carries no WebRTC (flutter_webrtc is Android's).
@@ -98,6 +109,83 @@ just-bash 3.6.0, isomorphic-git 1.44.9, re2js 1.3.3 and the packages they depend
 run the on-device engine's shell, search and Git on HarmonyOS. Each one keeps its own licence:
 the texts are in the runtime this app unpacks, under runtime/ohos/licenses/texts, and listed in
 runtime/ohos/licenses/README.md in the source.
+''';
+
+/// iOS Linux sandbox (iSH): the in-app Linux environment (terminal +
+/// agent bash). Only in the iOS build; see [_iosLinuxSandbox].
+const _iosLinuxSandbox = <LicenseEntry>[
+  LicenseEntryWithLineBreaks(<String>['iSH'], '$_ishNotice\n$_gpl3'),
+  LicenseEntryWithLineBreaks(<String>['Alpine Linux'], _alpineNotice),
+  LicenseEntryWithLineBreaks(<String>['NodeMobile (Node.js)'], _nodeMobileMit),
+];
+
+/// iSH (https://github.com/openminis/ish-arm64, pinned commit 0fd17a13):
+/// the user-mode Linux kernel + Alpine userland behind the in-app Linux
+/// sandbox (terminal + agent bash). GPLv3; contributions after commit
+/// 0e3a4144 are additionally licensed under GPLv2; the additional terms
+/// in LICENSE.IOS also apply. Corresponding source is the
+/// port/1.1.1-ish branch of https://github.com/CN00K/dsh-go
+/// (see THIRD_PARTY_NOTICES.md at the repository root).
+const _ishNotice = '''
+iSH — iOS Linux shell environment (https://github.com/openminis/ish-arm64)
+
+iSH is licensed under the GNU General Public License v3.0. The full text
+of the GPLv3 follows below. Contributions made after commit
+0e3a4144f93135c4fd618c8397d2cfd87194f69f are additionally licensed under
+the GPLv2, and the additional terms in LICENSE.IOS apply (App Store
+distribution waiver: the copyright holders will not pursue a violation
+that results solely from the conflict between the GPL and the App Store
+terms, as long as the GPL is complied with in all other respects,
+including providing users with source code and the text of the license).
+''';
+
+/// Alpine Linux 3.21.0 minirootfs: the guest root filesystem iSH runs
+/// (converted to fakefs by third_party/ish/prepare-rootfs.sh). Alpine is a
+/// collection of packages under their own licenses (MIT, BSD, GPL, Apache
+/// and others); the per-package license list is in the Alpine package
+/// database for 3.21.0. AOT-recorded modules: musl (MIT), busybox (GPLv2),
+/// zlib (zlib license), OpenSSL libcrypto/libssl 3.3.2 (Apache 2.0),
+/// pcre2 10.43 (BSD 3-Clause). See THIRD_PARTY_NOTICES.md.
+const _alpineNotice = '''
+Alpine Linux 3.21.0 (https://alpinelinux.org)
+
+Alpine Linux is a collection of packages, each under its own license
+(MIT, BSD, GPL, Apache and others). The guest root filesystem in this app
+is the Alpine 3.21.0 minirootfs for aarch64, converted to the fakefs
+format iSH runs. Per-package licenses are listed in the Alpine package
+database for 3.21.0; the AOT-recorded modules are musl (MIT), busybox
+(GPLv2), zlib (zlib license), OpenSSL libcrypto/libssl 3.3.2
+(Apache License 2.0) and pcre2 10.43 (BSD 3-Clause).
+''';
+
+/// NodeMobile 24.20.0: the iOS build of Node.js that runs the DSH engine
+/// the sandbox integrates with.
+const _nodeMobileMit = '''
+NodeMobile (Node.js) (https://nodejs.org)
+
+Copyright Node.js contributors. All rights reserved.
+
+$_mitTerms''';
+
+/// Bouncy Castle (`bcprov`, `bcpkix-jdk15to18`): the MIT terms under its own name.
+const _bouncyCastle = '''
+Copyright (c) 2000-2023 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ''';
 
 /// The MIT terms; each MIT entry puts its own copyright line above them.

@@ -83,6 +83,26 @@ class _NotificationSettingsTileState extends ConsumerState<NotificationSettingsT
 
 /// Master switch, one switch per kind of event, and the way back to the
 /// system settings when notifications are blocked there.
+///
+/// D5c FUSION (2026-11-17): this page is the single home of the old
+/// `IosBackgroundPage` 6-switch set (feat). Mapping, old -> upstream:
+///  1. master "allow user tasks to continue" -> [NotifyPrefs.continuedRun]
+///     (`continuedRunSettingsSwitch` below); the pref defaults ON.
+///  2. "prefer continued processing" -> folded into (1): upstream always
+///     submits a continued task when enabled; there is no audio/location-only
+///     fallback (ShellBoxPlugin's silent-audio + location keep-alive were
+///     dropped with it — see NOTES.md).
+///  3. "Live Activity" -> [NotifyPrefs.live] (`liveSettingsSwitch` below);
+///     the island itself is upstream 1.1.1's pet-first PetLiveActivity.
+///  4. "task notifications" -> the done/failed/approval/question switches.
+///  5. "privacy mode" -> no switch: upstream never puts task text on the
+///     lock screen (see the lock-screen privacy footer below), which is
+///     what privacy mode achieved.
+///  6. "background reading" -> DROPPED: no upstream counterpart (see NOTES.md).
+/// Single source of truth: Dart [NotifyPrefs] in SharedPreferences
+/// (`notify_*` keys). Feat's UserDefaults `dsh.shellbox.*` keys are
+/// orphaned by the fusion — see NOTES.md for the key table and the
+/// un-decided one-time migration.
 class NotificationSettingsPage extends ConsumerStatefulWidget {
   const NotificationSettingsPage({super.key});
 
@@ -281,6 +301,17 @@ class _NotificationSettingsPageState extends ConsumerState<NotificationSettingsP
                 subtitle: l10n.continuedRunSettingsSubtitle,
                 value: prefs.continuedRun,
                 onChanged: on ? (v) => unawaited(notifier.setContinuedRun(v)) : null,
+              ),
+            if (iosLiveActivities)
+              // Fused status row (was the old page's live state line):
+              // whether the system is currently letting a local turn run on.
+              // Best-effort: [RuntimeStatus.continuedRun] as the native
+              // ContinuedRun reports it through `dsh/runtime`.
+              SettingsTile(
+                title: l10n.continuedRunStatusTitle,
+                subtitle: ref.watch(localRuntimeProvider.select((s) => s.status.continuedRun))
+                    ? l10n.continuedRunActive
+                    : l10n.continuedRunIdle,
               ),
           ],
         ),

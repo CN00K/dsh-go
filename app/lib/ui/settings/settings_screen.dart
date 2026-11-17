@@ -22,6 +22,7 @@ import '../../state/system_actions_state.dart';
 import '../../state/ui_mode_state.dart';
 import '../../state/update_state.dart';
 import '../account/account_page.dart';
+import '../browser/browser_page.dart';
 import '../account/account_widgets.dart';
 import '../chat/balance_widgets.dart' show formatMoney;
 import '../common/ask_ai.dart';
@@ -202,6 +203,14 @@ class SettingsScreen extends ConsumerWidget {
               tint: SettingsHues.abilities,
               spot: SettingsIndex.entry(SettingsPageId.media),
               onTap: () => _push(context, const MediaSettingsPage()),
+            ),
+            // Agent browser (browser_use): the visible browser page — what
+            // the agent is doing in its WKWebView tabs, plus a URL bar.
+            SettingsTile(
+              icon: AppIcons.browser,
+              tint: SettingsHues.abilities,
+              spot: SettingsIndex.entry(SettingsPageId.browser),
+              onTap: () => _push(context, const BrowserPage()),
             ),
             if (ref.watch(operatingSystemProvider) == 'ohos') const LinuxEnvironmentTile(tint: SettingsHues.abilities),
             SettingsTile(
