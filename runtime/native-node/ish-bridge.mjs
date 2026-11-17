@@ -97,7 +97,7 @@ import childProcess from 'node:child_process';
 import {createHash, randomBytes} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {readFileSync} from 'node:fs';
-import {request as httpRequest} from 'node:http';
+import {request as httpRequest, Agent as HttpAgent} from 'node:http';
 import {syncBuiltinESMExports} from 'node:module';
 import {connect as netConnect} from 'node:net';
 import {join, resolve, sep} from 'node:path';
@@ -276,6 +276,34 @@ let cachedService = null; // {host, port, token} | null
 let cachedServiceFile = null;
 let lastMissingCheck = 0;
 let waitedForServiceFile = false;
+
+/**
+ * Loopback HTTP agent (build 34 fix): NO keep-alive. The loopback
+ * service answers every response with `Connection: close`, so pooled
+ * sockets are never reused in practice — but the client must not
+ * depend on that: a stale or wrong server on a reused port can hand
+ * the pool a dead socket, and the next request on it fails with a
+ * parse error (HPE_CLOSED_CONNECTION, "Data after `Connection:
+ * close`") instead of a clean ECONNREFUSED. One fresh TCP connect
+ * per call on 127.0.0.1 costs nothing measurable and removes the
+ * whole pooled-socket class.
+ */
+const loopbackAgent = new HttpAgent({keepAlive: false});
+
+/**
+ * True for errors that mean "this connection/response is garbage,
+ * not that the service is down": llhttp parse errors (HPE_* — the
+ * exact code for the build-33 device failure is
+ * HPE_CLOSED_CONNECTION, "Parse Error: Data after `Connection:
+ * close`") plus the classic dead-connection codes. Callers retry
+ * once with freshly-read service info and drop the cache on these,
+ * exactly as they already do for ECONNREFUSED/ECONNRESET.
+ */
+function isStaleConnectionError(error) {
+  if (!error) return false;
+  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') return true;
+  return typeof error.code === 'string' && error.code.startsWith('HPE_');
+}
 /**
  * True once a worker request has proven this service predates the
  * worker endpoints (HTTP 404 on /ish/worker/run). While set, the
@@ -409,8 +437,10 @@ export async function ishExec(opts) {
   }} : opts;
   // Retry once with a fresh read of ish-service.json (same stale-cache
   // fix as the WS path, build 37): postNdjson invalidates on
-  // ECONNREFUSED/ECONNRESET, and a 401 means the token rotated, so a
-  // retry with fresh info can succeed where the cached one failed.
+  // ECONNREFUSED/ECONNRESET and on llhttp parse errors (HPE_* — a
+  // garbled response from a stale/wrong port, build 34), and a 401
+  // means the token rotated, so a retry with fresh info can succeed
+  // where the cached one failed.
   // ISH_NOT_BOOTED is a real state, not a stale cache — do not retry it.
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -422,7 +452,7 @@ export async function ishExec(opts) {
     } catch (error) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
-      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+      const retryable = isStaleConnectionError(error)
         || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
       if (retryable && attempt === 0) continue;
       throw lastError;
@@ -448,6 +478,7 @@ function postNdjson(service, path, body, opts) {
     const req = httpRequest({
       host: service.host,
       port: service.port,
+      agent: loopbackAgent,
       path,
       method: 'POST',
       headers: {
@@ -532,7 +563,7 @@ function postNdjson(service, path, body, opts) {
       // Connection failure: the service file may have been rewritten
       // (restart with a new port/token); drop the cache so the next call
       // re-reads it. The caller retries once if it wants to.
-      if (error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET') invalidateServiceInfo();
+      if (isStaleConnectionError(error)) invalidateServiceInfo();
       settleReject(error);
     });
     req.on('abort', () => {
@@ -555,6 +586,7 @@ export async function ishStatus(opts = {}) {
     const req = httpRequest({
       host: service.host,
       port: service.port,
+      agent: loopbackAgent,
       path: '/ish/status',
       method: 'GET',
       headers: {'Authorization': `Bearer ${service.token}`},
@@ -562,7 +594,14 @@ export async function ishStatus(opts = {}) {
       res.resume();
       resolvePromise(res.statusCode === 200);
     });
-    req.on('error', () => resolvePromise(false));
+    req.on('error', (error) => {
+      // A failed probe may mean the cached port is stale (service
+      // restarted with a new port/token): drop the cache so the next
+      // call re-reads ish-service.json instead of failing fast on
+      // the dead port forever.
+      if (isStaleConnectionError(error)) invalidateServiceInfo();
+      resolvePromise(false);
+    });
     req.end();
   });
 }
@@ -780,6 +819,7 @@ function postJson(service, path, bodyObj, opts = {}) {
     const req = httpRequest({
       host: service.host,
       port: service.port,
+      agent: loopbackAgent,
       path,
       method: 'POST',
       headers: {
@@ -818,7 +858,7 @@ function postJson(service, path, bodyObj, opts = {}) {
         settleReject(Object.assign(new Error('ish request aborted'), {code: 'ISH_ABORTED'}));
         return;
       }
-      if (error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET') invalidateServiceInfo();
+      if (isStaleConnectionError(error)) invalidateServiceInfo();
       settleReject(error);
     });
     req.end(body);
@@ -929,7 +969,7 @@ export async function ishWorkerExec(opts) {
             new Error('ish worker endpoints are not available on this service'),
             {code: ISH_WORKER_UNSUPPORTED});
         }
-        const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+        const retryable = isStaleConnectionError(error)
           || error?.code === 'ISH_HTTP_ERROR';
         if (retryable && attempt === 0) continue;
         throw lastError;
@@ -991,7 +1031,7 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
           new Error(`ish job not found: session ${sessionId} pid ${pid}`),
           {code: ISH_JOB_NOT_FOUND});
       }
-      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+      const retryable = isStaleConnectionError(error)
         || error?.code === 'ISH_HTTP_ERROR';
       if (retryable && attempt === 0) continue;
       throw lastError;
@@ -1019,7 +1059,7 @@ export async function ishWorkerStop(sessionId, opts = {}) {
     } catch (error) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
-      const retryable = error?.code === 'ECONNREFUSED' || error?.code === 'ECONNRESET'
+      const retryable = isStaleConnectionError(error)
         || error?.code === 'ISH_HTTP_ERROR';
       if (retryable && attempt === 0) continue;
       throw lastError;
@@ -1669,7 +1709,8 @@ export function spawnIshExec(argv, options = {}) {
           child.ishWorker = true;
         } catch (error) {
           const fallBack = !sawOutput && (error?.code === ISH_WORKER_UNSUPPORTED
-            || error?.code === 'ISH_NOT_BOOTED' || error?.code === 'ISH_HTTP_ERROR');
+            || error?.code === 'ISH_NOT_BOOTED' || error?.code === 'ISH_HTTP_ERROR'
+            || isStaleConnectionError(error));
           if (!fallBack) throw error;
           // Worker unavailable (old service, start failure, or a
           // request the server rejected before running it): one-shot.
