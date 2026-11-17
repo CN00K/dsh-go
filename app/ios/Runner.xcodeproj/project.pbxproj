@@ -29,6 +29,7 @@
 		96A67D6348E9EF40D67E1114 /* PetLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 735E2282E0F893677524A2E3 /* PetLiveActivity.swift */; };
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
+		D5E200000000000000000012 /* alpine-rootfs.zip in Resources */ = {isa = PBXBuildFile; fileRef = D5E100000000000000000021 /* alpine-rootfs.zip */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
 		9DA4CCD005F1478331AD7A43 /* PetActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = D877E0F531097F288C739C49 /* PetActivityAttributes.swift */; };
 		A08400000000000000000002 /* UnicodeData-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = A08400000000000000000001 /* UnicodeData-LICENSE.txt */; };
@@ -197,6 +198,11 @@
 		3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = AppFrameworkInfo.plist; path = Flutter/AppFrameworkInfo.plist; sourceTree = "<group>"; };
 		3DDB03C634FB14AB72694FEC /* ISHKernel.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHKernel.m; sourceTree = "<group>"; };
 		47E36332DF351BE53CA87F3D /* ISHShellExecutor.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ISHShellExecutor.m; sourceTree = "<group>"; };
+		D5E100000000000000000016 /* libish.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000017 /* libish_emu.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_emu.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000018 /* libfakefs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libfakefs.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000022 /* libish_aot.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "IShArtifacts/lib/libish_aot.a"; sourceTree = SOURCE_ROOT; };
+		D5E100000000000000000021 /* alpine-rootfs.zip */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = "IShArtifacts/alpine-rootfs.zip"; sourceTree = SOURCE_ROOT; };
 		49D5A70C75C310CD8E17CCA9 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		544B7864BB86676E2D89DBC0 /* ISHResourceGovernor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHResourceGovernor.h; sourceTree = "<group>"; };
 		712816DD2BB38EEE0101905C /* ISHShellExecutor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ISHShellExecutor.h; sourceTree = "<group>"; };
@@ -426,7 +432,20 @@
 				331C8082294A63A400263BE5 /* RunnerTests */,
 				D5480000000000000000E008 /* PhoneRunner */,
 				D5480000000000000000B011 /* ShareExtension */,
+				D5E300000000000000000001 /* IShArtifacts */,
 			);
+			sourceTree = "<group>";
+		};
+		D5E300000000000000000001 /* IShArtifacts */ = {
+			isa = PBXGroup;
+			children = (
+				D5E100000000000000000016 /* libish.a */,
+				D5E100000000000000000017 /* libish_emu.a */,
+				D5E100000000000000000018 /* libfakefs.a */,
+				D5E100000000000000000022 /* libish_aot.a */,
+				D5E100000000000000000021 /* alpine-rootfs.zip */,
+			);
+			name = IShArtifacts;
 			sourceTree = "<group>";
 		};
 		97C146EF1CF9000F007C117D /* Products */ = {
@@ -753,6 +772,7 @@
 				D5480000000000000000A005 /* InfoPlist.strings in Resources */,
 				D5480000000000000000D001 /* AppShortcuts.strings in Resources */,
 				D5480000000000000000D004 /* Localizable.strings in Resources */,
+				D5E200000000000000000012 /* alpine-rootfs.zip in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1121,13 +1141,60 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconNight AppIconFrost AppIconInk";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshgo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1330,13 +1397,60 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconNight AppIconFrost AppIconInk";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshgo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1355,13 +1469,60 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconNight AppIconFrost AppIconInk";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
 				ENABLE_BITCODE = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					// iSH guest arch must match the meson lib build
+					// (build-ish.sh: -Dguest_arch=arm64, meson adds
+					// -DGUEST_ARM64=1). Without it emu/cpu.h falls back
+					// to #include "emu/arch/x86/cpu.h" (stage 1 build 7).
+					"GUEST_ARM64=1",
+					// dsh-go is an internal iSH consumer (links the libs,
+					// calls fakefs_bind_mount etc.); fs/fake.h refuses to
+					// compile without ISH_INTERNAL (stage 1 build 8: #error
+					// "for internal use only"). iSH .c files define it
+					// per-file; the Xcode target defines it project-wide.
+					"ISH_INTERNAL=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/include",
+					// iSH kernel headers include each other with repo-root-relative
+					// paths (e.g. kernel/init.h does #include "fs/tty.h"); the
+					// staged tree mirrors the repo under include/ish/, so the ish
+					// dir itself must also be a search path (stage 1 build 6:
+					// fs/tty.h file not found).
+					"$(SRCROOT)/IShArtifacts/include/ish",
+				);
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/IShArtifacts/lib",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lish_emu",
+					"-lish",
+					"-lfakefs",
+					"-lsqlite3",
+					"-lz",
+					// ISHKernel refreshDns uses res_9_ninit/nclose/getservers
+					// (libresolv); stage 1 build 9 failed to link without it.
+					"-lresolv",
+					// AOT images self-register via constructor; -force_load
+					// keeps the linker from dropping the archive (no symbol
+					// is referenced from the app). Stage 4: the archive is
+					// staged by third_party/ish/build-aot.sh (stub when no
+					// images are recorded yet).
+					"-force_load",
+					"$(SRCROOT)/IShArtifacts/lib/libish_aot.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.ccch1mneyyy.dshgo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
