@@ -10013,6 +10013,12 @@ class L10nZh extends L10n {
   String get liveSettingsSubtitle => '干活、等你处理、操作手机时，显示在状态栏胶囊和锁屏上；支持的手机会放进灵动岛';
 
   @override
+  String get continuedRunSettingsSwitch => '后台继续运行';
+
+  @override
+  String get continuedRunSettingsSubtitle => '离开 App 后继续本地任务，并显示系统进度卡片；仅 iOS 26 及以上生效';
+
+  @override
   String get liveSettingsFooter =>
       'Android 16 的实时活动（Live Updates）：小米 HyperOS 3.1+、OPPO / 一加 ColorOS 16、荣耀 MagicOS 10 和 Pixel 会显示；vivo 原子岛和三星 Now Bar 目前只对厂商合作的应用开放。';
 

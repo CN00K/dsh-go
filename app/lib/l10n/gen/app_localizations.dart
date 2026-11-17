@@ -18590,6 +18590,18 @@ abstract class L10n {
   /// **'干活、等你处理、操作手机时，显示在状态栏胶囊和锁屏上；支持的手机会放进灵动岛'**
   String get liveSettingsSubtitle;
 
+  /// No description provided for @continuedRunSettingsSwitch.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台继续运行'**
+  String get continuedRunSettingsSwitch;
+
+  /// No description provided for @continuedRunSettingsSubtitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'离开 App 后继续本地任务，并显示系统进度卡片；仅 iOS 26 及以上生效'**
+  String get continuedRunSettingsSubtitle;
+
   /// No description provided for @liveSettingsFooter.
   ///
   /// In zh, this message translates to:

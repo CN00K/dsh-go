@@ -275,6 +275,13 @@ class _NotificationSettingsPageState extends ConsumerState<NotificationSettingsP
               value: prefs.live && liveSupported,
               onChanged: on && liveSupported ? (v) => unawaited(notifier.setLive(v)) : null,
             ),
+            if (iosLiveActivities)
+              SettingsSwitchTile(
+                title: l10n.continuedRunSettingsSwitch,
+                subtitle: l10n.continuedRunSettingsSubtitle,
+                value: prefs.continuedRun,
+                onChanged: on ? (v) => unawaited(notifier.setContinuedRun(v)) : null,
+              ),
           ],
         ),
         SettingsSection(

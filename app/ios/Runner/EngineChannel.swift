@@ -559,6 +559,7 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
   // conversation has appeared in its session list.
   private var localTurnRunning = false
   private var phoneTaskRunning = false
+  private var continuedEnabled = true
   private let pathMonitor = NWPathMonitor()
   private var pathStarted = false
 
@@ -596,7 +597,7 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
       IOSPhoneControl.shared.onTaskActivityChanged = { [weak self] active in
         guard let self else { return }
         self.phoneTaskRunning = active
-        self.continued.update(running: self.localTurnRunning || active)
+        self.continued.update(running: self.continuedEnabled && (self.localTurnRunning || active))
       }
       IOSPetOverlay.shared.onKeepingAliveChanged = { [weak self] active in
         self?.queue.async { [weak self] in
@@ -701,7 +702,14 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
           let running = arguments["running"] as? Bool ?? false
           DispatchQueue.main.async { [self] in
             localTurnRunning = running
-            continued.update(running: running || phoneTaskRunning)
+            continued.update(running: continuedEnabled && (running || phoneTaskRunning))
+          }
+          reply(nil)
+        case "continuedEnabled":
+          let enabled = arguments["enabled"] as? Bool ?? true
+          DispatchQueue.main.async { [self] in
+            continuedEnabled = enabled
+            continued.update(running: enabled && (localTurnRunning || phoneTaskRunning))
           }
           reply(nil)
         case "reset":

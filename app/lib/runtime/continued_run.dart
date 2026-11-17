@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/android_features.dart';
 import '../state/chat_state.dart';
 import '../state/hosts_state.dart';
+import '../state/notify_state.dart';
 import '../state/read_list_cache.dart';
 import '../state/read_list_identity.dart';
 import '../state/sessions_state.dart';
@@ -37,14 +38,34 @@ final localTurnRunningProvider = Provider<bool>((ref) {
   return open != null && ref.watch(chatProvider(open).select((chat) => chat.running));
 });
 
+final continuedRunEnabledProvider = Provider<bool>((ref) {
+  final prefs = ref.watch(notifyPrefsProvider);
+  return prefs.enabled && prefs.continuedRun;
+});
+
 /// Keep this watched while the shell is up. Draws nothing and holds nothing.
 final continuedRunProvider = Provider<void>((ref) {
   if (ref.watch(operatingSystemProvider) != 'ios') return;
-  ref.listen(localTurnRunningProvider, (was, now) {
-    if (was == now) return;
-    unawaited(_tell(ref, now));
+  ref.listen<bool>(continuedRunEnabledProvider, (was, enabled) {
+    if (was == enabled) return;
+    unawaited(_setEnabled(ref, enabled));
+  });
+  ref.listen<bool>(localTurnRunningProvider, (was, running) {
+    if (was == running) return;
+    unawaited(_tell(ref, running && ref.read(continuedRunEnabledProvider)));
   }, fireImmediately: true);
 });
+
+Future<void> _setEnabled(Ref ref, bool enabled) async {
+  try {
+    await ref.read(runtimeBridgeProvider).setContinuedEnabled(enabled);
+    await ref.read(runtimeBridgeProvider).setTurnRunning(enabled && ref.read(localTurnRunningProvider));
+  } on MissingPluginException {
+    // A build without the engine.
+  } on PlatformException {
+    // The engine's channel refused. Nothing depends on this: it would pause, as it does anyway.
+  }
+}
 
 Future<void> _tell(Ref ref, bool running) async {
   try {

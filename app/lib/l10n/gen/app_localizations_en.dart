@@ -10570,6 +10570,13 @@ class L10nEn extends L10n {
       'While DSH works, waits on you or controls the phone: in the status bar chip and on the lock screen, and in the island on phones that have one';
 
   @override
+  String get continuedRunSettingsSwitch => 'Keep running in background';
+
+  @override
+  String get continuedRunSettingsSubtitle =>
+      'Continue a local task after leaving the app and show the system progress card; iOS 26 and later';
+
+  @override
   String get liveSettingsFooter =>
       'Android 16 Live Updates. Shown on Xiaomi HyperOS 3.1+, OPPO / OnePlus ColorOS 16, Honor MagicOS 10 and Pixel; vivo\'s Atomic Island and Samsung\'s Now Bar are open only to apps the maker partners with.';
 

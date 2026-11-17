@@ -61,7 +61,7 @@ After a system force-stop, reopen DSH Go before it can recover. Repeated failure
 - Shizuku: install and start Shizuku yourself, explicitly request authorization here, then connect. The actual service identity may be shell (UID 2000) or root (UID 0); check the status and each command confirmation.
 - **Self-ADB**: enable Wireless debugging in Android Developer options, open its pairing-code dialog, and enter the six-digit code and pairing port here (or use discovery). Connect after pairing. The connection port differs from the pairing port; leave it blank to discover a local endpoint. Pairing codes are not saved or logged. This feature does not contact other devices.
 
-Every `android_shell` tool call requires native confirmation of the complete command and actual identity, with the same **Allow once** / **Allow this turn** / **Cancel**: Allow once passes only this command; after Allow this turn the rest of this turn's commands don't ask; Cancel drops only this command. Screen-control exemptions and **Always allow** don't apply, and the next turn asks for each command again. System authorization, background-display authorization, and accessibility-restoration authorization do not authorize arbitrary commands. App rules cannot constrain every Shell operation. Do not rewrite a cancelled command or switch channels to bypass the decision.
+Every `android_shell` tool call requires native confirmation of the complete command and actual identity, with the same **Allow once** / Allow this turn / **Cancel**: Allow once passes only this command; after Allow this turn the rest of this turn's commands don't ask; Cancel drops only this command. Screen-control exemptions and **Always allow** don't apply, and the next turn asks for each command again. System authorization, background-display authorization, and accessibility-restoration authorization do not authorize arbitrary commands. App rules cannot constrain every Shell operation. Do not rewrite a cancelled command or switch channels to bypass the decision.
 
 The default command deadline is 30 seconds, with a 60-second maximum. Commands are limited to 2048 UTF-8 bytes, with a shared 64 KiB text-output cap and explicit truncation. Results include the actual exit code, stdout, stderr and timeout/cancellation status. Output goes to the current model: do not run commands that print secrets, login state or other content you do not want sent. Interactive terminals, binary transfer and persistent background jobs are not supported. Ubuntu paths, working directories and environment are not inherited.
 
@@ -72,7 +72,7 @@ The default command deadline is 30 seconds, with a 60-second maximum. Commands a
 Go back to a chat and say what you want done. While a task runs:
 
 - Keep the screen on and unlocked. Turning the screen off stops the task.
-- Passwords, verification codes, payments and system settings are up to you (unless you turn them on under Lift limits below). When a step needs you, **Your turn** appears; tap **Continue** when you're done. When one of these rules is the reason, the card's title says so, like **Passwords and codes are yours to enter** or **System settings are yours to change**.
+- Passwords, verification codes, payments and system settings are up to you (unless you turn them on under Lift limits below). When a step needs you, **Your turn** appears; tap **Continue** when you're done. When one of these rules is the reason, the card's title says so, like Passwords and codes are yours to enter or System settings are yours to change.
 - A task ends on its own when DSH makes no new move for 3 minutes.
 
 Alarms, events, maps and sharing don't need the accessibility service.
@@ -83,7 +83,7 @@ When a task starts, a floating bar appears in the lower middle of the screen, an
 
 - Capsule: one line saying what DSH is doing, like "Tap “Send”", with **Pause** and **Stop** on the right. After **Pause**, the button reads **Continue**; tap it to let DSH carry on. Hold and drag the capsule to move it: it stays at the height you let go, against the left, the middle or the right, and is there next time. Drag it off the left or right edge to shrink it to a ball on that side.
 - Card: tap the line on the capsule to open it. It shows the app DSH is working in, whether approvals are off, the last few steps, and a field to steer DSH another way. Left alone for a few seconds, it goes back to the capsule.
-- Ball: tap the dot at the capsule's left end, or **Shrink to a ball** in the card, to shrink it to a ball at the screen edge. Left alone for 3 seconds, the ball fades and slides half out of sight over the edge; a touch brings it back. Tap the ball to open it. Drag it anywhere; it snaps to the nearest edge and stays there next time. **Hold the ball for a second to stop**: a ring closes round it first, and letting go cancels.
+- Ball: tap the dot at the capsule's left end, or Shrink to a ball in the card, to shrink it to a ball at the screen edge. Left alone for 3 seconds, the ball fades and slides half out of sight over the edge; a touch brings it back. Tap the ball to open it. Drag it anywhere; it snaps to the nearest edge and stays there next time. Hold the ball for a second to stop: a ring closes round it first, and letting go cancels.
 
 When DSH needs your approval, the capsule says "Waiting for you below" and the approval card appears at the bottom of the screen.
 
@@ -99,7 +99,7 @@ Whatever the settings, the bar closes when the reply ends.
 
 - **Stop** on the floating bar, or hold the ball for a second.
 - **Stop** on the "Operating your phone" card on the phone control page.
-- **Stop phone control** on the engine notification. **Stop engine** on the same notification stops the whole engine.
+- Stop phone control on the engine notification. Stop engine on the same notification stops the whole engine.
 
 A stop affects this turn only: the rest of this turn's phone actions don't run, and the next turn resumes and asks you again — no need to turn phone control back on in Settings. **Cancel** on a confirmation card is different: it drops just that one action, leaves the rest of the turn alone, and doesn't stop the turn.
 
@@ -109,13 +109,13 @@ A stop affects this turn only: the rest of this turn's phone actions don't run, 
 `Settings › Phone control › Confirmation`
 
 - **Always ask** (default): asks before entering a new app, sending, deleting or paying.
-- **This task**: asks once this turn. Choose **Allow this turn** on the card, and the rest of the turn goes ahead.
+- **This task**: asks once this turn. Choose Allow this turn on the card, and the rest of the turn goes ahead.
 - **Always skip**: acts without asking. Asks you to confirm before turning on.
 
 The card and the notification always have the same three answers:
 
 - **Allow once**: this step only.
-- **Allow this turn**: the same app and kind of action are not asked again this turn; the next turn asks again.
+- Allow this turn: the same app and kind of action are not asked again this turn; the next turn asks again.
 - **Cancel**: drops only this action. The rest of the turn goes on, and the turn isn't stopped.
 
 When you pick Phone control during first-time setup, you choose once after agreeing to the disclosure: **Ask me at key steps** (Always ask) or **Fully automatic** (Always skip). You can change it here anytime.

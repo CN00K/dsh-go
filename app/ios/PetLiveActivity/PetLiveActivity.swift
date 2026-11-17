@@ -19,54 +19,54 @@ struct PetLiveActivity: Widget {
         .widgetURL(context.attributes.url)
     } dynamicIsland: { context in
       DynamicIsland {
-        // Expanded reads as one row — pet on the left, the state's headline on
-        // the right — with the redacted detail as a second line underneath.
-        // Keeping the headline beside the pet leaves no dead space on the
-        // right of the island and keeps text off its bottom edge.
+        // The selected pet is the visual anchor. PetSprite keeps the exact
+        // inline still from Dart ahead of the staged/bundled pack, so an
+        // imported pet remains the same pet in the island too.
         DynamicIslandExpandedRegion(.leading) {
-          PetSprite(state: context.state, label: compactLabel(context),
-            bodyHeight: 34, maxHeight: 46)
-            .frame(width: 60, height: 48, alignment: .center)
-            .padding(.leading, 4)
+          PetIslandBadge(state: context.state, label: compactLabel(context))
+            .padding(.leading, 2)
         }
         DynamicIslandExpandedRegion(.trailing) {
-          // One line, never stacked: "思考中 …" while it thinks, "干活中
-          // 02:41" while it works. The mark reads as part of the sentence
-          // instead of floating under it.
-          HStack(spacing: 6) {
-            Text(headline(context))
-              .font(.system(size: 14, weight: .semibold))
-              .foregroundStyle(PhaseStyle.of(context.state.phase).tint)
-              .lineLimit(1)
-              .minimumScaleFactor(0.8)
-            CompactStatus(state: context.state, stale: context.isStale,
-              label: compactLabel(context))
+          VStack(alignment: .leading, spacing: 5) {
+            Text("DSH GO")
+              .font(.system(size: 10, weight: .medium))
+              .foregroundStyle(Palette.secondary)
+              .textCase(.uppercase)
+              .tracking(0.4)
+            HStack(spacing: 6) {
+              Text(headline(context))
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(PhaseStyle.of(context.state.phase).tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+              CompactStatus(state: context.state, stale: context.isStale,
+                label: compactLabel(context))
+            }
           }
-          .frame(maxWidth: .infinity, alignment: .trailing)
+          .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.trailing, 6)
         }
         DynamicIslandExpandedRegion(.bottom) {
-          if let detail = context.state.detail, !detail.isEmpty {
-            Text(detail)
+          HStack(spacing: 7) {
+            PhaseGlyph(style: PhaseStyle.of(context.state.phase), size: 12)
+            Text(detail(context))
               .font(.system(size: 12))
               .foregroundStyle(Palette.secondary)
               .lineLimit(1)
               .frame(maxWidth: .infinity, alignment: .leading)
-              .padding(.horizontal, 8)
-              .padding(.top, 1)
           }
+          .padding(.horizontal, 8)
+          .padding(.top, 1)
         }
       } compactLeading: {
-        // The pet alone, centred in the system pill. Compact has one line of
-        // room: a fixed box keeps the sprite off the corner and clips it, so
-        // nothing can spill onto the wallpaper beside the island.
+        // The compact island still uses the selected pet, never a fixed emoji.
         PetSprite(state: context.state, label: compactLabel(context),
-          bodyHeight: 16, maxHeight: 22)
-          .frame(width: 30, height: 24, alignment: .center)
-          .clipped()
+          bodyHeight: 12, maxHeight: 16, maxWidth: 20)
+          .frame(width: 22, height: 20, alignment: .center)
       } compactTrailing: {
         CompactStatus(state: context.state, stale: context.isStale, label: compactLabel(context))
-          .frame(minWidth: 20, maxHeight: 24, alignment: .center)
+          .frame(width: 30, height: 20, alignment: .trailing)
+          .clipped()
       } minimal: {
         // The one thing worth recognizing at a glance.
         MinimalPet(state: context.state, label: compactLabel(context))
@@ -84,6 +84,11 @@ struct PetLiveActivity: Widget {
   private func headline(_ context: ActivityViewContext<PetActivityAttributes>) -> String {
     context.isStale ? context.state.staleLabel : context.state.label
   }
+
+  private func detail(_ context: ActivityViewContext<PetActivityAttributes>) -> String {
+    if let detail = context.state.detail, !detail.isEmpty { return detail }
+    return context.isStale ? context.state.staleLabel : context.state.label
+  }
 }
 
 /// The lock screen's card: the pet, then the headline and one line of detail.
@@ -95,7 +100,7 @@ private struct LockScreenCard: View {
 
   var body: some View {
     HStack(spacing: 14) {
-      PetSprite(state: context.state, label: text, bodyHeight: 34, maxHeight: 44)
+      PetSprite(state: context.state, label: text, bodyHeight: 34, maxHeight: 44, maxWidth: 54)
         .frame(width: 52, alignment: .center)
       VStack(alignment: .leading, spacing: 3) {
         Text(text)
@@ -164,6 +169,25 @@ private struct PhaseGlyph: View {
   }
 }
 
+/// A quiet frame that gives the chosen pet the main visual weight without
+/// masking its transparent action window. The art itself remains responsible
+/// for its proportions, including imported pixel-art packs.
+private struct PetIslandBadge: View {
+  let state: PetActivityAttributes.ContentState
+  let label: String
+
+  var body: some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .fill(PhaseStyle.of(state.phase).tint.opacity(0.16))
+      PetSprite(state: state, label: label, bodyHeight: 37, maxHeight: 47, maxWidth: 56)
+    }
+    .frame(width: 62, height: 54)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(label)
+  }
+}
+
 /// The island's trailing side: one thing only. A running task counts up; a
 /// waiting turn shows its mark; a finished one its check. Nothing at all while
 /// the pet idles, so the collapsed island stays quiet.
@@ -205,10 +229,15 @@ private struct CompactStatus: View {
 
   private func timer(_ start: Date) -> some View {
     Text(timerInterval: start...Date.distantFuture, countsDown: false, showsHours: false)
-      .font(.system(size: 12, weight: .medium))
+      .font(.system(size: 10, weight: .medium))
       .monospacedDigit()
       .foregroundStyle(PhaseStyle.of(state.phase).tint)
       .lineLimit(1)
+      // Date.distantFuture gives the live timer a stable update range, but it
+      // also makes Text reserve space for a much wider value. Keep the compact
+      // trailing region sized for the value that is actually shown.
+      .frame(width: 30, alignment: .trailing)
+      .clipped()
       .accessibilityLabel(label)
   }
 }
@@ -222,7 +251,7 @@ private struct MinimalPet: View {
     // The inline still already is this pose. Use its state unchanged so the
     // image and petState describe the same thing; only a pack without a still
     // falls back to idle art, where an old pose image must not survive.
-    PetSprite(state: displayedState, label: label, bodyHeight: 14, maxHeight: 18)
+    PetSprite(state: displayedState, label: label, bodyHeight: 14, maxHeight: 18, maxWidth: 22)
       .frame(width: 22, alignment: .center)
   }
 
@@ -245,6 +274,7 @@ private struct PetSprite: View {
   let label: String
   let bodyHeight: CGFloat
   let maxHeight: CGFloat
+  let maxWidth: CGFloat?
 
   var body: some View {
     if let data = state.art, let image = UIImage(data: data),
@@ -253,14 +283,15 @@ private struct PetSprite: View {
       let displayedRatio = min(max(ratio, 0.25), 4)
       let height = min(bodyHeight * displayedRatio, maxHeight)
       let width = height * image.size.width / image.size.height
+      let scale = maxWidth.map { min(1, $0 / width) } ?? 1
       Image(uiImage: image)
         .resizable()
         .interpolation(state.artPixelArt == true ? .none : .medium)
-        .frame(width: width, height: height)
+        .frame(width: width * scale, height: height * scale)
         .accessibilityLabel(label)
     } else if let art = PetArt.sprite(packId: state.packId, phase: state.phase,
       petState: state.petState, tier: state.tier, seed: state.completionSeed,
-      bodyHeight: bodyHeight, maxHeight: maxHeight) {
+      bodyHeight: bodyHeight, maxHeight: maxHeight, maxWidth: maxWidth) {
       art.image
         .resizable()
         .interpolation(.none)
@@ -334,7 +365,7 @@ enum PetArt {
   private static var logged: Set<String> = []
 
   static func sprite(packId: String?, phase: String, petState: String?, tier: Int?,
-    seed: String?, bodyHeight: CGFloat, maxHeight: CGFloat) -> PetArtwork? {
+    seed: String?, bodyHeight: CGFloat, maxHeight: CGFloat, maxWidth: CGFloat? = nil) -> PetArtwork? {
     guard let packId, bodyHeight > 0, maxHeight > 0 else {
       note(packId, "pack_not_staged")
       return nil
@@ -373,7 +404,8 @@ enum PetArt {
     // keeps its size across states without shrinking into a shared canvas.
     let window = animation.box.union(pack.body)
     guard window.width > 0, window.height > 0 else { return nil }
-    let scale = min(bodyHeight / pack.body.height, maxHeight / window.height)
+    let widthScale = maxWidth.map { $0 / window.width } ?? .greatestFiniteMagnitude
+    let scale = min(bodyHeight / pack.body.height, maxHeight / window.height, widthScale)
     return PetArtwork(
       image: Image(decorative: cropped, scale: 1),
       draw: CGSize(width: animation.box.width * scale, height: animation.box.height * scale),

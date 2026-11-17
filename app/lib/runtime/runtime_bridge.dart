@@ -777,6 +777,10 @@ class RuntimeBridge {
   /// iOS: whether a local turn is running, which is what asks the system to let it go on.
   Future<void> setTurnRunning(bool running) => _methods.invokeMethod<void>('turnRunning', {'running': running});
 
+  /// iOS: whether the system-owned continued-processing card is allowed.
+  Future<void> setContinuedEnabled(bool enabled) =>
+      _methods.invokeMethod<void>('continuedEnabled', {'enabled': enabled});
+
   /// Deletes the runtime with everything in /root except [keep].
   Future<void> reset({ResetKeep keep = const ResetKeep()}) => _methods.invokeMethod<void>('reset', {'keep': keep.wire});
 

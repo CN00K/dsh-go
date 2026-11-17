@@ -2,6 +2,20 @@
 
 每个版本先中文、后英文。发版时把对应版本的正文（不含版本标题）作为 Release 正文，见 `docs/release.md`。
 
+## 1.1.1 · 2026-11-17
+
+### 中文
+
+- **灵动岛重构。** 以当前选择的宠物为视觉主体，内置宠物和第三方导入的宠物都会沿用各自的动作与比例；紧凑状态收紧宠物和计时器的占位，避免计时器把灵动岛撑得过长。
+- **实时活动设置。** 可以分别开关实时活动，以及离开 App 后继续本地任务并显示系统进度卡片的功能。
+- **验证情况。** 已通过 Xcode 27.2 的 iOS 模拟器 Debug 构建和 Flutter 静态检查；未在真实 iPhone 上完成签名、安装或完整功能验证。
+
+### English
+
+- **Dynamic Island redesign.** The selected pet is now the visual anchor. Built-in and third-party imported pets keep their own poses and proportions, while compact mode uses tighter pet and timer bounds so the timer cannot stretch the island unnecessarily.
+- **Live activity settings.** You can turn live activities on or off separately from continuing a local task after leaving the app and showing the system progress card.
+- **How this version was checked.** The iOS Simulator Debug build passed with Xcode 27.2 and Flutter analysis passed. A real iPhone signing, installation, and full device walkthrough were not completed.
+
 ## 1.1.0 · 2026-11-15
 
 ### 中文
