@@ -1159,7 +1159,7 @@ extension HTTPConnection {
     // (status, pty upgrade) are not stalled behind it.
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { return }
-      var worker = ISHShellExecutor.shared().workerForSession(sessionId, fsContext: fsContext,
+      var worker = ISHShellExecutor.shared().worker(forSession: sessionId, fsContext: fsContext,
                                                              baseEnvText: baseEnvText)
       if worker == nil {
         // The bridge falls back to one-shot /ish/exec for this command.
@@ -1171,8 +1171,8 @@ extension HTTPConnection {
       // context is rebuilt (its jobs die with it — a context change
       // means a new agent run, whose jobs belong to the old run).
       if worker!.fsContext != fsContext {
-        ISHShellExecutor.shared().stopWorkerForSession(sessionId)
-        worker = ISHShellExecutor.shared().workerForSession(sessionId, fsContext: fsContext,
+        ISHShellExecutor.shared().stopWorker(forSession: sessionId)
+        worker = ISHShellExecutor.shared().worker(forSession: sessionId, fsContext: fsContext,
                                                            baseEnvText: baseEnvText)
         if worker == nil {
           self.sendJSON(status: 503, reason: "Service Unavailable",
@@ -1195,7 +1195,7 @@ extension HTTPConnection {
       return
     }
     let pid = pidNumber.intValue
-    guard let worker = ISHShellExecutor.shared().workerForSessionIfPresent(sessionId),
+    guard let worker = ISHShellExecutor.shared().worker(forSessionIfPresent: sessionId),
           worker.isAlive else {
       sendJSON(status: 404, reason: "Not Found", object: ["error": "job_not_found"])
       return
@@ -1217,7 +1217,7 @@ extension HTTPConnection {
       return
     }
     // Idempotent: stopping a session with no worker still reports stopped.
-    ISHShellExecutor.shared().stopWorkerForSession(sessionId)
+    ISHShellExecutor.shared().stopWorker(forSession: sessionId)
     sendJSON(status: 200, reason: "OK", object: ["stopped": true])
   }
 }
@@ -1461,7 +1461,7 @@ private final class WorkerSession {
   private func escalateToWorkerKill(worker: ISHWorkerShell) {
     guard !finished else { return }
     NSLog("ish-loopback: worker run stuck, killing worker session %@", worker.sessionId)
-    ISHShellExecutor.shared().stopWorkerForSession(worker.sessionId)
+    ISHShellExecutor.shared().stopWorker(forSession: worker.sessionId)
     // Backstop: if the death notice does not complete the run within
     // 2 s, complete directly (the run must never hang the session).
     queue.asyncAfter(deadline: .now() + 2) { [weak self] in
