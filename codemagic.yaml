@@ -1,7 +1,7 @@
-# codemagic.yaml — dsh-go iOS unsigned IPA, port/1.1.1-ish
+# codemagic.yaml — dsh-go iOS unsigned IPA, 1.2.0 port (branch port/1.1.1-ish)
 #
 # Place this file at the repository root of the port branch (CN00K/dsh-go,
-# branch port/1.1.1-ish) and run the "ios-stage2-verify" workflow on
+# branch port/1.1.1-ish, 1.2.0 port) and run the "ios-stage2-verify" workflow on
 # Codemagic (mac_mini_m2, team zzuu account as currently used).
 #
 # What it does (1.2.0 engine assembly, D1c step 1: loopback HTTP bridge kept):

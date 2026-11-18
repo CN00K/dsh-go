@@ -154,7 +154,7 @@ Python 的原生文件系统回归见 [guest-mmap.md](../../tooling/ios/engine-s
 - 设备档位：内存低于 3.5 GiB 算低档，其余中档，不用 `high`。
 - 通知只在应用运行时发得出去。锁屏和离开应用后的提醒要 APNs，还没做，所以离开应用后等你确认的请求不会提醒你，回到应用才看得到。
 - 凭据存在 Keychain，只留在本机，不随备份迁移。全新安装时会先清掉上一次安装留下的 Keychain（`AppDelegate.forgetPreviousInstall`）。
-- 包里还带着 `assets/engine/`，隐藏入口不等于移除。发行前要决定去留。
+- 包里还带着 `assets/engine/`，隐藏入口不等于移除。发行前要决定去留，并生成 iOS 的第三方许可清单（见 `app/lib/ui/common/third_party_licenses.dart`）。
 - 发行前需检查安装包内容及 iOS 的第三方许可清单；运行时下载不免除原有许可证和署名要求。
 - 分享扩展靠响应链唤起主应用，这是非公开用法，上架时要重新评估。唤起失败时，内容留在收件箱，下次回到应用时送达。
 

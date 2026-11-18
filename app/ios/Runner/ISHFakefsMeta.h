@@ -56,9 +56,11 @@ int ish_fakefs_meta_remove_path(const char *metaDBPath,
                                 const char *guestPath);
 
 /// Delete dead paths rows whose guest path starts with "//" (left by
-/// pre-R5-3-1 walks, which registered the tree under "//..."), then
-/// delete orphan stats rows (meta.db has no FK cascade). No-op on a
-/// clean database. Returns 0 on success, -1 on any sqlite error.
+/// pre-R5-3-1 walks, which registered the tree under "//..."), and rows
+/// with a trailing slash (e.g. '/root/', matched by GLOB '?*/'); the "/"
+/// row is never deleted. Then delete orphan stats rows (meta.db has no
+/// FK cascade). No-op on a clean database. Returns 0 on success, -1 on
+/// any sqlite error.
 int ish_fakefs_meta_prune_dead_paths(const char *metaDBPath);
 
 /// Recursively register a host directory tree under a guest prefix:

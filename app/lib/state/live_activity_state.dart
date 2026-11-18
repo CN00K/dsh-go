@@ -101,17 +101,6 @@ class PetLiveActivityStatus extends Notifier<AsyncValue<String?>> {
 
 final petLiveActivityChannelProvider = Provider<PetLiveActivityChannel>((ref) => PetLiveActivityChannel());
 
-Future<bool> openLiveActivitySettings(WidgetRef ref) async {
-  if (!iosLiveActivities) return ref.read(notifyChannelProvider).openLiveSettings();
-  try {
-    return await ref.read(petLiveActivityChannelProvider).channel.invokeMethod<bool>('openSettings') ?? false;
-  } on PlatformException {
-    return false;
-  } on MissingPluginException {
-    return false;
-  }
-}
-
 /// The widget extension cannot read Flutter's asset bundle or the app's
 /// sandbox. Stage the sheets in the App Group when possible, and also send a
 /// small inline still so imported pets survive builds where the App Group is

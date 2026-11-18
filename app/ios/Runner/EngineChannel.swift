@@ -554,24 +554,15 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
   private var secrets: [String] = []
 
   private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+  // NOTE (R9-3-2): continued-run has no switch since 1.2.0 (D5c) — upgrading
+  // from 1.1.1 silently re-enables it even for users who had the old master
+  // switch off, and there is no switch to turn it off again. Do not gate
+  // continued.update on the old preference (that would reintroduce R8-4-2).
   private let continued = ContinuedRun()
   // Main-thread sources: a native phone task may begin before Flutter's new
   // conversation has appeared in its session list.
   private var localTurnRunning = false
   private var phoneTaskRunning = false
-  // Startup default for the switch Dart owns: SharedPreferences persists
-  // under `flutter.<key>` in UserDefaults (same as `flutter.app_language`
-  // in NativeMediaChannel, from lib/state/locale_state.dart), so read the
-  // last saved value instead of assuming on. Dart's value is
-  // `notify_enabled && notify_continued_run` (continued_run.dart), and an
-  // absent key means "never touched", which Dart also defaults to on —
-  // hence object(forKey:) as? Bool, not bool(forKey:) (false when absent).
-  private var continuedEnabled: Bool = {
-    let defaults = UserDefaults.standard
-    let enabled = defaults.object(forKey: "flutter.notify_enabled") as? Bool ?? true
-    let continuedRun = defaults.object(forKey: "flutter.notify_continued_run") as? Bool ?? true
-    return enabled && continuedRun
-  }()
   private let pathMonitor = NWPathMonitor()
   private var pathStarted = false
 
@@ -609,7 +600,7 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
       IOSPhoneControl.shared.onTaskActivityChanged = { [weak self] active in
         guard let self else { return }
         self.phoneTaskRunning = active
-        self.continued.update(running: self.continuedEnabled && (self.localTurnRunning || active))
+        self.continued.update(running: self.localTurnRunning || active)
       }
       IOSPetOverlay.shared.onKeepingAliveChanged = { [weak self] active in
         self?.queue.async { [weak self] in
@@ -714,14 +705,7 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
           let running = arguments["running"] as? Bool ?? false
           DispatchQueue.main.async { [self] in
             localTurnRunning = running
-            continued.update(running: continuedEnabled && (running || phoneTaskRunning))
-          }
-          reply(nil)
-        case "continuedEnabled":
-          let enabled = arguments["enabled"] as? Bool ?? true
-          DispatchQueue.main.async { [self] in
-            continuedEnabled = enabled
-            continued.update(running: enabled && (localTurnRunning || phoneTaskRunning))
+            continued.update(running: running || phoneTaskRunning)
           }
           reply(nil)
         case "reset":

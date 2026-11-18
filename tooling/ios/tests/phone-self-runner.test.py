@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -58,6 +59,37 @@ class PhoneBuildContracts(unittest.TestCase):
             self.assertEqual(plistlib.load(stream), {})
         with (ROOT / 'app/ios/PhoneRunner/PhoneRunner.entitlements').open('rb') as stream:
             self.assertIn('com.apple.security.application-groups', plistlib.load(stream))
+
+    def test_runner_keychain_access_groups_pin_suffix_filter_invariant(self):
+        # R11-4-2: AppDelegate.swift suffix filtering assumes Runner.entitlements
+        # has exactly two keychain groups and only the default group ends with
+        # '.' + the bundle ID. The default group is stored literally as the
+        # '$(PRODUCT_BUNDLE_IDENTIFIER)' variable form, so a naive endswith
+        # check on the raw plist value would never match it; pin that form
+        # (or the literal expanded suffix, if it is ever written out).
+        bundle_id = 'io.github.ccch1mneyyy.dshgo'
+        with (ROOT / 'app/ios/Runner/Runner.entitlements').open('rb') as stream:
+            groups = plistlib.load(stream)['keychain-access-groups']
+        self.assertEqual(len(groups), 2, groups)
+        # R14-3-1: '..' can never appear in a legal group (TeamID is 10
+        # alphanumerics; bundle ID and companion suffix have no '..'), so
+        # reject a misspelled double-dot group instead of letting the
+        # suffix branches below silently accept it.
+        self.assertFalse(any('..' in group for group in groups), groups)
+        # R16-3-1: whitespace can never appear in a legal group (TeamID,
+        # bundle ID and companion suffix have no whitespace), so reject it.
+        # Zero-width/format (Cf) characters likewise can never appear in one.
+        self.assertFalse(any(any(ch.isspace() or unicodedata.category(ch) == 'Cf' for ch in group) for group in groups), groups)
+        # R17-3-1: 分隔符位置：前缀后一字符只允许 '$' 或 'i'。
+        self.assertTrue(all(not group.startswith('$(AppIdentifierPrefix)') or (len(group) > len('$(AppIdentifierPrefix)') and group[len('$(AppIdentifierPrefix)')] in '$i') for group in groups), groups)
+        default_groups = [group for group in groups
+                          if group == '$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)'
+                          or group == '$(AppIdentifierPrefix)' + bundle_id
+                          or (group.endswith('.' + bundle_id) and not group.startswith('$(AppIdentifierPrefix)') and '.' not in group[:-len('.' + bundle_id)] and '$(' not in group[:-len('.' + bundle_id)] and '${' not in group[:-len('.' + bundle_id)])
+                          or (group.endswith('.$(PRODUCT_BUNDLE_IDENTIFIER)') and not group.startswith('$(AppIdentifierPrefix)') and '.' not in group[:-len('.$(PRODUCT_BUNDLE_IDENTIFIER)')] and '$(' not in group[:-len('.$(PRODUCT_BUNDLE_IDENTIFIER)')] and '${' not in group[:-len('.$(PRODUCT_BUNDLE_IDENTIFIER)')])]
+        self.assertEqual(len(default_groups), 1, groups)
+        companion_groups = [group for group in groups if group.endswith('.companion-widget')]
+        self.assertEqual(len(companion_groups), 1, groups)
 
     @unittest.skipUnless(shutil.which(os.environ.get('CC', 'cc')), 'C compiler unavailable')
     def test_native_header_remains_a_standalone_c_interface(self):

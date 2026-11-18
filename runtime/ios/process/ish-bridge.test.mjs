@@ -2774,7 +2774,6 @@ test('ishExec/ishWorkerExec reject a throwing or flipping env getter with ISH_IN
     // R7-1-2: pin the single-enumeration invariant itself, not just its
     // consequence (rejection with no request sent).
     assert.equal(reads, 1, 'env must be enumerated exactly once');
-    assert.equal(reads, 1, 'env must be enumerated exactly once');
     assert.equal(requests, 0, 'throwing/flipping env getters must fail before any HTTP is sent');
   } finally {
     clearWorkerState();
