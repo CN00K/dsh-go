@@ -534,9 +534,27 @@ function assertValidExecInput(opts) {
       new Error('ish cwd must be a string'),
       {code: 'ISH_INVALID_ARGV'});
   }
+  // R6-1-1: enumerate env once and reuse the snapshot for both checks
+  // below. A throwing getter used to leak its raw error out of
+  // Object.values (and, on a second enumeration, out of the NUL check),
+  // which spawnIshExec then misclassified as ISH_BRIDGE_UNAVAILABLE.
+  // Any enumeration failure is a client-side argument error. A single
+  // snapshot also keeps the two checks from judging different values
+  // when a stateful getter flips between reads.
+  let envEntries = null;
+  if (opts.env !== undefined && opts.env !== null
+    && typeof opts.env === 'object' && !Array.isArray(opts.env)) {
+    try {
+      envEntries = Object.entries(opts.env);
+    } catch {
+      throw Object.assign(
+        new Error('ish env must be an object mapping strings to strings'),
+        {code: 'ISH_INVALID_ARGV'});
+    }
+  }
   if (opts.env !== undefined && opts.env !== null
     && (typeof opts.env !== 'object' || Array.isArray(opts.env)
-      || Object.values(opts.env).some((v) => typeof v !== 'string'))) {
+      || envEntries.some(([, v]) => typeof v !== 'string'))) {
     throw Object.assign(
       new Error('ish env must be an object mapping strings to strings'),
       {code: 'ISH_INVALID_ARGV'});
@@ -546,7 +564,7 @@ function assertValidExecInput(opts) {
       new Error('ish cwd must not contain NUL bytes'),
       {code: 'ISH_INVALID_ARGV'});
   }
-  if (opts.env && Object.entries(opts.env).some(([k, v]) => k.includes('\0') || (typeof v === 'string' && v.includes('\0')))) {
+  if (envEntries && envEntries.some(([k, v]) => k.includes('\0') || (typeof v === 'string' && v.includes('\0')))) {
     throw Object.assign(
       new Error('ish env keys and values must not contain NUL bytes'),
       {code: 'ISH_INVALID_ARGV'});

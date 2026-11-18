@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const TOKEN = 'test-token-123';
 const PORT_ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
@@ -43,6 +43,7 @@ mkdirSync(process.env.TMPDIR, { recursive: true });
 delete process.env.DSH_SESSION_ID;
 /** Canonical service-file path the bridge reads (HOME/../ish-service.json). */
 const canonicalServiceFile = join(fakeRoot, 'ish-service.json');
+test.after(() => rmSync(fakeRoot, { recursive: true, force: true }));
 
 /**
  * Build the specialized runtime.mjs with the real specialize script
@@ -152,7 +153,7 @@ async function startHoldingServer() {
 }
 
 async function fixture(t) {
-  const { VirtualSubprocessRuntime } = await loadSpecializedRuntime();
+  const { VirtualSubprocessRuntime, tmp } = await loadSpecializedRuntime();
   const work = join(fakeHome, 'workspace');
   const temporaryRoot = join(fakeRoot, 'host-tmp');
   mkdirSync(temporaryRoot, { recursive: true });
@@ -162,6 +163,7 @@ async function fixture(t) {
     server.releaseAll();
     await runtime.dispose().catch(() => {});
     await server.close();
+    rmSync(tmp, { recursive: true, force: true });
   });
   const spawn = (argv, options = {}) => runtime.spawn({
     argv, cwd: work, graceMs: 200,
@@ -198,6 +200,7 @@ async function routerFixture(t) {
     server.releaseAll();
     await router.dispose().catch(() => {});
     await server.close();
+    rmSync(tmp, { recursive: true, force: true });
   });
   const spawn = (argv, options = {}) => router.spawn({
     argv, cwd: work, graceMs: 200,
@@ -312,8 +315,12 @@ function specializeFile(relPath) {
   ].join('\n');
   const tmp = mkdtempSync(join(tmpdir(), 'ios-specialized-file-'));
   const outPath = join(tmp, 'out.js');
-  execFileSync('python3', ['-c', script, SPECIALIZE_PY, join(PORT_ROOT, relPath), outPath, relPath], { stdio: 'pipe' });
-  return readFileSync(outPath, 'utf8');
+  try {
+    execFileSync('python3', ['-c', script, SPECIALIZE_PY, join(PORT_ROOT, relPath), outPath, relPath], { stdio: 'pipe' });
+    return readFileSync(outPath, 'utf8');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -359,7 +366,7 @@ test('N-2 caller: terminal-controller specialization leaves the manual terminal 
   // function instead — it raises KeyError exactly when
   // DIAGNOSTIC_EDITS carries no entry for the controller, whatever
   // the key's quote style.
-  assert.throws(() => specializeFile(TERMINAL_CONTROLLER_FILE), /KeyError/,
+  assert.throws(() => specializeFile(TERMINAL_CONTROLLER_FILE), /KeyError: 'node_modules\/@deepseek-ai\/dsh-api-terminal-controller\/lib\/index\.js'/,
     'diagnostics_for_ios must have no edit for the terminal controller (the manual terminal stays exempt)');
   const stock = readFileSync(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE), 'utf8');
   assert.ok(stock.includes('const { subprocess, workingDirectory } = this.execution(agent);'),
@@ -518,17 +525,21 @@ test('N-2 caller: no module resolves the duplicate controller copy lib/types/ind
   // terminal-controller/ prefix), so nothing is excluded there.
   const hits = [];
   const walk = (dir, skipNodeModules, pattern) => {
+    let scanned = 0;
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (entry.name === '.git' || (skipNodeModules && entry.name === 'node_modules')) continue;
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) walk(path, skipNodeModules, pattern);
-      else if (entry.isFile() && path !== new URL(import.meta.url).pathname
+      if (entry.isDirectory()) scanned += walk(path, skipNodeModules, pattern);
+      else if (entry.isFile() && path !== fileURLToPath(import.meta.url)
         && pattern.test(entry.name)) {
+        scanned++;
         if (readFileSync(path, 'utf8').includes('terminal-controller/lib/types/index.js')) hits.push(path);
       }
     }
+    return scanned;
   };
   walk(PORT_ROOT, true, /\.(mjs|js|cjs|json|ya?ml|py|md)$/);
-  walk(join(PORT_ROOT, 'node_modules'), false, /\.(mjs|js|cjs)$/);
+  const scannedSecondPass = walk(join(PORT_ROOT, 'node_modules'), false, /\.(mjs|js|cjs)$/);
+  assert.ok(scannedSecondPass > 1000, 'the node_modules pass must actually scan installed modules');
   assert.deepEqual(hits, [], 'no repo or installed-module file may reference the duplicate controller copy');
 });

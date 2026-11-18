@@ -65,8 +65,10 @@ static sqlite3_int64 ish_meta_lookup_inode(sqlite3 *db, const char *guestPath) {
 // Returns 1 and fills *modeOut with the recorded st_mode when guestPath
 // has a paths row, 0 when it has none, -1 on a sqlite error. (R5-3-3)
 // The walker uses this single query for both existence and the recorded
-// type bits, so a host-side type change (symlink <-> regular file,
-// file <-> dir) is not silently skipped.
+// mode, so it can compare the directory bit. (R6-3-1) Only the
+// directory bit is ever compared: host lstat cannot express a guest
+// symlink (or fifo/socket/device) — fakefs stores those as plain host
+// files — so symlink <-> file differences are deliberately ignored.
 static int ish_meta_lookup_mode(sqlite3 *db, const char *guestPath,
                                 uint32_t *modeOut) {
     sqlite3_stmt *st = NULL;
@@ -230,12 +232,14 @@ int ish_fakefs_meta_remove_path(const char *metaDBPath,
     if (!db) return -1;
     int rc = -1;
     // Exact path, or any path under it with a "/" boundary ("/foo" removes
-    // "/foo/bar" but not "/foobar").
+    // "/foo/bar" but not "/foobar"). (R6-3-4) paths.path is a BLOB:
+    // substr() on a blob returns a blob, which never equals the text
+    // '?1 || "/"', so the prefix clause needs CAST on both sides.
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(
             db,
             "DELETE FROM paths WHERE path = ?1 "
-            "OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+            "OR CAST(substr(path, 1, length(?1) + 1) AS TEXT) = CAST(?1 AS TEXT) || '/'",
             -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_blob(st, 1, guestPath, (int)strlen(guestPath),
                           SQLITE_TRANSIENT);
@@ -260,6 +264,36 @@ int ish_fakefs_meta_remove_path(const char *metaDBPath,
             rc = -1;
         }
     }
+    sqlite3_close(db);
+    return rc;
+}
+
+// (R6-3-3) Delete dead paths rows left by pre-R5-3-1 walks, which
+// registered the tree under "//..." (the old walker joined "/" +
+// "bin" as "//bin"), then drop stats rows nothing references (same
+// cleanup as ish_fakefs_meta_remove_path; meta.db has no FK cascade).
+// paths.path is a BLOB: GLOB without CAST never matches a blob row,
+// so the pattern match must cast the path to TEXT first. A no-op on
+// a clean database (no "//" rows, no orphans).
+int ish_fakefs_meta_prune_dead_paths(const char *metaDBPath) {
+    if (!metaDBPath) return -1;
+    sqlite3 *db = ish_meta_open(metaDBPath);
+    if (!db) return -1;
+    int rc = -1;
+    char *errmsg = NULL;
+    if (sqlite3_exec(db,
+                     "DELETE FROM paths WHERE CAST(path AS TEXT) GLOB '//*'",
+                     NULL, NULL, &errmsg) == SQLITE_OK &&
+        sqlite3_exec(db,
+                     "DELETE FROM stats WHERE inode NOT IN "
+                     "(SELECT inode FROM paths)",
+                     NULL, NULL, &errmsg) == SQLITE_OK) {
+        rc = 0;
+    } else {
+        NSLog(@"ISHFakefsMeta: prune dead paths failed: %s",
+              errmsg ? errmsg : "(null)");
+    }
+    if (errmsg) sqlite3_free(errmsg);
     sqlite3_close(db);
     return rc;
 }
@@ -301,15 +335,22 @@ static int ish_meta_register_tree(const char *metaDBPath,
     // recursed into, so missing children are INSERTed below it.
     // register_path itself is untouched — bind mounts rely on its
     // UPDATE semantics (ISHKernel.m).
+    // (R6-3-1) The one exception is a row recorded as a non-directory
+    // whose host entry is a directory (see below): a host directory
+    // is always a guest directory, so that UPDATE corrects a real
+    // file -> dir swap. Every other type difference is skipped —
+    // host lstat cannot tell a guest symlink from a regular file,
+    // so comparing the full S_IFMT would rewrite all 335 factory
+    // symlink rows as regular files.
     // (R5-3-1) The root node of a "/" walk is guest path "/" itself,
     // which the kernel never looks up (it uses "" for the root, as in
     // the shipped meta.db), so do not register it; still recurse below.
     // (R5-3-2) A lookup error (-1) fails the walk instead of falling
     // through to register_path: a transient error (e.g. SQLITE_BUSY)
     // followed by a successful register_path retry would UPDATE a
-    // factory row. (R5-3-3) A row whose recorded type bits differ from
-    // the host lstat type is not skipped — it falls through to
-    // register_path, whose UPDATE corrects the type.
+    // factory row. (R6-3-1) A recorded row is re-registered only
+    // when the host entry is a directory and the recorded mode is
+    // not — the only direction host lstat can prove.
     if (!(rel[0] == '\0' && strcmp(guestPath, "/") == 0)) {
         uint32_t recordedMode = 0;
         int exists = ish_meta_path_mode(metaDBPath, guestPath, &recordedMode);
@@ -317,7 +358,7 @@ static int ish_meta_register_tree(const char *metaDBPath,
             return -1;
         }
         if (exists == 0 ||
-            (recordedMode & S_IFMT) != (st.st_mode & S_IFMT)) {
+            (!S_ISDIR(recordedMode) && S_ISDIR(st.st_mode))) {
             if (ish_fakefs_meta_register_path(metaDBPath, guestPath,
                                               (uint32_t)st.st_mode) != 0) {
                 return -1;
@@ -354,7 +395,18 @@ int ish_fakefs_meta_register_subtree(const char *metaDBPath,
                                      const char *hostRoot,
                                      const char *guestPrefix) {
     if (!metaDBPath || !hostRoot || !guestPrefix || guestPrefix[0] != '/') return -1;
-    return ish_meta_register_tree(metaDBPath, hostRoot, guestPrefix, "");
+    // (R6-3-2) Normalize the prefix once: strip trailing slashes, so
+    // "//" and "/root/" cannot produce dead rows ("//..." / "/root/"). "/" stays
+    // "/" (length 1 is never stripped); the walker still joins it
+    // correctly via the R5-3-1 trailing-slash rule.
+    char normalized[PATH_MAX];
+    size_t len = strlen(guestPrefix);
+    if (len >= sizeof(normalized)) return -1;
+    memcpy(normalized, guestPrefix, len + 1);
+    while (len > 1 && normalized[len - 1] == '/') {
+        normalized[--len] = '\0';
+    }
+    return ish_meta_register_tree(metaDBPath, hostRoot, normalized, "");
 }
 
 int ish_fakefs_meta_path_exists(const char *metaDBPath,

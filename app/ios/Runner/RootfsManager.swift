@@ -620,6 +620,15 @@ struct RootfsManager {
             }
             try fm.moveItem(at: src, to: metaDBURL)
             NSLog("RootfsManager: 已补回缺失的 meta.db")
+            // (R6-3-3) Pre-R5-3-1 walks left "//..." dead rows in
+            // meta.db; prune them (and their orphan stats) before
+            // re-registering, so the walk below does not inherit them.
+            let pruned = metaDBURL.path.withCString { dbPath in
+                ish_fakefs_meta_prune_dead_paths(dbPath)
+            }
+            guard pruned == 0 else {
+                throw RootfsError.ioError("meta.db 清理死行失败 (rc=\(pruned))")
+            }
             // (M-8) The shipped meta.db only registers factory files;
             // files added after install (apk packages, user writes to
             // /root and /etc) exist on disk but have no paths+stats
@@ -690,6 +699,14 @@ struct RootfsManager {
         if exists == 1 { return }
         if exists == 0 {
             NSLog("RootfsManager: meta.db 缺少 /bin/sh，重新登记整棵 data/ 树")
+            // (R6-3-3) Prune "//..." dead rows left by pre-R5-3-1
+            // walks (and their orphan stats) before re-registering.
+            let pruned = metaDBPath.withCString { dbPath in
+                ish_fakefs_meta_prune_dead_paths(dbPath)
+            }
+            guard pruned == 0 else {
+                throw RootfsError.ioError("meta.db 清理死行失败 (rc=\(pruned))")
+            }
             let rc = metaDBPath.withCString { dbPath in
                 dataURL.path.withCString { dataPath in
                     ish_fakefs_meta_register_subtree(dbPath, dataPath, "/")

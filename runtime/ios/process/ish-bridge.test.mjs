@@ -2689,6 +2689,9 @@ test('ishExec/ishWorkerExec reject non-string cwd/env with ISH_INVALID_ARGV (R5-
     await assert.rejects(ishExec({command: 'echo hi', env: 'xx', serviceFile}), invalid);
     await assert.rejects(ishExec({command: 'echo hi', env: 42, serviceFile}), invalid);
     await assert.rejects(ishExec({command: 'echo hi', env: Symbol('x'), serviceFile}), invalid);
+    // R6-1-3: probe morphologies the R5-1-1 test did not pin down.
+    await assert.rejects(ishExec({command: 'echo hi', cwd: Symbol('x'), serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: [], serviceFile}), invalid);
     await assert.rejects(
       ishWorkerExec({command: 'echo hi', cwd: 42, sessionId: 'sess-r5-1-1', serviceFile}), invalid);
     await assert.rejects(
@@ -2720,7 +2723,55 @@ test('ishWorkerExec rejects a well-formed argv with ISH_INVALID_ARGV (R5-1-2)', 
     const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
     await assert.rejects(
       ishWorkerExec({command: 'echo hi', argv: ['rg'], sessionId: 'sess-r5-1-2', serviceFile}), invalid);
+    // R6-1-3: probe morphologies the R5-1-2 test did not pin down — the
+    // empty argv (the only empty shape the helper lets through) and an
+    // argv with no command (the helper skips the command check then).
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', argv: [], sessionId: 'sess-r5-1-2', serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({argv: ['rg'], sessionId: 'sess-r5-1-2', serviceFile}), invalid);
     assert.equal(requests, 0, 'argv must fail before any HTTP is sent');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// R6-1-1: an env with a throwing getter must fail as ISH_INVALID_ARGV,
+// not leak the getter's raw error (which spawnIshExec would misclassify
+// as ISH_BRIDGE_UNAVAILABLE). A stateful getter must also be judged on
+// a single snapshot: one that reads a NUL-bearing value first and a
+// clean value second used to slip past the guard (first enumeration)
+// and the NUL check (second enumeration) — with one enumeration both
+// checks see the same value and reject it.
+test('ishExec/ishWorkerExec reject a throwing or flipping env getter with ISH_INVALID_ARGV (R6-1-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
+    const throwingEnv = {};
+    Object.defineProperty(throwingEnv, 'A', {
+      enumerable: true,
+      get() { throw new Error('getter boom'); },
+    });
+    await assert.rejects(ishExec({command: 'echo hi', env: throwingEnv, serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', env: throwingEnv, sessionId: 'sess-r6-1-1', serviceFile}), invalid);
+    let reads = 0;
+    const flippingEnv = {};
+    Object.defineProperty(flippingEnv, 'A', {
+      enumerable: true,
+      get() { reads++; return reads === 1 ? 'bad\0x' : 'ok'; },
+    });
+    await assert.rejects(ishExec({command: 'echo hi', env: flippingEnv, serviceFile}), invalid);
+    assert.equal(requests, 0, 'throwing/flipping env getters must fail before any HTTP is sent');
   } finally {
     clearWorkerState();
     await close();

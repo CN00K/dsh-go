@@ -55,14 +55,28 @@ int ish_fakefs_meta_ensure_parents(const char *metaDBPath,
 int ish_fakefs_meta_remove_path(const char *metaDBPath,
                                 const char *guestPath);
 
+/// Delete dead paths rows whose guest path starts with "//" (left by
+/// pre-R5-3-1 walks, which registered the tree under "//..."), then
+/// delete orphan stats rows (meta.db has no FK cascade). No-op on a
+/// clean database. Returns 0 on success, -1 on any sqlite error.
+int ish_fakefs_meta_prune_dead_paths(const char *metaDBPath);
+
 /// Recursively register a host directory tree under a guest prefix:
 /// every entry found under `hostRoot` (via lstat, so symlinks keep
 /// their link mode) is registered at `guestPrefix` + relative path,
 /// with its real st_mode — but only when it has no row yet: an entry
 /// already in meta.db keeps its recorded mode, so re-registration
 /// never clobbers the shipped modes (+x bits, symlink type) with the
-/// flattened host mode. `guestPrefix` must be absolute (e.g.
-/// "/home/workspace"); `hostRoot` must be an absolute host path.
+/// flattened host mode. The one exception (R6-3-1) is a row recorded
+/// as a non-directory whose host entry is a directory: a host
+/// directory is always a guest directory, so that row is updated to
+/// a directory. No other recorded type is ever overwritten, because
+/// host lstat cannot express guest types: fakefs stores symlinks
+/// (and fifo/socket/device nodes) as plain host files and only the
+/// meta.db row carries the guest type (see GuestRootfsArchive:
+/// "No symlinks are made on the host."). `guestPrefix` must be an
+/// absolute, normalized path (no trailing slash; the root is "/");
+/// `hostRoot` must be an absolute host path.
 /// Returns 0 on success, -1 on the first error encountered (entries
 /// registered before the failure stay registered).
 int ish_fakefs_meta_register_subtree(const char *metaDBPath,
