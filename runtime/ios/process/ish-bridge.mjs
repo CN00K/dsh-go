@@ -234,6 +234,15 @@ function hostRoots() {
     // -> <AppSupport>/iSH/rootfs/data. The old two-level climb landed
     // under <AppSupport>/runtime/iSH/rootfs/data, which does not exist.
     data: join(home, '..', '..', '..', 'iSH', 'rootfs', 'data'),
+    // The engine's own runtime tree (RuntimeInstaller base/tree):
+    // the DSH engine runs from here, so every path under it is
+    // already a host path — never a guest path. The C++ host writes
+    // patch plugin names from here and Swift writes the phone plugin
+    // name from here; toHost() must leave them alone instead of
+    // mapping them under the rootfs data dir (build 46: the doubled
+    // path broke all six patch plugins, so no session could start).
+    // Same three-level climb as `data` above.
+    runtime: join(home, '..', '..', '..', 'dsh-runtime', 'tree'),
     serviceFile: join(home, '..', 'ish-service.json'),
   };
 }
@@ -289,9 +298,11 @@ export function toHost(guestPath) {
   }
   // Already a host path (the engine's cwd and other host-side paths
   // are passed through here too): leave it alone. Guest paths never
-  // start with a host root.
-  for (const root of [roots.workspace, roots.data, roots.tmp, roots.home]) {
-    if (relativeTo(guestPath, root) !== null) return guestPath;
+  // start with a host root. The runtime tree is a host root too: the
+  // engine's patch plugin names live under it, and mapping them
+  // under the rootfs data dir breaks every plugin import (build 46).
+  for (const root of [roots.workspace, roots.data, roots.tmp, roots.home, roots.runtime]) {
+    if (underHostRoot(guestPath, root)) return guestPath;
   }
   const relWorkspace = relativeTo(guestPath, GUEST_WORKSPACE);
   if (relWorkspace !== null) return join(roots.workspace, relWorkspace);
@@ -315,6 +326,21 @@ function relativeTo(path, base) {
   const prefix = resolvedBase.endsWith(sep) ? resolvedBase : resolvedBase + sep;
   if (!resolvedPath.startsWith(prefix)) return null;
   return resolvedPath.slice(prefix.length);
+}
+
+/**
+ * Whether `path` lies under host `root`. iOS spells the app container
+ * two ways: /var/... (Swift / FileManager) and /private/var/...
+ * (canonical C++). /var is a symlink to /private/var, so the same host
+ * dir must match under either spelling — compare with an optional
+ * /private prefix stripped from both sides. A genuine guest path can
+ * never match: host roots all carry the container UUID plus
+ * `Library/Application Support/`, which no guest path has.
+ */
+function underHostRoot(path, root) {
+  if (relativeTo(path, root) !== null) return true;
+  const stripPrivate = (value) => value.startsWith('/private/') ? value.slice('/private'.length) : value;
+  return relativeTo(stripPrivate(path), stripPrivate(root)) !== null;
 }
 
 /** Join guest path segments with '/' (guest is always POSIX). */

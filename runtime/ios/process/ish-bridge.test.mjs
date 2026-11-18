@@ -146,6 +146,43 @@ test('toHost maps guest paths into the rootfs data dir', () => {
   assert.equal(toHost(join(fakeData, 'etc', 'passwd')), join(fakeData, 'etc', 'passwd'));
 });
 
+test('toHost leaves runtime-tree host paths alone (build 46: patch plugin names)', () => {
+  // The engine's patch plugin names live under the runtime tree
+  // (RuntimeInstaller base/tree); mapping them under the rootfs data
+  // dir doubled the path and broke all six patch plugin imports, so
+  // no session could start. They must pass through unchanged.
+  const fakeRuntime = join(fakeHome, '..', '..', '..', 'dsh-runtime', 'tree');
+  const ohos = join(fakeRuntime, 'runtime', 'ohos', 'process', 'index.mjs');
+  const bridge = join(fakeRuntime, 'runtime', 'bridge', 'dsh-go-bridge', 'lib', 'index.js');
+  const phone = join(fakeRuntime, 'runtime', 'ios', 'phone', 'plugin.mjs');
+  assert.equal(toHost(ohos), ohos);
+  assert.equal(toHost(bridge), bridge);
+  assert.equal(toHost(phone), phone);
+  // A guest path that merely shares the tail is still a guest path.
+  assert.equal(toHost('/runtime/ohos/process/index.mjs'), join(fakeData, 'runtime', 'ohos', 'process', 'index.mjs'));
+});
+
+test('toHost leaves runtime-tree paths alone under the /var spelling too', () => {
+  // iOS spells the app container /var/... (Swift / FileManager) and
+  // /private/var/... (canonical C++); the C++ patch names use the
+  // latter, the Swift phone plugin name the former. Both must pass
+  // through (build 46: only the /private/var form matched, so the
+  // phone plugin stayed doubled).
+  const savedHome = process.env.HOME;
+  const savedTmp = process.env.TMPDIR;
+  try {
+    process.env.HOME = '/private/var/mobile/Containers/Data/Application/UUID/Library/Application Support/runtime/rootfs/root';
+    process.env.TMPDIR = '/private/var/mobile/Containers/Data/Application/UUID/Library/Caches/ohos-process';
+    const canonical = '/private/var/mobile/Containers/Data/Application/UUID/Library/Application Support/dsh-runtime/tree/runtime/ohos/process/index.mjs';
+    const swift = '/var/mobile/Containers/Data/Application/UUID/Library/Application Support/dsh-runtime/tree/runtime/ios/phone/plugin.mjs';
+    assert.equal(toHost(canonical), canonical);
+    assert.equal(toHost(swift), swift);
+  } finally {
+    process.env.HOME = savedHome;
+    process.env.TMPDIR = savedTmp;
+  }
+});
+
 test('toHost throws for kernel-virtual guest paths', () => {
   // /proc, /sys and /dev have no file in the rootfs; the shell is the
   // only way to read them. The error must say so (P2-9 hint).
