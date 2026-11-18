@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <mutex>
 #if defined(__APPLE__)
 #include <cstdio>
 #include <sys/sysctl.h>
@@ -381,26 +382,41 @@ struct LifecycleReader {
   DshReadHostLifecycleV1 read = nullptr;
   DshHostPhoneV1 phone = nullptr;
 };
-LifecycleReader& HostReader() { static thread_local LifecycleReader reader; return reader; }
+// The host snapshot read is mutex-protected in the host, so it is safe from
+// any thread. The reader used to be thread_local (bound on the main engine
+// thread), but on iOS the engine app runs in the engine worker thread,
+// where the thread-local reader was never bound: the snapshot always threw
+// "belongs to the main engine", the lifecycle ack never validated, and the
+// coordinator paused all tool dispatch. Share one reader process-wide.
+// `bound`/`read` are written once by BindPublicationHost on the engine
+// thread before the app thread starts; the lazy dlopen/phone resolution
+// below is guarded by HostReaderMutex().
+LifecycleReader& HostReader() { static LifecycleReader reader; return reader; }
+std::mutex& HostReaderMutex() { static std::mutex mutex; return mutex; }
 
 napi_value GetHostLifecycleSnapshot(napi_env env, napi_callback_info) {
-  if (!HostReader().bound) {
-    napi_throw_error(env,"ERR_OHOS_LIFECYCLE_MAIN_THREAD","Host lifecycle belongs to the main engine");return nullptr;
-  }
-  if (!HostReader().read && !HostReader().library.empty()) {
-    // Never load another owner. This must resolve the Ark module already hosting this engine.
-    void* handle=dlopen(HostReader().library.c_str(),RTLD_NOW|RTLD_NOLOAD|RTLD_LOCAL);
-    if(handle) {
-      auto read=reinterpret_cast<DshReadHostLifecycleV1>(dlsym(handle,"dsh_host_lifecycle_snapshot_v1"));
-      Dl_info info{};char actual[PATH_MAX];
-      if(read && dladdr(reinterpret_cast<void*>(read),&info) && info.dli_fname &&
-          realpath(info.dli_fname,actual) && HostReader().library==actual) {
-        HostReader().handle=handle;HostReader().read=read;
-      } else dlclose(handle);
+  DshReadHostLifecycleV1 read = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(HostReaderMutex());
+    if (!HostReader().bound) {
+      napi_throw_error(env,"ERR_OHOS_LIFECYCLE_MAIN_THREAD","Host lifecycle belongs to the main engine");return nullptr;
     }
+    if (!HostReader().read && !HostReader().library.empty()) {
+      // Never load another owner. This must resolve the Ark module already hosting this engine.
+      void* handle=dlopen(HostReader().library.c_str(),RTLD_NOW|RTLD_NOLOAD|RTLD_LOCAL);
+      if(handle) {
+        auto read=reinterpret_cast<DshReadHostLifecycleV1>(dlsym(handle,"dsh_host_lifecycle_snapshot_v1"));
+        Dl_info info{};char actual[PATH_MAX];
+        if(read && dladdr(reinterpret_cast<void*>(read),&info) && info.dli_fname &&
+            realpath(info.dli_fname,actual) && HostReader().library==actual) {
+          HostReader().handle=handle;HostReader().read=read;
+        } else dlclose(handle);
+      }
+    }
+    read = HostReader().read;
   }
   DshHostLifecycleSnapshotV1 data{};
-  if(!HostReader().read || HostReader().read(&data,sizeof(data))!=0 || data.version!=1 || data.size!=sizeof(data) ||
+  if(!read || read(&data,sizeof(data))!=0 || data.version!=1 || data.size!=sizeof(data) ||
       data.engine_generation>9007199254740991ULL || data.owner_generation>9007199254740991ULL ||
       data.revision>9007199254740991ULL || data.grant_generation>9007199254740991ULL ||
       data.now_ms>9007199254740991LL || data.deadline_ms>9007199254740991LL || data.drain_at_ms>9007199254740991LL) {
@@ -448,13 +464,18 @@ napi_value PhoneCall(napi_env env,napi_callback_info info) {
   const auto operation=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data));
   // This also performs the main-registration-thread and fixed NOLOAD checks.
   if(!GetHostLifecycleSnapshot(env,nullptr))return nullptr;
-  if(!HostReader().phone && HostReader().handle) {
-    auto call=reinterpret_cast<DshHostPhoneV1>(dlsym(HostReader().handle,"dsh_host_phone_v1"));
-    Dl_info symbol{};char actual[PATH_MAX];
-    if(call&&dladdr(reinterpret_cast<void*>(call),&symbol)&&symbol.dli_fname&&
-        realpath(symbol.dli_fname,actual)&&HostReader().library==actual)HostReader().phone=call;
+  DshHostPhoneV1 phone = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(HostReaderMutex());
+    if(!HostReader().phone && HostReader().handle) {
+      auto call=reinterpret_cast<DshHostPhoneV1>(dlsym(HostReader().handle,"dsh_host_phone_v1"));
+      Dl_info symbol{};char actual[PATH_MAX];
+      if(call&&dladdr(reinterpret_cast<void*>(call),&symbol)&&symbol.dli_fname&&
+          realpath(symbol.dli_fname,actual)&&HostReader().library==actual)HostReader().phone=call;
+    }
+    phone = HostReader().phone;
   }
-  if(!HostReader().phone){napi_throw_error(env,"ERR_OHOS_PHONE_NATIVE","Trusted phone host unavailable");return nullptr;}
+  if(!phone){napi_throw_error(env,"ERR_OHOS_PHONE_NATIVE","Trusted phone host unavailable");return nullptr;}
   DshPhoneInputV1 in{};in.size=sizeof(in);in.version=1;in.operation=operation;std::string payload;
   if(operation==DshPhoneBind) {
     if(count!=1||!PhoneText(env,args[0],in.engine_id,sizeof(in.engine_id)))return nullptr;
@@ -477,7 +498,7 @@ napi_value PhoneCall(napi_env env,napi_callback_info info) {
   DshPhoneSnapshotV1 snapshot{};
   // Allocate boolean/null handles before a native state mutation.
   napi_value yes,no,nil;if(napi_get_boolean(env,true,&yes)!=napi_ok||napi_get_boolean(env,false,&no)!=napi_ok||napi_get_null(env,&nil)!=napi_ok)return nullptr;
-  const int answer=HostReader().phone(&in,&snapshot);
+  const int answer=phone(&in,&snapshot);
   if(answer<0){napi_throw_error(env,"ERR_OHOS_PHONE_NATIVE","Phone native operation unavailable");return nullptr;}
   if(operation!=DshPhoneSnapshot)return answer==2?nil:(answer?yes:no);
   if(answer!=1||snapshot.size!=sizeof(snapshot)||snapshot.version!=1||snapshot.generation>9007199254740991ULL||
@@ -547,6 +568,7 @@ napi_module publication_module = {
 
 void BindPublicationHost(DshReadHostLifecycleV1 read) {
   clone_owner_thread = true;
+  std::lock_guard<std::mutex> lock(HostReaderMutex());
   HostReader().bound = true;
   HostReader().read = read;
 }

@@ -1,7 +1,9 @@
-import { isMainThread } from 'node:worker_threads';
 const failure = () => Object.assign(new Error('Trusted native host lifecycle is unavailable'), { code: 'ERR_OHOS_LIFECYCLE_NATIVE' });
 export function readNativeHost() {
-  if (!isMainThread) throw failure();
+  // No main-thread gate: on iOS the engine app runs in the engine worker
+  // thread, and the native snapshot read is mutex-protected in the host
+  // (publication_binding.cc shares one reader process-wide). Keeping the
+  // gate here would fail every lifecycle ack and pause all tool dispatch.
   const binding = process._linkedBinding('dsh_ohos_publication');
   if (typeof binding.getHostLifecycleSnapshot !== 'function') throw failure();
   return validateHostSnapshot(binding.getHostLifecycleSnapshot());

@@ -283,13 +283,18 @@ struct RootfsManager {
 
     /// (Build 40) Restores ONLY the critical guest files that are
     /// missing (or truncated) from the bundled zip, in place, without
-    /// touching meta.db and without deleting anything. Safe to call
-    /// while the kernel is booted: the kernel reads guest files on
-    /// demand through fakefs, so restoring the missing files lets the
-    /// next shell spawn succeed. The shipped meta.db already records
-    /// the correct modes (bin/sh is a symlink, busybox/ld-musl are
-    /// 0755), so it is left alone — replacing it under a running
-    /// kernel would risk SQLite inconsistency.
+    /// deleting anything. Safe to call while the kernel is booted: the
+    /// kernel reads guest files on demand through fakefs, so restoring
+    /// the missing files lets the next shell spawn succeed. The shipped
+    /// meta.db already records the correct modes (bin/sh is a symlink,
+    /// busybox/ld-musl are 0755), so an existing one is left alone —
+    /// replacing it under a running kernel would risk SQLite
+    /// inconsistency. (Build 48) A missing meta.db is restored too:
+    /// reset deletes the whole rootfs tree, and sqlite3_open uses
+    /// SQLITE_OPEN_READWRITE without CREATE, so an absent meta.db fails
+    /// every bind-mount registration ("unable to open database file")
+    /// until a cold reinstall; an absent database leaves the kernel
+    /// with no metadata to be inconsistent with.
     ///
     /// This is the recovery for a tree that was deleted while booted
     /// (e.g. the user pressed Reset while the kernel was up): the old
@@ -312,7 +317,8 @@ struct RootfsManager {
             }
             if needsRestore { missing.append(rel) }
         }
-        guard !missing.isEmpty else { return }
+        let metaMissing = !fm.fileExists(atPath: metaDBURL.path)
+        guard !missing.isEmpty || metaMissing else { return }
         NSLog("RootfsManager: 内核运行中，补回缺失的关键文件：%@", missing.joined(separator: ", "))
         let zip = try resolveZipURL(nil)
         let zipData = try Data(contentsOf: zip)
@@ -338,6 +344,14 @@ struct RootfsManager {
         }
         guard criticalFilesPresent() else {
             throw RootfsError.ioError("补回后校验失败：关键文件仍缺失或截断")
+        }
+        if metaMissing {
+            let src = tmp.appendingPathComponent("meta.db")
+            guard fm.fileExists(atPath: src.path) else {
+                throw RootfsError.ioError("zip 内缺失 meta.db，无法补回")
+            }
+            try fm.moveItem(at: src, to: metaDBURL)
+            NSLog("RootfsManager: 已补回缺失的 meta.db")
         }
         NSLog("RootfsManager: 关键文件已补回，内核无需重启")
     }

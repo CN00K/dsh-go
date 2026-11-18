@@ -5,10 +5,12 @@
 // virtual runtime speaks a different handle shape (collected readers,
 // done/started promises, terminate/waitForExit/start). This module
 // converts between the two. It is iOS-only, imported by the
-// specialize-runtime.py edits to runtime/ohos/process/runtime.mjs, and
-// returns undefined from both entry points when the bridge is not
-// installed — then the virtual shell / virtual PTY error run exactly as
-// in stock 1.1.1.
+// specialize-runtime.py edits to runtime/ohos/process/runtime.mjs. The
+// adapter installs the bridge lazily in the calling thread on first use
+// (the preload only installs it on the main thread, while the engine app
+// runs in the engine worker thread), and returns undefined from both
+// entry points only for non-guest argv — then the virtual shell /
+// virtual PTY error run exactly as in stock 1.1.1.
 //
 // Confinement: the ticket unwrap in VirtualSubprocessRuntime.spawn has
 // already run before this adapter is called (confine() validated the
@@ -22,12 +24,23 @@ import { basename } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { OutputCollector } from '@deepseek-ai/dsh-subprocess-local/output';
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess';
-import { ISH_RUNNER_COMMAND, spawnIshExec, ishPtySpawn } from './ish-bridge.mjs';
+import { ISH_RUNNER_COMMAND, spawnIshExec, ishPtySpawn, installIshBridge } from './ish-bridge.mjs';
 
 const ISH_PTY_SYMBOL = Symbol.for('dsh.ish.pty');
 
-// True when installIshBridge() has run (preload.mjs, main thread only).
+// True when installIshBridge() has run in this thread. The preload installs
+// the bridge on the main thread only, but the engine app (and therefore this
+// adapter) runs in the engine worker thread, where that install never
+// landed — on device both entry points bailed to the virtual shell /
+// virtual PTY error even though the loopback was up. Install lazily on
+// first use, in the calling thread; installIshBridge never throws, and
+// the guard keeps each thread to a single install.
 const bridgeInstalled = () => globalThis[ISH_PTY_SYMBOL] !== undefined;
+const ensureBridge = () => {
+  if (bridgeInstalled()) return true;
+  installIshBridge();
+  return bridgeInstalled();
+};
 
 // Only agent bash goes to the guest: ['bash', '-c', command]. Anything
 // else (rg/git/node workers, 'sh', node scripts) stays virtual.
@@ -46,7 +59,7 @@ const isBashArgv = (argv) => Array.isArray(argv) && argv.length === 3
  * bytes the bridge only collects for 25ms.
  */
 export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => {} } = {}) {
-  if (!bridgeInstalled() || !isBashArgv(argv)) return undefined;
+  if (!ensureBridge() || !isBashArgv(argv)) return undefined;
   if (spec.stdio.control === 'pipe' || spec.stdio.stdin === 'pipe') return undefined;
 
   const collected = {};
@@ -186,7 +199,7 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
  * a live terminal for inactivity.
  */
 export function ishSpawnTerminalFor(spec) {
-  if (!bridgeInstalled()) return undefined;
+  if (!ensureBridge()) return undefined;
   const argv = spec?.argv;
   if (!Array.isArray(argv) || !argv.length) return undefined;
   const name = basename(argv[0]);
