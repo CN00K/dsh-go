@@ -381,13 +381,19 @@ struct RootfsManager {
         let root = dataURL.appendingPathComponent("root", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         // (R3-N-1) /root is 0700 in the factory image, but the host
-        // default is 0755 — and the register_subtree below rewrites
-        // meta.db from the host mode, so a 0755 host dir would silently
-        // relax /root. Enforce 0700 even when the dir already existed
+        // default is 0755 — and the register_subtree below records
+        // the host mode for rows it INSERTs, so a 0755 host dir
+        // would silently relax /root when its row is missing.
+        // Enforce 0700 even when the dir already existed
         // (createDirectory's attributes only apply on creation). Best
         // effort: a chmod failure degrades to today's behavior rather
         // than failing the whole restore.
-        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        // (R4-3-4) Log the failure instead of silently dropping it.
+        do {
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        } catch {
+            NSLog("RootfsManager: /root 0700 设置失败（继续恢复）：%@", error.localizedDescription)
+        }
         guard let enumerator = fm.enumerator(atPath: backup.path) else {
             throw RootfsError.ioError("恢复 /root 备份失败：无法枚举备份 \(backup.lastPathComponent)")
         }
@@ -451,11 +457,19 @@ struct RootfsManager {
     /// zip's external attrs do NOT carry them (the build tree is
     /// flattened to 02770 before zipping, verified against the 11-14
     /// product zip), so they are pinned here instead of read from the
-    /// zip. (R3-N-1) /root (0700) is not listed: it is enforced in
-    /// restoreLatestUserRootBackup, the only path that rebuilds it.
+    /// zip. (R4-3-2/R4-3-3) The table also lists "proc" and
+    /// "var/empty" (0555) and "root" (0700), all from the shipped
+    /// meta.db: the sweep rebuilds data/root on its own, and
+    /// restoreLatestUserRootBackup is a no-op when no backup exists,
+    /// so the table is what closes the no-backup path. The 0700
+    /// enforcement in restoreLatestUserRootBackup stays (idempotent,
+    /// runs after the sweep).
     private static let factoryDirModes: [String: Int] = [
         "tmp": 0o1777,
         "var/tmp": 0o1777,
+        "proc": 0o555,
+        "var/empty": 0o555,
+        "root": 0o700,
     ]
 
     /// critical files: a reset-while-booted deletes the whole tree,
@@ -551,12 +565,19 @@ struct RootfsManager {
                     // that differ from the host default 0755 (/tmp and
                     // /var/tmp are 1777). Applied whether the dir was
                     // just created or already existed: the M-8
-                    // re-registration below rewrites meta.db from the
-                    // host lstat mode, so a pre-existing 0755 host dir
-                    // would lose the sticky bit the same way. Best
+                    // re-registration below records the host lstat
+                    // mode for rows it INSERTs, so a pre-existing
+                    // 0755 host dir would lose the sticky bit the
+                    // same way when its row is missing. Best
                     // effort, as in restoreLatestUserRootBackup.
+                    // (R4-3-4) Log the failure instead of silently
+                    // dropping it.
                     if let mode = factoryDirModes[rel] {
-                        try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: dst.path)
+                        do {
+                            try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: dst.path)
+                        } catch {
+                            NSLog("RootfsManager: 恢复目录 %@ 模式设置失败（继续恢复）：%@", rel, error.localizedDescription)
+                        }
                     }
                     continue
                 }

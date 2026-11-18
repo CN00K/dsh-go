@@ -64,7 +64,8 @@ export class BoundaryCoordinator {
   #lastPause = false;
   // R3-1: the last #pause() record never landed (transient journal failure).
   // #refreshNative retries it once while the target stays paused; #pause()
-  // clears this on success and re-sets it in its catch on failure.
+  // clears this once the record lands and re-sets it in its catch only for
+  // a non-fatal failure before the record landed (R4-N-1/R4-N-2).
   #pauseRetryPending = false;
   #manualPaused = false;
   #lastManualPaused = false;
@@ -462,12 +463,20 @@ export class BoundaryCoordinator {
     const version = ++this.#controlVersion;
     const manualPaused = this.#manualPaused;
     this.#gate ??= Promise.withResolvers();
+    // R4-N-2: set once #record lands, so the catch below can tell a record
+    // failure (retry needed) from a later flush() failure (the record is
+    // already on disk; a retry would append a duplicate pause record).
+    let recorded = false;
     const work = this.#controlTail.then(async () => {
       await this.#record({ kind: 'pause', bootId: this.bootId, manualPaused });
+      // R3-1: the pause record landed; clear the retry marker now, before
+      // flush() — a flush failure must not leave a stale marker behind
+      // (R4-N-2). The record is durable without the fsync: a failed sync
+      // does not remove bytes already written to the file.
+      this.#pauseRetryPending = false;
+      recorded = true;
       this.clock.pause();
       await this.#journal.flush();
-      // R3-1: the pause record landed; clear the retry marker.
-      this.#pauseRetryPending = false;
       return { ...this.status(), acknowledgedControlVersion: version };
     });
     this.#controlTail = work.catch(error => {
@@ -483,7 +492,12 @@ export class BoundaryCoordinator {
       // while the target stays paused. If the retry also fails, this catch
       // re-sets the marker; a stuck marker only causes one retry per
       // refresh, never a tight loop.
-      this.#pauseRetryPending = true;
+      // R4-N-1: a fatal failure poisons the boundary, so retrying is
+      // pointless — do not set the marker, or the 250ms poller would retry
+      // a poisoned journal forever with no self-stop (cf. #resume's fatal
+      // branch, which likewise keeps its target). R4-N-2: if the record
+      // already landed, a flush failure must not set the marker either.
+      if (!recorded && !fatalLifecycleError(error)) this.#pauseRetryPending = true;
       // N-3: the gate was built before the record attempt, so the boundary
       // is paused whether or not the pause record landed: stop the budget
       // clock too, or the pause would keep charging tool budgets.

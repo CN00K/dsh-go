@@ -42,8 +42,9 @@ int ish_fakefs_meta_register_path(const char *metaDBPath,
                                   uint32_t mode);
 
 /// Register a guest path and every ancestor directory up to "/" in
-/// meta.db (directories get mode 0o040755). Idempotent. Returns 0 on
-/// success, -1 on any sqlite error.
+/// meta.db (newly registered directories get mode 0o040755;
+/// already-registered ancestors keep their recorded mode).
+/// Idempotent. Returns 0 on success, -1 on any sqlite error.
 int ish_fakefs_meta_ensure_parents(const char *metaDBPath,
                                    const char *guestPath);
 
@@ -57,7 +58,10 @@ int ish_fakefs_meta_remove_path(const char *metaDBPath,
 /// Recursively register a host directory tree under a guest prefix:
 /// every entry found under `hostRoot` (via lstat, so symlinks keep
 /// their link mode) is registered at `guestPrefix` + relative path,
-/// with its real st_mode. `guestPrefix` must be absolute (e.g.
+/// with its real st_mode — but only when it has no row yet: an entry
+/// already in meta.db keeps its recorded mode, so re-registration
+/// never clobbers the shipped modes (+x bits, symlink type) with the
+/// flattened host mode. `guestPrefix` must be absolute (e.g.
 /// "/home/workspace"); `hostRoot` must be an absolute host path.
 /// Returns 0 on success, -1 on the first error encountered (entries
 /// registered before the failure stay registered).

@@ -7,20 +7,30 @@ import { BoundaryCoordinator } from '../../ohos/lifecycle/coordinator.mjs';
 // identity check (ERR_OHOS_LIFECYCLE_IDENTITY / SEQUENCE) or confirmed
 // journal damage (CORRUPT / POISONED) may poison the shared boundary.
 const transientIo = () => Object.assign(new Error('transient journal EIO'), { code: 'EIO' });
+const corruptErr = () => Object.assign(new Error('journal corrupt'), { code: 'ERR_OHOS_LIFECYCLE_CORRUPT' });
 const foreground = { version: 1, engineGeneration: 1, ownerGeneration: 1, revision: 1, grantGeneration: 0,
   nowMs: 100, deadlineMs: 0, drainAtMs: 0, phase: 0, available: 1, foreground: 1, clockFailed: 0 };
 
 function setup(t, { flushSession, readEvents } = {}) {
   const records = [];
   let appendFailures = 0;
+  let fatalFailures = 0;
+  let flushFailures = 0;
+  let appendCalls = 0;
   const journal = {
     records,
+    get appendCalls() { return appendCalls; },
     failAppend(times) { appendFailures = times; },
+    failAppendFatal(times) { fatalFailures = times; },
+    failFlush(times) { flushFailures = times; },
     async append(body) {
+      appendCalls++;
       if (appendFailures > 0) { appendFailures--; throw transientIo(); }
+      if (fatalFailures > 0) { fatalFailures--; throw corruptErr(); }
       const row = { body }; records.push(row); return row;
     },
-    async flush() {}, async close() {},
+    async flush() { if (flushFailures > 0) { flushFailures--; throw transientIo(); } },
+    async close() {},
   };
   const c = new BoundaryCoordinator({ journal, bootId: 'transient-fault',
     flushSession: flushSession ?? (async () => true),
@@ -178,4 +188,59 @@ test('a missing durable flush listener in committed poisons the boundary', async
   assert.equal(f.c.status().blocked, true);
   const next = { ...f.meta, callSeq: 1, block: { id: 'call-1', name: 'effect' } };
   await assert.rejects(f.c.prepared(next), { code: 'ERR_OHOS_LIFECYCLE_BLOCKED' });
+});
+
+// R4-N-1: a fatal #pause() failure poisons the boundary, so the retry
+// marker must not be set — otherwise the 250ms poller retries a poisoned
+// journal forever. A gate waiter keeps the timer alive (observeHost is not
+// the driver: it #check()s first and throws BLOCKED once #fault is set).
+test('a fatal journal failure during pause does not arm the retry marker; the poller stops retrying', async t => {
+  const f = setup(t);
+  f.journal.failAppend(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.equal(f.c.status().blocked, false);
+  f.journal.failAppendFatal(10);
+  // Park a gate waiter before the fatal retry: gate() re-checks #check only
+  // when its race resolves, so the waiter stays and the timer keeps firing.
+  const waiter = f.c.gate('session-A', undefined);
+  waiter.catch(() => {});
+  await new Promise(r => setTimeout(r, 700));
+  assert.equal(f.c.status().blocked, true);
+  // Exactly 2 appends: the transient failure plus the one fatal retry.
+  // Pre-fix the marker was re-set on the fatal failure and each 250ms
+  // refresh retried, growing the count (1 -> 4 in the audit probe).
+  assert.equal(f.journal.appendCalls, 2);
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), []);
+});
+
+// R4-N-2: the pause record lands before flush(), so a flush failure must
+// not arm the retry marker — the retry would append a duplicate pause
+// record. The record is already on disk without the fsync.
+test('a flush failure after the pause record landed does not retry or duplicate the pause record', async t => {
+  const f = setup(t);
+  f.journal.failFlush(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.equal(f.c.status().blocked, false);
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+});
+
+// R4-N-2 (stale marker): the marker was set by an earlier record failure,
+// then the retry's record lands but its flush() fails. The marker must be
+// cleared when the record lands, or the next refresh would retry and
+// duplicate the record. This is the case (b)-alone would miss: its catch
+// guard never clears a marker set by the earlier failure.
+test('a stale retry marker is cleared when the retry record lands even if its flush fails', async t => {
+  const f = setup(t);
+  f.journal.failAppend(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), []);
+  f.journal.failFlush(1);
+  await assert.rejects(f.c.observeHost({}), { code: 'EIO' });
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
 });

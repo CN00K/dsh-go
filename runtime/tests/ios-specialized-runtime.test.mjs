@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -26,9 +26,11 @@ const TOKEN = 'test-token-123';
 const PORT_ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
 const TREE_RUNTIME = join(PORT_ROOT, 'runtime/ohos/process/runtime.mjs');
 const SPECIALIZE_PY = join(PORT_ROOT, 'tooling/ios/specialize-runtime.py');
-// N-2 caller files: the two stock terminal callers the iOS
+// N-2 caller file: the one stock terminal caller the iOS
 // specialization attaches the resolved policy in (see
-// tooling/ios/specialize-runtime.py DIAGNOSTIC_EDITS).
+// tooling/ios/specialize-runtime.py DIAGNOSTIC_EDITS). The other
+// caller, the terminal controller behind the user's own terminal,
+// is deliberately left stock: it carries no policy (R4-1).
 const TERMINAL_BASH_FILE = 'node_modules/@deepseek-ai/dsh-terminal-bash/lib/index.js';
 const TERMINAL_CONTROLLER_FILE = 'node_modules/@deepseek-ai/dsh-api-terminal-controller/lib/index.js';
 
@@ -345,17 +347,23 @@ test('N-2 caller: terminal-bash specialization attaches policy to the spawnTermi
     'the stock caller must not attach policy (the test is sensitive to the edit)');
 });
 
-test('N-2 caller: terminal-controller specialization resolves and attaches policy', () => {
-  const original = readFileSync(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE), 'utf8');
-  const text = specializeFile(TERMINAL_CONTROLLER_FILE);
-  assert.ok(text.includes('const { subprocess, sandboxPolicy, workingDirectory } = this.execution(agent);'),
-    'spawn must fetch the sandboxPolicy provider');
-  assert.ok(text.includes('const policy = sandboxPolicy.resolve({ session: agent.session });'),
-    'spawn must resolve the policy for the agent session');
-  assert.ok(text.includes('argv: [shell.path, ...shell.args],\n\t\t\t\tpolicy,'),
-    'specialized spawnTerminal spec must carry the resolved policy');
-  assert.ok(!original.includes('sandboxPolicy, workingDirectory } = this.execution(agent)'),
-    'the stock caller must not fetch sandboxPolicy (the test is sensitive to the edit)');
+// N-2 caller (R4-1): the controller is deliberately NOT specialized:
+// the user's own terminal must open without an agent sandbox policy
+// (create() promises a shell "without Agent sandbox or approval
+// restrictions"). The specialization must carry no edit for it, and
+// the stock spawn must neither fetch the policy for the spec nor put
+// one in it.
+test('N-2 caller: terminal-controller specialization leaves the manual terminal unpolicied', () => {
+  const py = readFileSync(SPECIALIZE_PY, 'utf8');
+  assert.ok(!py.includes(`'${TERMINAL_CONTROLLER_FILE}': (`),
+    'DIAGNOSTIC_EDITS must carry no entry for the terminal controller (the manual terminal stays exempt)');
+  const stock = readFileSync(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE), 'utf8');
+  assert.ok(stock.includes('const { subprocess, workingDirectory } = this.execution(agent);'),
+    'stock spawn must destructure only subprocess and workingDirectory');
+  assert.ok(!stock.includes('sandboxPolicy, workingDirectory } = this.execution(agent)'),
+    'stock spawn must not fetch sandboxPolicy for the spec');
+  assert.ok(!stock.includes('argv: [shell.path, ...shell.args],\n\t\t\t\tpolicy,'),
+    'stock spawnTerminal spec must not carry a policy');
 });
 
 // N-2 caller: drive the specialized BashTerminalBackend with stubbed
@@ -393,15 +401,15 @@ test('N-2 caller: BashTerminalBackend.spawn puts the resolved policy in the spec
   assert.deepEqual(captured.argv, ['/bin/bash']);
 });
 
-// N-2 caller: drive the specialized TerminalController.spawn with a
+// N-2 caller (R4-1): drive the STOCK TerminalController.spawn with a
 // fake `this` (execution/config only) and stubbed providers, and
-// assert the resolved policy reaches the spec. spawn() itself builds
-// a BrowserTerminal around the stubbed handle, so the handle carries
-// an ended output stream and an already-settled done.
-test('N-2 caller: TerminalController.spawn puts the resolved policy in the spec', { timeout: 15000 }, async (t) => {
-  const { TerminalController } = await loadSpecializedCaller(t, TERMINAL_CONTROLLER_FILE);
+// assert the spec carries NO policy: the manual terminal opens
+// unpolicied even though the sandboxPolicy provider exists. spawn()
+// itself builds a BrowserTerminal around the stubbed handle, so the
+// handle carries an ended output stream and an already-settled done.
+test('N-2 caller: TerminalController.spawn puts no policy in the spec', { timeout: 15000 }, async () => {
+  const { TerminalController } = await import(pathToFileURL(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE)).href);
   const session = { id: 'sess-n2-ctl', header: { cwd: '/tmp' } };
-  const resolved = { mode: 'read-only', workspaceRoot: '/tmp', sessionId: 'sess-n2-ctl' };
   let captured = null;
   const providers = {
     subprocess: {
@@ -411,11 +419,10 @@ test('N-2 caller: TerminalController.spawn puts the resolved policy in the spec'
         return { pid: 7, output: Readable.from([]), done: Promise.resolve({ exitCode: 0, signal: null }) };
       },
     },
+    // Present but never resolved: stock spawn destructures only
+    // subprocess and workingDirectory, so resolve() must not run.
     sandboxPolicy: {
-      resolve: (request) => {
-        assert.equal(request.session, session, 'policy must resolve for the agent session');
-        return resolved;
-      },
+      resolve: () => { throw new Error('stock controller spawn must not resolve a policy'); },
     },
     workingDirectory: { ensure: async () => '/tmp' },
   };
@@ -434,7 +441,83 @@ test('N-2 caller: TerminalController.spawn puts the resolved policy in the spec'
   const terminal = await TerminalController.prototype.spawn.call(
     fakeThis, agent, {}, { id: 't-n2', cols: 80, rows: 24 }, new AbortController().signal);
   assert.ok(terminal, 'spawn must return the created terminal');
-  assert.equal(captured.policy, resolved, 'the resolved policy must travel in the spec');
-  assert.equal(captured.policy.mode, 'read-only');
+  assert.equal('policy' in captured, false, 'the manual terminal spec must carry no policy');
   assert.deepEqual(captured.argv, ['/bin/bash']);
+});
+
+// N-2 caller (R4-3): the stock spawn destructures { subprocess,
+// workingDirectory } from execution(), so pin the REAL execution()
+// provider shape: it returns exactly the three providers the
+// controller relies on, and throws when one is missing. The stubbed
+// execution() in the behavior test above cannot catch an upstream
+// change to this return shape.
+test('N-2 caller: TerminalController execution() returns the providers spawn destructures', async () => {
+  const { TerminalController } = await import(pathToFileURL(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE)).href);
+  const providers = {
+    subprocess: { resolveExecutable: async (path) => path },
+    sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
+    workingDirectory: { ensure: async () => '/tmp' },
+  };
+  const agent = { id: 'agent-n2-exec', ctx: { get: (name) => providers[name] } };
+  const returned = TerminalController.prototype.execution.call({}, agent);
+  assert.deepEqual(Object.keys(returned).sort(), ['sandboxPolicy', 'subprocess', 'workingDirectory']);
+  assert.equal(returned.subprocess, providers.subprocess);
+  assert.equal(returned.sandboxPolicy, providers.sandboxPolicy);
+  assert.equal(returned.workingDirectory, providers.workingDirectory);
+  for (const missing of ['subprocess', 'sandboxPolicy', 'workingDirectory']) {
+    const partial = { ...providers, [missing]: undefined };
+    const partialAgent = { id: 'agent-n2-exec', ctx: { get: (name) => partial[name] } };
+    assert.throws(() => TerminalController.prototype.execution.call({}, partialAgent),
+      /requires (subprocess and sandbox policy|a working-directory) provider/);
+  }
+});
+
+// N-2 caller (R4-2): lib/types/index.js is a second, unpatched copy
+// of the controller bundled into lib/index.js. After the R4-1 revert
+// the two copies behave the same (neither attaches a policy), so
+// there is nothing to mirror — mirroring would re-create the
+// exemption break in the copy, and deleting the file at compose time
+// would need new machinery for a file nothing loads. Instead this
+// test pins the copy as dead code: no export maps to it and no
+// module in the tree imports it, so a future loader change cannot
+// silently route terminals through the stale copy.
+test('N-2 caller: no module resolves the duplicate controller copy lib/types/index.js', () => {
+  const packageDir = join(PORT_ROOT, 'node_modules/@deepseek-ai/dsh-api-terminal-controller');
+  assert.ok(existsSync(join(packageDir, 'lib/types/index.js')),
+    'the duplicate copy must exist for this test to mean anything');
+  const pkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
+  const targets = [];
+  const collect = (node) => {
+    if (typeof node === 'string') targets.push(node);
+    else if (node && typeof node === 'object') Object.values(node).forEach(collect);
+  };
+  collect(pkg.exports);
+  assert.ok(targets.length > 0, 'the controller package must declare exports');
+  assert.ok(!targets.some((target) => target.endsWith('lib/types/index.js')),
+    `no export may map to the duplicate copy; saw ${JSON.stringify(targets)}`);
+  assert.equal(pkg.exports['./types'].default, './lib/types/types.js',
+    'the ./types export must stay the empty stub, not the duplicate implementation');
+  assert.equal(readFileSync(join(packageDir, 'lib/types/types.js'), 'utf8').split('\n')[0], 'export {};',
+    'the ./types target must be a stub with no implementation');
+  // The only in-package mention of the duplicate is the bundler's
+  // //#region marker in lib/index.js (a comment, not an import).
+  const bundled = readFileSync(join(packageDir, 'lib/index.js'), 'utf8');
+  const mentions = bundled.split('\n').filter((line) => line.includes('lib/types/index.js'));
+  assert.deepEqual(mentions, ['//#region lib/types/index.js']);
+  // No file outside node_modules may deep-import the duplicate; this
+  // test file itself names the path, so it is excluded from the walk.
+  const hits = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git') continue;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (entry.isFile() && path !== new URL(import.meta.url).pathname
+        && /\.(mjs|js|cjs|json|ya?ml|py|md)$/.test(entry.name)) {
+        if (readFileSync(path, 'utf8').includes('terminal-controller/lib/types/index.js')) hits.push(path);
+      }
+    }
+  };
+  walk(PORT_ROOT);
+  assert.deepEqual(hits, [], 'no repo file may reference the duplicate controller copy');
 });

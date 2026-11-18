@@ -1536,23 +1536,46 @@ test('ishWorkerKillJob surfaces a 404 as ISH_JOB_NOT_FOUND', async () => {
 // response is lost to a transport error; the retry gets 404 because the
 // job is already gone. The job IS dead, so killJob returns true instead
 // of reporting the kill as not-found.
+// R4-2: the job table is seeded first (one worker run), so the
+// retry-after-404 true must also mark the local job done.
 test('ishWorkerKillJob returns true when the retry gets 404 after a lost kill response (R3-N2)', async () => {
   clearWorkerState();
-  let requests = 0;
-  const {server, port, close} = await startMockServer((_req, res) => {
-    requests++;
-    if (requests === 1) {
-      res.writeHead(200, {'Content-Type': 'application/json'});
-      res.destroy(); // kill landed, response lost
+  const sessionId = 'sess-kill-404';
+  let killRequests = 0;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (req.url === '/ish/worker/run') {
+      mockWorkerRunResponse(res, {
+        nonce: parsed.nonce,
+        jobsText: '[1]+  1234 Running                 sleep 600 &',
+        jobPids: [1234],
+      });
+      return;
+    }
+    if (req.url === '/ish/worker/jobs/kill') {
+      killRequests++;
+      if (killRequests === 1) {
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.destroy(); // kill landed, response lost
+        return;
+      }
+      res.writeHead(404, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({error: 'job_not_found'}));
       return;
     }
     res.writeHead(404, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({error: 'job_not_found'}));
+    res.end(JSON.stringify({error: 'not_found'}));
   });
   try {
     invalidateServiceInfo();
-    assert.equal(await ishWorkerKillJob('sess-kill-404', 1234, {serviceFile: writeServiceFile(port)}), true);
-    assert.equal(requests, 2, 'the transport error must retry once before the 404 answers true');
+    const serviceFile = writeServiceFile(port);
+    await ishWorkerExec({command: 'sleep 600 &', sessionId, serviceFile, onLine: () => {}});
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => ({pid: j.pid, state: j.state})),
+      [{pid: 1234, state: 'running'}]);
+    assert.equal(await ishWorkerKillJob(sessionId, 1234, {serviceFile}), true);
+    assert.equal(killRequests, 2, 'the transport error must retry once before the 404 answers true');
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => ({pid: j.pid, state: j.state})),
+      [{pid: 1234, state: 'done'}], 'a retry-after-404 true must mark the local job done');
   } finally {
     clearWorkerState();
     await close();
@@ -1821,6 +1844,60 @@ test('ishWebSocket surfaces the 403 JSON error and does not retry a 4xx refusal 
     assert.match(outcome.message, /OHOS_SANDBOX_DENIED/);
     assert.equal(connections, 1, 'a 4xx refusal must not be retried');
   } finally {
+    await new Promise((done) => server.close(done));
+  }
+});
+
+// R4-1: a 401 on the WS upgrade is NOT deterministic — it means the
+// cached token is stale (the service rotates its token on restart) and
+// the retry re-reads the service file, so the second attempt with the
+// fresh token must succeed. The mock only accepts the new token; it
+// rewrites the service file with the new token when it sees the old
+// one, exactly as a restarted service would have done.
+test('ishWebSocket retries a 401 with the rotated token and connects on the second attempt (R4-1)', async () => {
+  const NEW_TOKEN = 'test-token-rotated';
+  let connections = 0;
+  const server = createServer();
+  const sockets = new Set();
+  server.on('upgrade', (req, socket) => {
+    connections++;
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    const auth = req.headers.authorization;
+    if (auth === `Bearer ${TOKEN}`) {
+      // Stale token: refuse, and rotate the service file first — the
+      // bridge's retry must re-read it (invalidateServiceInfo) and
+      // come back with the new token.
+      writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port, token: NEW_TOKEN}));
+      const body = JSON.stringify({error: 'unauthorized'});
+      socket.end(`HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      return;
+    }
+    if (auth === `Bearer ${NEW_TOKEN}`) {
+      const key = req.headers['sec-websocket-key'];
+      const accept = createHash('sha1').update(key + WS_GUID).digest('base64');
+      socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      return;
+    }
+    socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const port = server.address().port;
+  const serviceFile = writeServiceFile(port);
+  try {
+    invalidateServiceInfo();
+    const ws = ishWebSocket({path: '/ish/pty', serviceFile});
+    const outcome = await Promise.race([
+      ws.ready.then(() => 'resolved', (error) => error),
+      new Promise((done) => setTimeout(() => done('TIMEOUT'), 15000)),
+    ]);
+    assert.notEqual(outcome, 'TIMEOUT', 'handshake must settle');
+    assert.equal(outcome, 'resolved', `401 must retry with the fresh token, got ${outcome?.code ?? outcome}`);
+    assert.equal(connections, 2, 'the stale-token 401 must cost exactly one retry, then connect');
+    ws.close();
+  } finally {
+    for (const s of sockets) s.destroy();
     await new Promise((done) => server.close(done));
   }
 });
@@ -2556,6 +2633,34 @@ test('ishExec/ishWorkerExec reject missing/empty/NUL-bearing command, argv, env 
     await assert.rejects(ishWorkerExec({command: 'echo hi', sessionId: 'sess-r3n1', cwd: '/tmp\0x', serviceFile}), invalid);
     assert.equal(requests, 0, 'all invalid inputs must fail before any HTTP is sent');
   } finally {
+    await close();
+  }
+});
+
+// R4-3: a malformed argv through ishWorkerExec (which has no shape
+// check of its own — only the helper) must fail as ISH_INVALID_ARGV,
+// not a bare TypeError from .some/.includes.
+test('ishWorkerExec rejects malformed argv with ISH_INVALID_ARGV (R4-3)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', argv: 'rg', sessionId: 'sess-r4-3', serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', argv: [42], sessionId: 'sess-r4-3', serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', argv: ['rg', null], sessionId: 'sess-r4-3', serviceFile}), invalid);
+    assert.equal(requests, 0, 'all malformed argv inputs must fail before any HTTP is sent');
+  } finally {
+    clearWorkerState();
     await close();
   }
 });

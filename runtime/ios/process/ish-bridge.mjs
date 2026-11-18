@@ -509,8 +509,9 @@ export function invalidateServiceInfo() {
 // argv, command is required and must be a non-empty string; NUL bytes in
 // command, argv elements, env keys/values or cwd would be silently
 // truncated by the server's C string handling, so reject before any HTTP
-// is sent. Callers pass a valid argv (ishExec validates its shape first)
-// or no argv at all (ishWorkerExec takes command only).
+// is sent. The helper guards argv's shape itself (ishWorkerExec takes
+// command only, so a malformed argv can only arrive by caller error —
+// R4-3: it must still fail as ISH_INVALID_ARGV, not a TypeError).
 function assertValidExecInput(opts) {
   if (opts.argv === undefined) {
     if (typeof opts.command !== 'string' || opts.command.length === 0 || opts.command.includes('\0')) {
@@ -518,9 +519,9 @@ function assertValidExecInput(opts) {
         new Error('ish command must be a non-empty string without NUL bytes'),
         {code: 'ISH_INVALID_ARGV'});
     }
-  } else if (opts.argv.some((a) => a.includes('\0'))) {
+  } else if (!Array.isArray(opts.argv) || opts.argv.some((a) => typeof a !== 'string' || a.includes('\0'))) {
     throw Object.assign(
-      new Error('ish argv must not contain NUL bytes'),
+      new Error('ish argv must be an array of strings without NUL bytes'),
       {code: 'ISH_INVALID_ARGV'});
   }
   if (typeof opts.cwd === 'string' && opts.cwd.includes('\0')) {
@@ -1280,7 +1281,17 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
         // so answer true instead of reporting a kill that already
         // happened as not-found. A 404 on the first attempt still
         // throws: the job never existed (or died before we tried).
-        if (attempt > 0) return true;
+        // R4-2: mark the local job done too — the retry-after-404 path
+        // answers "the job is dead", so the job table must agree with
+        // the return value (same generation-guarded update as the
+        // success path above).
+        if (attempt > 0) {
+          if (state.generation === generation) {
+            const job = state.jobs.get(pid);
+            if (job && job.state !== 'done') { job.state = 'done'; job.endedAt = Date.now(); }
+          }
+          return true;
+        }
         throw Object.assign(
           new Error(`ish job not found: session ${sessionId} pid ${pid}`),
           {code: ISH_JOB_NOT_FOUND});
@@ -1423,7 +1434,10 @@ export function ishWebSocket(opts) {
         // R3-N-1: a 4xx refusal is deterministic (policy denial, bad
         // request) — retrying the identical handshake cannot succeed,
         // so fail immediately instead of spending the second attempt.
-        if (attempt === 0 && !(error?.statusCode >= 400 && error?.statusCode < 500)) continue;
+        // R4-1: 401 is the exception — it only means the cached token
+        // is stale (the service rotates its token on restart), and the
+        // retry re-reads the service file, so retry it once.
+        if (attempt === 0 && !(error?.statusCode >= 400 && error?.statusCode < 500 && error?.statusCode !== 401)) continue;
         throw lastError;
       }
     }

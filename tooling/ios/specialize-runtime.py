@@ -104,26 +104,19 @@ DIAGNOSTIC_EDITS = {
         ('无效或已使用的鸿蒙执行票据', '无效或已使用的 iOS 执行票据'),
         ('鸿蒙虚拟进程临时根的身份已改变，拒绝删除替换目录', 'iOS 虚拟进程临时根的身份已改变，拒绝删除替换目录'),
     ),
-    # (N-2) the two terminal callers attach the policy they resolve to
-    # the spawnTerminal spec, so the iOS loopback can refuse a read-only
-    # terminal before the 101 upgrade (see the spawnTerminal rewrite
-    # above). Only a read-only policy is refused server-side; any other
-    # resolved policy travels untouched, and a caller without a policy
-    # (the user's own terminal) is unaffected. dsh-terminal-bash already
-    # resolves the policy for spawnArgv; the controller resolves it here
-    # (it only fetched the provider before) against agent.session, the
-    # same session the working directory is resolved against.
+    # (N-2) the agent terminal caller attaches the policy it resolves
+    # to the spawnTerminal spec, so the iOS loopback can refuse a
+    # read-only terminal before the 101 upgrade (see the spawnTerminal
+    # rewrite above). Only a read-only policy is refused server-side;
+    # any other resolved policy travels untouched. The user's own
+    # terminal (dsh-api-terminal-controller) is deliberately NOT
+    # patched: create() promises a shell "without Agent sandbox or
+    # approval restrictions", so a manually opened terminal carries no
+    # policy and is unaffected. dsh-terminal-bash already resolves the
+    # policy for spawnArgv.
     'node_modules/@deepseek-ai/dsh-terminal-bash/lib/index.js': (
         ("\t\tconst terminal = await this.spawnTerminal({\n\t\t\targv,\n",
          "\t\tconst terminal = await this.spawnTerminal({\n\t\t\targv,\n\t\t\tpolicy,\n"),
-    ),
-    'node_modules/@deepseek-ai/dsh-api-terminal-controller/lib/index.js': (
-        ("\t\t\tconst { subprocess, workingDirectory } = this.execution(agent);",
-         "\t\t\tconst { subprocess, sandboxPolicy, workingDirectory } = this.execution(agent);"),
-        ("\t\t\tconst cwd = await workingDirectory.ensure(agent, signal);",
-         "\t\t\tconst cwd = await workingDirectory.ensure(agent, signal);\n\t\t\tconst policy = sandboxPolicy.resolve({ session: agent.session });"),
-        ("\t\t\tconst handle = await subprocess.spawnTerminal({\n\t\t\t\targv: [shell.path, ...shell.args],\n",
-         "\t\t\tconst handle = await subprocess.spawnTerminal({\n\t\t\t\targv: [shell.path, ...shell.args],\n\t\t\t\tpolicy,\n"),
     ),
     'runtime/ohos/process/child-process.mjs': (
         ('OS child processes are unavailable on OpenHarmony; use the virtual runtime or a remote service.', 'OS child processes are unavailable on iOS; use the virtual runtime or a remote service.'),

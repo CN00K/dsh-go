@@ -134,9 +134,24 @@ int ish_fakefs_meta_ensure_parents(const char *metaDBPath,
         if (*p == '/' || *p == '\0') {
             char save = *p;
             *p = '\0';
-            int rc = ish_fakefs_meta_register_path(metaDBPath, buf, 0040755);
+            // (R4-3-1) Skip ancestors that are already registered:
+            // blindly UPDATE-ing them to 040755 would clobber a
+            // factory mode if a future mount point lands under a
+            // special-mode directory (e.g. /tmp 1777, /root 0700).
+            // register_path itself is untouched — bind mounts still
+            // rely on its UPDATE semantics (ISHKernel.m).
+            // path_exists returns 1 only for an existing row;
+            // anything else (0 = missing or lookup failure,
+            // -1 = open failure) falls through to register_path,
+            // which INSERTs or reports the error.
+            if (ish_fakefs_meta_path_exists(metaDBPath, buf) != 1) {
+                int rc = ish_fakefs_meta_register_path(metaDBPath, buf, 0040755);
+                if (rc != 0) {
+                    *p = save;
+                    return -1;
+                }
+            }
             *p = save;
-            if (rc != 0) return -1;
             if (save == '\0') break;
         }
     }
@@ -204,9 +219,23 @@ static int ish_meta_register_tree(const char *metaDBPath,
         NSLog(@"ISHFakefsMeta: lstat failed for %s", hostPath);
         return -1;
     }
-    if (ish_fakefs_meta_register_path(metaDBPath, guestPath,
-                                      (uint32_t)st.st_mode) != 0) {
-        return -1;
+    // (R4-3-1) Only INSERT rows that are missing. The host mode comes
+    // from extract(), which flattens every file to 0660 and stores
+    // symlinks as regular files, so UPDATE-ing an existing row would
+    // clobber the shipped mode (+x bits, symlink type) in meta.db.
+    // The skip is per-node: a directory that already exists is still
+    // recursed into, so missing children are INSERTed below it.
+    // register_path itself is untouched — bind mounts rely on its
+    // UPDATE semantics (ISHKernel.m).
+    // path_exists returns 1 only when a paths row exists; anything
+    // else (0 = missing or lookup failure, -1 = open failure) falls
+    // through to register_path, which INSERTs or reports the error
+    // as before.
+    if (ish_fakefs_meta_path_exists(metaDBPath, guestPath) != 1) {
+        if (ish_fakefs_meta_register_path(metaDBPath, guestPath,
+                                          (uint32_t)st.st_mode) != 0) {
+            return -1;
+        }
     }
     if (!S_ISDIR(st.st_mode)) return 0;
     DIR *dir = opendir(hostPath);
