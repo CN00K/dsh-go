@@ -28,7 +28,7 @@ mixin _RefreshOnResume<T extends ConsumerStatefulWidget> on ConsumerState<T> {
         ref.invalidate(liveSystemStatusProvider);
         // 实时活动 may have just been allowed there: offer the running activity
         // again (the native side posts nothing new if it already shows it).
-        if (!iosLiveActivities) unawaited(ref.read(notifyChannelProvider).live(ref.read(livePushProvider)));
+        unawaited(ref.read(notifyChannelProvider).live(ref.read(livePushProvider)));
       },
     );
   }
@@ -86,10 +86,17 @@ class _NotificationSettingsTileState extends ConsumerState<NotificationSettingsT
 ///
 /// D5c FUSION (2026-11-17): this page is the single home of the old
 /// `IosBackgroundPage` 6-switch set (feat). Mapping, old -> upstream:
-///  1. master "allow user tasks to continue" -> [NotifyPrefs.continuedRun]
-///     (`continuedRunSettingsSwitch` below); the pref defaults ON.
-///  2. "prefer continued processing" -> folded into (1): upstream always
-///     submits a continued task when enabled; there is no audio/location-only
+///  1. master "allow user tasks to continue" -> REMOVED in 1.2.0:
+///     upstream dropped [NotifyPrefs.continuedRun] and its switch here;
+///     continued-run is now unconditional (continued_run.dart forwards
+///     every local turn, no pref gate). The fused status row that sat in
+///     the live section below went with it: 1.2.0 hides that section on
+///     iOS (`if (!wordsForIos)`), so the row could never show. Live
+///     continued-run status is still visible in the background-pause
+///     banner ([RuntimeStatus.continuedRun]).
+///  2. "prefer continued processing" -> folded into (1): upstream
+///     submits a continued task whenever a local turn runs (1.2.0:
+///     unconditional, no pref gate); there is no audio/location-only
 ///     fallback (ShellBoxPlugin's silent-audio + location keep-alive were
 ///     dropped with it — see NOTES.md).
 ///  3. "Live Activity" -> [NotifyPrefs.live] (`liveSettingsSwitch` below);
@@ -202,7 +209,7 @@ class _NotificationSettingsPageState extends ConsumerState<NotificationSettingsP
   );
 
   Future<void> _openLive() async {
-    final opened = await openLiveActivitySettings(ref);
+    final opened = await ref.read(notifyChannelProvider).openLiveSettings();
     if (!mounted) return;
     _readAgainOnHarmony();
     if (!opened) _settingsFailed();
@@ -280,41 +287,25 @@ class _NotificationSettingsPageState extends ConsumerState<NotificationSettingsP
           ],
         ),
         if (liveBlocked) _liveNote(),
-        SettingsSection(
-          title: ohos ? l10n.harmonyLiveTitle : l10n.liveSettingsTitle,
-          footer: iosLiveActivities ? null : Text(ohos ? l10n.harmonyLiveFooter : l10n.liveSettingsFooter),
-          children: [
-            SettingsSwitchTile(
-              spot: Spots.notifyLive,
-              title: ohos ? l10n.harmonyLiveSwitch : null,
-              subtitle: ohos
-                  ? (liveSupported ? l10n.harmonyLiveSubtitle : l10n.harmonyLiveUnavailable)
-                  : liveSupported
-                  ? l10n.liveSettingsSubtitle
-                  : l10n.liveUnsupported,
-              value: prefs.live && liveSupported,
-              onChanged: on && liveSupported ? (v) => unawaited(notifier.setLive(v)) : null,
-            ),
-            if (iosLiveActivities)
+        // iOS has them, this app doesn't yet: nothing to switch on.
+        if (!wordsForIos)
+          SettingsSection(
+            title: ohos ? l10n.harmonyLiveTitle : l10n.liveSettingsTitle,
+            footer: Text(ohos ? l10n.harmonyLiveFooter : l10n.liveSettingsFooter),
+            children: [
               SettingsSwitchTile(
-                title: l10n.continuedRunSettingsSwitch,
-                subtitle: l10n.continuedRunSettingsSubtitle,
-                value: prefs.continuedRun,
-                onChanged: on ? (v) => unawaited(notifier.setContinuedRun(v)) : null,
+                spot: Spots.notifyLive,
+                title: ohos ? l10n.harmonyLiveSwitch : null,
+                subtitle: ohos
+                    ? (liveSupported ? l10n.harmonyLiveSubtitle : l10n.harmonyLiveUnavailable)
+                    : liveSupported
+                    ? l10n.liveSettingsSubtitle
+                    : l10n.liveUnsupported,
+                value: prefs.live && liveSupported,
+                onChanged: on && liveSupported ? (v) => unawaited(notifier.setLive(v)) : null,
               ),
-            if (iosLiveActivities)
-              // Fused status row (was the old page's live state line):
-              // whether the system is currently letting a local turn run on.
-              // Best-effort: [RuntimeStatus.continuedRun] as the native
-              // ContinuedRun reports it through `dsh/runtime`.
-              SettingsTile(
-                title: l10n.continuedRunStatusTitle,
-                subtitle: ref.watch(localRuntimeProvider.select((s) => s.status.continuedRun))
-                    ? l10n.continuedRunActive
-                    : l10n.continuedRunIdle,
-              ),
-          ],
-        ),
+            ],
+          ),
         SettingsSection(
           title: l10n.pluginsSystemSettings,
           // Android posts a public version for the lock screen; here the real text goes to the system.

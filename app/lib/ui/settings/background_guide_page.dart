@@ -20,9 +20,10 @@ import '../common/smooth_size.dart';
 
 /// 后台运行: how to keep conversations running on Android; on HarmonyOS,
 /// where nothing does, what happens instead. On iOS this opens the
-/// notification settings instead: continued run lives there (D5c fusion —
-/// the old IosBackgroundPage is gone, its switches moved to
-/// notification_settings.dart).
+/// notification settings instead: the background/notification switches
+/// live there (D5c fusion — the old IosBackgroundPage is gone, its
+/// switches moved to notification_settings.dart; 1.2.0 dropped the
+/// continued-run master switch, continued-run is now unconditional).
 class BackgroundGuidePage extends ConsumerWidget {
   const BackgroundGuidePage({super.key});
 

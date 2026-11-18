@@ -62,14 +62,12 @@ Map<String, Object?>? petLiveActivityPayload(LivePush push) {
   // reducer's already-redacted public sentence; [text] may carry conversation
   // detail and must not cross the native boundary.
   final detail = activity.publicText;
-  final tier = phase == 'working' && activity.tier > 0 ? activity.tier : null;
   return {
     // Exclude the optional host display name from external presentation data.
     'host': jsonEncode({'kind': target.host.kind.name, 'id': target.host.id}),
     'sessionId': target.sessionId,
     'packId': ?packId,
     if (packId != null) 'petState': petState,
-    if (packId != null && tier != null) 'tier': tier,
     'phase': phase,
     'detail': detail,
     if (activity.since case final since?) 'since': since.millisecondsSinceEpoch,

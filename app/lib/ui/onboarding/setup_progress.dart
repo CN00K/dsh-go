@@ -102,7 +102,6 @@ final setupRuntimeProvider = Provider<SetupRuntime>(
 class InstallEtaController extends Notifier<Duration?> {
   DateTime? _t0;
   double _f0 = 0;
-  String? _step;
 
   @override
   Duration? build() {
@@ -117,7 +116,6 @@ class InstallEtaController extends Notifier<Duration?> {
   void _reset() {
     _t0 = null;
     _f0 = 0;
-    _step = null;
     state = null;
   }
 
@@ -125,11 +123,9 @@ class InstallEtaController extends Notifier<Duration?> {
     if (progress == null) return;
     final now = DateTime.now();
     final f = progress.fraction;
-    if (_t0 == null || _step != progress.step || f < _f0) {
+    if (_t0 == null) {
       _t0 = now;
       _f0 = f;
-      _step = progress.step;
-      state = null;
       return;
     }
     final elapsed = now.difference(_t0!);
@@ -139,31 +135,19 @@ class InstallEtaController extends Notifier<Duration?> {
     final next = Duration(milliseconds: (perUnit * (1 - f)).round());
     // Smooth the estimate so it doesn't jitter with each chunk.
     final eta = state;
-    state = eta == null ? next : Duration(milliseconds: (eta.inMilliseconds * 0.6 + next.inMilliseconds * 0.4).round());
+    state = eta == null
+        ? next
+        : Duration(milliseconds: (eta.inMilliseconds * 0.6 + next.inMilliseconds * 0.4).round());
   }
 }
 
 final installEtaProvider = NotifierProvider<InstallEtaController, Duration?>(InstallEtaController.new);
 
-String installStageTitle(L10n l10n, RuntimeProgressEvent? progress, {bool updating = false}) =>
-    switch (progress?.step) {
-      'download' => l10n.shellRuntimeDownloading,
-      'verify-download' || 'verify' => l10n.shellRuntimeVerifying,
-      'extract' || 'configure' => l10n.shellRuntimeInstalling,
-      _ => updating ? l10n.shellRuntimeUpdating : l10n.shellRuntimePreparing,
-    };
-
 /// 「48 / 120 MB · 约 30 秒」: what is under the unpack's progress.
 String? installMetaLine(L10n l10n, RuntimeProgressEvent? progress, Duration? eta) {
   if (progress == null) return null;
   String mb(int bytes) => (bytes / (1024 * 1024)).toStringAsFixed(0);
-  final size = progress.total <= 0
-      ? null
-      : switch (progress.step) {
-          'download' || 'verify-download' || 'extract' => '${mb(progress.done)} / ${mb(progress.total)} MB',
-          'verify' => l10n.shellRuntimeFilesProgress(progress.done, progress.total),
-          _ => null,
-        };
+  final size = progress.total > 0 ? '${mb(progress.done)} / ${mb(progress.total)} MB' : null;
   final String? remaining;
   if (eta == null) {
     remaining = null;
@@ -389,9 +373,6 @@ class _SetupProgressCapsuleState extends ConsumerState<SetupProgressCapsule> {
     final line = MediaQuery.textScalerOf(context).scale(style.fontSize!) * style.height!;
     final markSize = math.min(line, 1.5 * style.fontSize! * style.height!);
     final percent = progress == null ? null : (progress.fraction * 100).floor().clamp(0, 100);
-    final stageProgress = percent != null && ['download', 'verify-download', 'verify'].contains(progress?.step)
-        ? l10n.shellRuntimeStageProgress(installStageTitle(l10n, progress), percent)
-        : null;
 
     final (Widget mark, String label, String semantics, Color color) = switch (runtime) {
       SetupRuntime.ready => (
@@ -408,11 +389,16 @@ class _SetupProgressCapsuleState extends ConsumerState<SetupProgressCapsule> {
       ),
       _ when runtime == SetupRuntime.unpacking && percent != null => (
         SetupRing(value: progress!.fraction, size: markSize),
-        stageProgress ?? l10n.setupCapsuleProgress(percent),
-        stageProgress ?? l10n.setupCapsuleProgressSemantics(percent),
+        l10n.setupCapsuleProgress(percent),
+        l10n.setupCapsuleProgressSemantics(percent),
         scheme.onSurfaceVariant,
       ),
-      _ => (SetupRing(size: markSize), l10n.setupCapsulePreparing, l10n.setupCapsulePreparing, scheme.onSurfaceVariant),
+      _ => (
+        SetupRing(size: markSize),
+        l10n.setupCapsulePreparing,
+        l10n.setupCapsulePreparing,
+        scheme.onSurfaceVariant,
+      ),
     };
 
     final pill = GlassSurface(
@@ -425,23 +411,13 @@ class _SetupProgressCapsuleState extends ConsumerState<SetupProgressCapsule> {
         key: const ValueKey('setup-capsule-content'),
         mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox.square(
-            key: const ValueKey('setup-capsule-mark'),
-            dimension: markSize,
-            child: Center(child: mark),
-          ),
+          SizedBox.square(key: const ValueKey('setup-capsule-mark'), dimension: markSize, child: Center(child: mark)),
           const SizedBox(width: SetupProgressCapsule.gap),
           Flexible(
             child: AnimatedSwitcher(
               duration: AppMotion.of(context, AppMotion.quick),
-              layoutBuilder: (current, previous) =>
-                  Stack(alignment: Alignment.center, children: [...previous, ?current]),
-              child: Text(
-                label,
-                key: ValueKey(runtime),
-                maxLines: 1,
-                style: style.copyWith(color: color),
-              ),
+              layoutBuilder: (current, previous) => Stack(alignment: Alignment.center, children: [...previous, ?current]),
+              child: Text(label, key: ValueKey(runtime), maxLines: 1, style: style.copyWith(color: color)),
             ),
           ),
         ],
@@ -498,13 +474,11 @@ class _SetupStatusSheet extends ConsumerWidget {
         ? l10n.shellRuntimeIncomplete
         : ready
         ? l10n.shellRuntimeReady
-        : installStageTitle(l10n, progress);
+        : l10n.shellRuntimePreparing;
     final body = failed
         ? humanizeRuntimeError(state.status.error) ?? l10n.shellRuntimeExtractFailed
         : ready
         ? l10n.shellRuntimeLocalOnly
-        : progress?.step == 'download'
-        ? l10n.shellRuntimeDownloadingHint
         : l10n.shellRuntimeFirstSetup;
     final meta = installMetaLine(l10n, progress, eta);
     final navigator = Navigator.of(context);
@@ -526,12 +500,7 @@ class _SetupStatusSheet extends ConsumerWidget {
                 child: AnimatedSwitcher(
                   duration: AppMotion.of(context, AppMotion.emphasized),
                   child: switch (runtime) {
-                    SetupRuntime.ready => Icon(
-                      AppIcons.done,
-                      key: const ValueKey('done'),
-                      size: 36,
-                      color: scheme.primary,
-                    ),
+                    SetupRuntime.ready => Icon(AppIcons.done, key: const ValueKey('done'), size: 36, color: scheme.primary),
                     SetupRuntime.failed => Icon(
                       AppIcons.attention,
                       key: const ValueKey('failed'),
@@ -632,7 +601,10 @@ class _FailedActions extends StatelessWidget {
         // Label width plus the button's own side padding (app_theme).
         bool fits(String label, ButtonStyle? style) {
           final painter = TextPainter(
-            text: TextSpan(text: label, style: style?.textStyle?.resolve(const {}) ?? theme.textTheme.labelLarge),
+            text: TextSpan(
+              text: label,
+              style: style?.textStyle?.resolve(const {}) ?? theme.textTheme.labelLarge,
+            ),
             textDirection: Directionality.of(context),
             textScaler: MediaQuery.textScalerOf(context),
             maxLines: 1,
@@ -654,11 +626,7 @@ class _FailedActions extends StatelessWidget {
         }
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            retry,
-            const SizedBox(height: stackGap),
-            remote,
-          ],
+          children: [retry, const SizedBox(height: stackGap), remote],
         );
       },
     );

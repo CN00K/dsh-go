@@ -47,11 +47,9 @@ final liveActivityProvider = Provider<LiveActivity?>((ref) {
 final livePushProvider = Provider<LivePush>((ref) {
   final enabled = ref.watch(notifyPrefsProvider.select((p) => p.enabled && p.live));
   final packId = ref.watch(petStateProvider.select((s) => s.packId == noPetId ? null : s.packId));
-  final packToken = iosLiveActivities && packId != null ? ref.watch(petPackProvider(packId)).value : null;
   return LivePush(
     enabled: enabled,
     packId: packId,
-    packToken: packToken,
     activity: enabled ? ref.watch(liveActivityProvider) : null,
   );
 });

@@ -189,14 +189,14 @@ class _RuntimeSetupPageState extends ConsumerState<RuntimeSetupPage> {
     };
 
     final title = switch (view) {
-      _SetupView.installing => installStageTitle(l10n, progress, updating: _upgrade),
-      _SetupView.waiting || _SetupView.choose => _upgrade ? l10n.shellRuntimeUpdating : l10n.shellRuntimePreparing,
+      _SetupView.waiting ||
+      _SetupView.installing ||
+      _SetupView.choose => _upgrade ? l10n.shellRuntimeUpdating : l10n.shellRuntimePreparing,
       _SetupView.done => l10n.shellRuntimeReady,
       _SetupView.failed => l10n.shellRuntimeIncomplete,
     };
     final body = switch (view) {
       _SetupView.waiting || _SetupView.installing || _SetupView.choose when widget.waiting => l10n.setupWaitingBody,
-      _SetupView.installing when progress?.step == 'download' => l10n.shellRuntimeDownloadingHint,
       _SetupView.waiting ||
       _SetupView.installing ||
       _SetupView.choose => _upgrade ? l10n.shellRuntimeFilesKept : l10n.shellRuntimeFirstSetup,

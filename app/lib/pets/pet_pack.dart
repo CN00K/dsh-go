@@ -33,7 +33,6 @@ class PetAnimation {
     required this.box,
     required this.frames,
     this.loop = true,
-    this.preview,
   });
 
   final String name;
@@ -50,14 +49,6 @@ class PetAnimation {
   final Rect box;
   final List<PetFrame> frames;
   final bool loop;
-
-  /// The cell the pack selects for still previews.
-  final int? preview;
-
-  int get stillIndex {
-    if (preview case final cell? when frames.any((frame) => frame.i == cell)) return cell;
-    return frames[(frames.length - 1) ~/ 2].i;
-  }
 
   /// One pass, in milliseconds.
   int get durationMs => frames.fold(0, (sum, f) => sum + f.ms);
@@ -308,7 +299,6 @@ class PetPack {
         box: box,
         frames: frames,
         loop: a['loop'] != false,
-        preview: _num(a['preview'])?.round(),
       );
     }
     if (animations.isEmpty) throw const FormatException('pack.json: animations');
@@ -443,7 +433,6 @@ class PetPack {
     if (!number.isFinite) throw const FormatException('pack.json: non-finite number');
     return number;
   }
-
   static Map<String, Object?> _map(Object? v) =>
       v is Map ? {for (final MapEntry(:key, :value) in v.entries) '$key': value} : const {};
   static List<Object?> _list(Object? v) => v is List ? v : const [];

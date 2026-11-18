@@ -216,25 +216,20 @@ class NotifyAction {
 /// it shows, and what the agent does ([LiveActivity]; null: nothing).
 @immutable
 class LivePush {
-  const LivePush({required this.enabled, this.packId, this.packToken, this.activity});
+  const LivePush({required this.enabled, this.packId, this.activity});
 
   final bool enabled;
   final String? packId;
-  final Object? packToken;
   final LiveActivity? activity;
 
   Map<String, Object?> toMap() => {'enabled': enabled, 'packId': ?packId, 'activity': ?activity?.toMap()};
 
   @override
   bool operator ==(Object other) =>
-      other is LivePush &&
-      other.enabled == enabled &&
-      other.packId == packId &&
-      identical(other.packToken, packToken) &&
-      other.activity == activity;
+      other is LivePush && other.enabled == enabled && other.packId == packId && other.activity == activity;
 
   @override
-  int get hashCode => Object.hash(enabled, packId, packToken, activity);
+  int get hashCode => Object.hash(enabled, packId, activity);
 }
 
 /// What the phone offers the live activity.

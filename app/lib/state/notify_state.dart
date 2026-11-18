@@ -39,7 +39,6 @@ class NotifyPrefs {
     this.approval = true,
     this.question = true,
     this.live = true,
-    this.continuedRun = true,
     this.loaded = false,
   });
 
@@ -59,9 +58,6 @@ class NotifyPrefs {
 
   /// 实时活动: the status bar chip / island while DSH works (lib/notify/live_activity.dart).
   final bool live;
-
-  /// iOS 26's system-owned continued-processing card while a local turn runs.
-  final bool continuedRun;
   final bool loaded;
 
   bool allows(AlertKind kind) =>
@@ -80,7 +76,6 @@ class NotifyPrefs {
     bool? approval,
     bool? question,
     bool? live,
-    bool? continuedRun,
     bool? loaded,
   }) => NotifyPrefs(
     enabled: enabled ?? this.enabled,
@@ -89,7 +84,6 @@ class NotifyPrefs {
     approval: approval ?? this.approval,
     question: question ?? this.question,
     live: live ?? this.live,
-    continuedRun: continuedRun ?? this.continuedRun,
     loaded: loaded ?? this.loaded,
   );
 }
@@ -102,7 +96,6 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
     approval: 'notify_approval',
     question: 'notify_question',
     live: 'notify_live',
-    continuedRun: 'notify_continued_run',
   );
 
   late Future<void> _loaded;
@@ -123,7 +116,6 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
         approval: prefs.getBool(_keys.approval) ?? true,
         question: prefs.getBool(_keys.question) ?? true,
         live: prefs.getBool(_keys.live) ?? true,
-        continuedRun: prefs.getBool(_keys.continuedRun) ?? true,
         loaded: true,
       );
     } catch (_) {
@@ -150,7 +142,6 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
   Future<void> setApproval(bool v) => _save(_keys.approval, v, (s) => s.copyWith(approval: v));
   Future<void> setQuestion(bool v) => _save(_keys.question, v, (s) => s.copyWith(question: v));
   Future<void> setLive(bool v) => _save(_keys.live, v, (s) => s.copyWith(live: v));
-  Future<void> setContinuedRun(bool v) => _save(_keys.continuedRun, v, (s) => s.copyWith(continuedRun: v));
 }
 
 final notifyPrefsProvider = NotifierProvider<NotifyPrefsController, NotifyPrefs>(NotifyPrefsController.new);

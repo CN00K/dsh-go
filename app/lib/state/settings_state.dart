@@ -140,9 +140,7 @@ class SettingsController extends Notifier<AppSettings> {
   static const _foldTurnsKey = 'fold_completed_turns';
   static const _visualRepliesKey = 'visual_replies';
   static const _secure = AppSecureStorage();
-  // Keep a completed default for test/fallback controllers that override
-  // [build] without running the asynchronous settings load.
-  Future<void> _loaded = Future<void>.value();
+  late Future<void> _loaded;
 
   @override
   AppSettings build() {
@@ -227,11 +225,6 @@ class SettingsController extends Notifier<AppSettings> {
   }
 
   Future<void> setApiKey(String key) async {
-    // The initial load runs asynchronously from [build]. Waiting for it here
-    // prevents a slow Keychain read from publishing an old empty value over a
-    // key the user has just saved.
-    await _loaded;
-    if (!ref.mounted) return;
     ref.read(readListCredentialEpochProvider.notifier).advance();
     final trimmed = key.trim();
     if (trimmed.isEmpty) {
@@ -239,14 +232,6 @@ class SettingsController extends Notifier<AppSettings> {
     } else {
       await _secure.write(key: _apiKeyKey, value: trimmed);
     }
-    // A successful platform call is not enough to prove that the credential
-    // is readable by the next app start (this matters on iOS Keychain under
-    // self-signed builds). Verify the value before publishing it to the UI.
-    final stored = await _secure.read(key: _apiKeyKey);
-    if ((stored ?? '') != trimmed) {
-      throw StateError('api_key_store_failed');
-    }
-    if (!ref.mounted) return;
     state = state.copyWith(apiKey: trimmed);
   }
 

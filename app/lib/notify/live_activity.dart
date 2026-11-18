@@ -37,7 +37,6 @@ class LiveActivity {
     this.since,
     this.target,
     this.eventId,
-    this.tier = 0,
   });
 
   final LiveKind kind;
@@ -64,9 +63,6 @@ class LiveActivity {
   /// The request it waits on.
   final String? eventId;
 
-  /// The pet's animation tier for a running turn.
-  final int tier;
-
   Map<String, Object?> toMap() => {
     'kind': kind.name,
     'title': title,
@@ -90,11 +86,10 @@ class LiveActivity {
       other.mood == mood &&
       other.since == since &&
       other.target == target &&
-      other.eventId == eventId &&
-      other.tier == tier;
+      other.eventId == eventId;
 
   @override
-  int get hashCode => Object.hash(kind, title, text, chip, publicText, mood, since, target, eventId, tier);
+  int get hashCode => Object.hash(kind, title, text, chip, publicText, mood, since, target, eventId);
 
   @override
   String toString() => 'LiveActivity(${kind.name} "$title" · $text)';
@@ -158,7 +153,6 @@ LiveActivity? liveActivityOf({
     since: kind == LiveKind.running || kind == LiveKind.waiting ? started(target) : null,
     target: target,
     eventId: eventId,
-    tier: kind == LiveKind.running ? pet.tier : 0,
   );
 
   LiveActivity? runningAs(PetStateName state) {

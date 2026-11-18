@@ -1,4 +1,5 @@
 import Flutter
+import Security
 import UIKit
 import UserNotifications
 
@@ -12,6 +13,7 @@ import UserNotifications
   ) -> Bool {
     // Before launch finishes, or the tap that launched the app is lost.
     UNUserNotificationCenter.current().delegate = NotifyTaps.shared
+    forgetPreviousInstall()
     #if DSH_PHONE_SELF_RUNNER_DIAGNOSTICS
     let preflight = ProcessInfo.processInfo.arguments.contains("--dsh-phone-preflight")
       || ProcessInfo.processInfo.environment["DSH_PHONE_PREFLIGHT"] == "1"
@@ -41,6 +43,16 @@ import UserNotifications
     }
     #endif
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  /// The Keychain outlives an uninstall and UserDefaults doesn't. On a fresh install
+  /// anything in there belongs to the last one, and must not sign this one in.
+  private func forgetPreviousInstall() {
+    let marker = "dsh.installed"
+    let defaults = UserDefaults.standard
+    guard !defaults.bool(forKey: marker) else { return }
+    SecItemDelete([kSecClass: kSecClassGenericPassword] as CFDictionary)
+    defaults.set(true, forKey: marker)
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {

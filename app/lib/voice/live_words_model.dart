@@ -7,12 +7,10 @@ import 'native_trial.dart';
 import 'streaming_asr_model.dart';
 
 /// What live words run on here: HarmonyOS's own recognizer once its probe says
-/// ready, the downloaded model elsewhere. iOS uses its native system dictation
-/// and does not provide the PCM tap required for separate live words.
+/// ready, the downloaded model elsewhere. Null when there is none; a failed
+/// HarmonyOS probe throws, as the model store does.
 Future<({StreamingAsrModel model, NativeTrial? trial})?> liveWordsModel(WidgetRef ref) async {
-  final os = ref.read(operatingSystemProvider);
-  if (os == 'ios') return null;
-  if (os == 'ohos') {
+  if (ref.read(operatingSystemProvider) == 'ohos') {
     // The probe is autoDispose: held while it runs, re-asked next time.
     final probe = ref.listenManual(ohosStreamingAsrReadyProvider, (_, _) {});
     try {

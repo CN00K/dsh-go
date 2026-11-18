@@ -4,7 +4,7 @@
 # branch port/1.1.1-ish) and run the "ios-stage2-verify" workflow on
 # Codemagic (mac_mini_m2, team zzuu account as currently used).
 #
-# What it does (1.1.1 engine assembly, D1c step 1: loopback HTTP bridge kept):
+# What it does (1.2.0 engine assembly, D1c step 1: loopback HTTP bridge kept):
 #   1. flutter pub get + analyze (+ l10n check)
 #   2. Verifies the hash-pinned patch registration (195, see step note).
 #      The patches themselves are applied INSIDE prepare-engine.sh:
@@ -54,11 +54,11 @@
 #   what burns the free minutes. Check the remaining quota on the
 #   account that will run the build BEFORE triggering it.
 #   max_build_duration 120 for ios-stage2-verify is provisional: the
-#   1.1.1 engine preparation has never been timed on Codemagic. Measure
+#   1.2.0 engine preparation has never been timed on Codemagic. Measure
 #   the first run and tighten it after.
 workflows:
   ios-stage2-verify:
-    name: iOS stage 2 verify (1.1.1 port, iSH, unsigned)
+    name: iOS stage 2 verify (1.2.0 port, iSH, unsigned)
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
@@ -87,7 +87,7 @@ workflows:
             # third_party/ish/build-ish.sh installs its own brew deps
             # when missing). Checking here would only duplicate that
             # logic and block the install step.
-            # NOTE: `pod` is intentionally absent: 1.1.1 has no Podfile
+            # NOTE: `pod` is intentionally absent: 1.2.0 has no Podfile
             # (plugins use Swift Package Manager); there is no pod
             # install step in this workflow any more.
             for t in rsync unzip tar curl shasum file zip ditto; do
@@ -140,7 +140,7 @@ workflows:
           print('patch registration OK:', len(names))
           PYEOF
 
-      - name: Prepare engine (upstream 1.1.1 flow)
+      - name: Prepare engine (upstream 1.2.0 flow)
         script: |
           set -euo pipefail
           # Replaces the feat flow's hand-rolled npm ci + patch-dsh +
@@ -452,7 +452,7 @@ workflows:
       - build-logs/*.log
 
   ios-unsigned:
-    name: iOS unsigned IPA (1.1.1 engine, no iSH)
+    name: iOS unsigned IPA (1.2.0 engine, no iSH)
     instance_type: mac_mini_m2
     max_build_duration: 90
     environment:
@@ -506,7 +506,7 @@ workflows:
           print('patch registration OK:', len(names))
           PYEOF
 
-      - name: Prepare engine (upstream 1.1.1 flow)
+      - name: Prepare engine (upstream 1.2.0 flow)
         script: |
           set -euo pipefail
           # Same constraint as ios-stage2-verify: prepare-inputs.py
