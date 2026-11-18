@@ -14,10 +14,11 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
@@ -25,6 +26,11 @@ const TOKEN = 'test-token-123';
 const PORT_ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
 const TREE_RUNTIME = join(PORT_ROOT, 'runtime/ohos/process/runtime.mjs');
 const SPECIALIZE_PY = join(PORT_ROOT, 'tooling/ios/specialize-runtime.py');
+// N-2 caller files: the two stock terminal callers the iOS
+// specialization attaches the resolved policy in (see
+// tooling/ios/specialize-runtime.py DIAGNOSTIC_EDITS).
+const TERMINAL_BASH_FILE = 'node_modules/@deepseek-ai/dsh-terminal-bash/lib/index.js';
+const TERMINAL_CONTROLLER_FILE = 'node_modules/@deepseek-ai/dsh-api-terminal-controller/lib/index.js';
 
 const fakeRoot = mkdtempSync(join(tmpdir(), 'ios-specialized-runtime-'));
 const fakeHome = join(fakeRoot, 'root');
@@ -284,4 +290,151 @@ test('N-2: a read-only policy marks the terminal upgrade readOnly; no policy lea
     `a terminal without a policy must upgrade plainly; saw ${JSON.stringify(server.urls())}`);
   assert.ok(server.urls().filter((url) => url.includes('?')).every((url) => url === '/ish/pty?readOnly=1'),
     `no other query form may appear; saw ${JSON.stringify(server.urls())}`);
+});
+
+/**
+ * Run the real specialize script's diagnostics_for_ios() on one
+ * composed-tree file and return the specialized text. The script
+ * itself enforces every anchor's count == 1, so a drifted upstream
+ * file fails here instead of silently shipping unpatched.
+ */
+function specializeFile(relPath) {
+  const script = [
+    'import importlib.util, sys',
+    "spec = importlib.util.spec_from_file_location('specialize_runtime', sys.argv[1])",
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+    "data = open(sys.argv[2], 'rb').read()",
+    'out = mod.diagnostics_for_ios(sys.argv[4], data)',
+    "open(sys.argv[3], 'wb').write(out)",
+  ].join('\n');
+  const tmp = mkdtempSync(join(tmpdir(), 'ios-specialized-file-'));
+  const outPath = join(tmp, 'out.js');
+  execFileSync('python3', ['-c', script, SPECIALIZE_PY, join(PORT_ROOT, relPath), outPath, relPath], { stdio: 'pipe' });
+  return readFileSync(outPath, 'utf8');
+}
+
+/**
+ * Import a specialized caller module from a temp mirror of the repo
+ * layout: the specialized file sits at <mirror>/caller/<relPath>, so
+ * its bare imports resolve through <mirror>/node_modules (symlinked
+ * to the repo's), exactly like the composed runtime tree's layout.
+ * The mirror's own node_modules holds only the specialized caller
+ * packages; every other bare import falls through to the repo tree.
+ */
+async function loadSpecializedCaller(t, relPath) {
+  const text = specializeFile(relPath);
+  const mirror = mkdtempSync(join(tmpdir(), 'ios-specialized-caller-'));
+  const dest = join(mirror, 'caller', relPath);
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, text);
+  symlinkSync(join(PORT_ROOT, 'node_modules'), join(mirror, 'node_modules'));
+  t.after(() => rmSync(mirror, { recursive: true, force: true }));
+  return import(pathToFileURL(dest).href);
+}
+
+// N-2 caller: the specialization itself must attach the policy —
+// the stock callers do not, and the anchor's count == 1 is enforced
+// by diagnostics_for_ios, so these tests also guard anchor drift.
+test('N-2 caller: terminal-bash specialization attaches policy to the spawnTerminal spec', () => {
+  const original = readFileSync(join(PORT_ROOT, TERMINAL_BASH_FILE), 'utf8');
+  const text = specializeFile(TERMINAL_BASH_FILE);
+  assert.ok(text.includes('\t\t\targv,\n\t\t\tpolicy,\n\t\t\tcwd: spec.cwd'),
+    'specialized spawnTerminal spec must carry the resolved policy');
+  assert.ok(!original.includes('\t\t\targv,\n\t\t\tpolicy,\n'),
+    'the stock caller must not attach policy (the test is sensitive to the edit)');
+});
+
+test('N-2 caller: terminal-controller specialization resolves and attaches policy', () => {
+  const original = readFileSync(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE), 'utf8');
+  const text = specializeFile(TERMINAL_CONTROLLER_FILE);
+  assert.ok(text.includes('const { subprocess, sandboxPolicy, workingDirectory } = this.execution(agent);'),
+    'spawn must fetch the sandboxPolicy provider');
+  assert.ok(text.includes('const policy = sandboxPolicy.resolve({ session: agent.session });'),
+    'spawn must resolve the policy for the agent session');
+  assert.ok(text.includes('argv: [shell.path, ...shell.args],\n\t\t\t\tpolicy,'),
+    'specialized spawnTerminal spec must carry the resolved policy');
+  assert.ok(!original.includes('sandboxPolicy, workingDirectory } = this.execution(agent)'),
+    'the stock caller must not fetch sandboxPolicy (the test is sensitive to the edit)');
+});
+
+// N-2 caller: drive the specialized BashTerminalBackend with stubbed
+// ctx and a capturing spawnTerminal, and assert the resolved policy
+// reaches the spec. The backend's own spawnTerminal is injected, so
+// no subprocess or guest is involved.
+test('N-2 caller: BashTerminalBackend.spawn puts the resolved policy in the spec', { timeout: 15000 }, async (t) => {
+  const { BashTerminalBackend } = await loadSpecializedCaller(t, TERMINAL_BASH_FILE);
+  const session = { id: 'sess-n2', header: { cwd: '/tmp' } };
+  const owner = { id: 'owner-n2', session, ctx: { on: () => {} } };
+  const resolved = { mode: 'read-only', workspaceRoot: '/tmp', sessionId: 'sess-n2' };
+  const ctx = {
+    terminals: {},
+    sandboxPolicy: {
+      resolve: (request) => {
+        assert.equal(request.session, session, 'policy must resolve for the spec owner session');
+        return resolved;
+      },
+    },
+    workingDirectory: { ensure: async () => '/tmp' },
+    get: (name) => (name === 'sandbox' ? { confine: async (argv) => ({ argv }) } : undefined),
+  };
+  const config = {
+    backendType: 'bash', shellPath: '/bin/bash', shellArgs: [],
+    rows: 24, cols: 80, shellDialect: 'bash', disposeGraceMs: 200, timeoutMs: 5000,
+  };
+  let captured = null;
+  const spawnTerminal = async (spec) => { captured = spec; return { pid: 7 }; };
+  const createSession = () => ({ initialize: async () => {} });
+  const backend = new BashTerminalBackend(ctx, config, spawnTerminal, createSession);
+  const spawned = await backend.spawn({ owner, sessionId: 'pty-n2', cwd: '/tmp' });
+  assert.ok(spawned, 'spawn must return the created session');
+  assert.equal(captured.policy, resolved, 'the resolved policy must travel in the spec');
+  assert.equal(captured.policy.mode, 'read-only');
+  assert.deepEqual(captured.argv, ['/bin/bash']);
+});
+
+// N-2 caller: drive the specialized TerminalController.spawn with a
+// fake `this` (execution/config only) and stubbed providers, and
+// assert the resolved policy reaches the spec. spawn() itself builds
+// a BrowserTerminal around the stubbed handle, so the handle carries
+// an ended output stream and an already-settled done.
+test('N-2 caller: TerminalController.spawn puts the resolved policy in the spec', { timeout: 15000 }, async (t) => {
+  const { TerminalController } = await loadSpecializedCaller(t, TERMINAL_CONTROLLER_FILE);
+  const session = { id: 'sess-n2-ctl', header: { cwd: '/tmp' } };
+  const resolved = { mode: 'read-only', workspaceRoot: '/tmp', sessionId: 'sess-n2-ctl' };
+  let captured = null;
+  const providers = {
+    subprocess: {
+      resolveExecutable: async (path) => path,
+      spawnTerminal: async (spec) => {
+        captured = spec;
+        return { pid: 7, output: Readable.from([]), done: Promise.resolve({ exitCode: 0, signal: null }) };
+      },
+    },
+    sandboxPolicy: {
+      resolve: (request) => {
+        assert.equal(request.session, session, 'policy must resolve for the agent session');
+        return resolved;
+      },
+    },
+    workingDirectory: { ensure: async () => '/tmp' },
+  };
+  const agent = { id: 'agent-n2', session, ctx: { get: (name) => providers[name] } };
+  const fakeThis = {
+    execution: (a) => ({
+      subprocess: a.ctx.get('subprocess'),
+      sandboxPolicy: a.ctx.get('sandboxPolicy'),
+      workingDirectory: a.ctx.get('workingDirectory'),
+    }),
+    config: {
+      shell: { path: '/bin/bash', args: [], name: 'bash' },
+      disposeGraceMs: 200, scrollback: 100, maxBufferedBytes: 4096,
+    },
+  };
+  const terminal = await TerminalController.prototype.spawn.call(
+    fakeThis, agent, {}, { id: 't-n2', cols: 80, rows: 24 }, new AbortController().signal);
+  assert.ok(terminal, 'spawn must return the created terminal');
+  assert.equal(captured.policy, resolved, 'the resolved policy must travel in the spec');
+  assert.equal(captured.policy.mode, 'read-only');
+  assert.deepEqual(captured.argv, ['/bin/bash']);
 });

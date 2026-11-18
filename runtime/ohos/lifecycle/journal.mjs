@@ -198,7 +198,9 @@ export async function openBoundaryJournal({ directory, lockExclusive, fs = nodeF
           // hit EEXIST, read the remnant as corruption and poison the
           // journal for a transient failure. The unlink is best-effort;
           // the original write error is the one the caller must see.
-          await fs.unlink(path).catch(() => {});
+          // R3-4: a failed unlink is still surfaced on the rethrown
+          // error, so diagnostics can see the remnant is there.
+          await fs.unlink(path).catch(() => { error.cleanupFailed = true; });
           throw error;
         }
         if (error.code !== 'EEXIST') throw error;

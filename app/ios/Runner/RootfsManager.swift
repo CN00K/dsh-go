@@ -380,6 +380,14 @@ struct RootfsManager {
         guard let backup = latestUserRootBackup() else { return }
         let root = dataURL.appendingPathComponent("root", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        // (R3-N-1) /root is 0700 in the factory image, but the host
+        // default is 0755 — and the register_subtree below rewrites
+        // meta.db from the host mode, so a 0755 host dir would silently
+        // relax /root. Enforce 0700 even when the dir already existed
+        // (createDirectory's attributes only apply on creation). Best
+        // effort: a chmod failure degrades to today's behavior rather
+        // than failing the whole restore.
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         guard let enumerator = fm.enumerator(atPath: backup.path) else {
             throw RootfsError.ioError("恢复 /root 备份失败：无法枚举备份 \(backup.lastPathComponent)")
         }
@@ -437,6 +445,19 @@ struct RootfsManager {
     /// kernel is booted: the kernel reads guest files on demand through
     /// fakefs, so restoring the missing files lets the next shell spawn
     /// succeed. (H-4) The restore is a full sweep, not just the five
+    /// Factory modes for shipped directories that differ from the host
+    /// default 0755, keyed by the sweep enumerator path under data/
+    /// ("tmp", "var/tmp"). Values are from the shipped meta.db — the
+    /// zip's external attrs do NOT carry them (the build tree is
+    /// flattened to 02770 before zipping, verified against the 11-14
+    /// product zip), so they are pinned here instead of read from the
+    /// zip. (R3-N-1) /root (0700) is not listed: it is enforced in
+    /// restoreLatestUserRootBackup, the only path that rebuilds it.
+    private static let factoryDirModes: [String: Int] = [
+        "tmp": 0o1777,
+        "var/tmp": 0o1777,
+    ]
+
     /// critical files: a reset-while-booted deletes the whole tree,
     /// and restoring only the critical set would leave a tree that
     /// reports running while /bin/bash and every other shipped file
@@ -526,6 +547,17 @@ struct RootfsManager {
                     if !fm.fileExists(atPath: dst.path) {
                         try fm.createDirectory(at: dst, withIntermediateDirectories: true)
                     }
+                    // (R3-N-1) Restore the factory mode for shipped dirs
+                    // that differ from the host default 0755 (/tmp and
+                    // /var/tmp are 1777). Applied whether the dir was
+                    // just created or already existed: the M-8
+                    // re-registration below rewrites meta.db from the
+                    // host lstat mode, so a pre-existing 0755 host dir
+                    // would lose the sticky bit the same way. Best
+                    // effort, as in restoreLatestUserRootBackup.
+                    if let mode = factoryDirModes[rel] {
+                        try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: dst.path)
+                    }
                     continue
                 }
                 var dstIsDir: ObjCBool = false
@@ -541,9 +573,14 @@ struct RootfsManager {
                     if isSymlink || dstIsDir.boolValue { continue }
                     if let expected = shippedSizes["data/" + rel],
                        let attrs = try? fm.attributesOfItem(atPath: dst.path),
-                       let size = attrs[.size] as? UInt64,
-                       size == UInt64(expected) {
-                        continue
+                       let size = attrs[.size] as? UInt64 {
+                        if size == UInt64(expected) { continue }
+                        // (R3-N-2, option b) A size mismatch rebuilds
+                        // the file from the factory zip — which also
+                        // silently reverts a user edit that changed the
+                        // size. Log the path and both sizes first so
+                        // the revert is visible in diagnostics.
+                        NSLog("RootfsManager: 恢复尺寸不符文件 %@（现有 %llu 字节，出厂 %u 字节）", rel, size, expected)
                     }
                     try fm.removeItem(at: dst)
                 }

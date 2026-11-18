@@ -1532,6 +1532,33 @@ test('ishWorkerKillJob surfaces a 404 as ISH_JOB_NOT_FOUND', async () => {
   }
 });
 
+// R3-N2 (option b): the first kill attempt lands server-side but its
+// response is lost to a transport error; the retry gets 404 because the
+// job is already gone. The job IS dead, so killJob returns true instead
+// of reporting the kill as not-found.
+test('ishWorkerKillJob returns true when the retry gets 404 after a lost kill response (R3-N2)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    if (requests === 1) {
+      res.writeHead(200, {'Content-Type': 'application/json'});
+      res.destroy(); // kill landed, response lost
+      return;
+    }
+    res.writeHead(404, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'job_not_found'}));
+  });
+  try {
+    invalidateServiceInfo();
+    assert.equal(await ishWorkerKillJob('sess-kill-404', 1234, {serviceFile: writeServiceFile(port)}), true);
+    assert.equal(requests, 2, 'the transport error must retry once before the 404 answers true');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
 test('ishWorkerStop clears the worker state (jobs are done)', async () => {
   clearWorkerState();
   const sessionId = 'sess-stop';
@@ -1762,6 +1789,38 @@ test('ishWebSocket gives up the handshake after a timeout (M-3)', async () => {
     assert.equal(outcome, 'rejected:ISH_WS_HANDSHAKE_TIMEOUT');
   } finally {
     for (const s of sockets) s.destroy();
+    await new Promise((done) => server.close(done));
+  }
+});
+
+// R3-N-1: a 403 refusal carries a JSON body, like the Swift read-only
+// refusal (OHOS_SANDBOX_DENIED). The bridge surfaces its error field in
+// the failure message, and a 4xx is deterministic — the identical
+// handshake is not retried, so only one connection is made.
+test('ishWebSocket surfaces the 403 JSON error and does not retry a 4xx refusal (R3-N-1)', async () => {
+  let connections = 0;
+  const server = createServer();
+  server.on('upgrade', (_req, socket) => {
+    connections++;
+    const body = JSON.stringify({error: 'OHOS_SANDBOX_DENIED: read-only session'});
+    socket.end(`HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const port = server.address().port;
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const ws = ishWebSocket({path: '/ish/pty?readOnly=1', serviceFile});
+    const outcome = await Promise.race([
+      ws.ready.then(() => 'resolved', (error) => error),
+      new Promise((done) => setTimeout(() => done('TIMEOUT'), 15000)),
+    ]);
+    assert.notEqual(outcome, 'TIMEOUT', 'handshake must settle');
+    assert.equal(outcome.code, 'ISH_WS_UPGRADE_FAILED');
+    assert.equal(outcome.statusCode, 403);
+    assert.match(outcome.message, /OHOS_SANDBOX_DENIED/);
+    assert.equal(connections, 1, 'a 4xx refusal must not be retried');
+  } finally {
     await new Promise((done) => server.close(done));
   }
 });
@@ -2165,6 +2224,29 @@ test('ishExec does not retry a response-phase disconnect before any output (N-1)
   }
 });
 
+// R3-N4: a 429 (pty_session_limit) is a throttle, not a pre-run rejection
+// a retry can fix — ishWorkerExec must not retry it, symmetric with
+// ishExec (which already excluded 429 in round 2).
+test('ishWorkerExec does not retry a 429 throttle (R3-N4)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(429, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'pty_session_limit'}));
+  });
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', sessionId: 'sess-429', serviceFile: writeServiceFile(port)}),
+      (error) => error.code === 'ISH_HTTP_ERROR' && error.statusCode === 429);
+    assert.equal(requests, 1, 'a 429 throttle must not be retried');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
 // N-1: a garbled response (llhttp HPE_* parse error) is a
 // response-phase failure too — the request may already have run.
 test('ishExec does not retry a garbled (HPE_*) response (N-1)', async () => {
@@ -2233,6 +2315,47 @@ test('ishWorkerExec does not retry a response-phase disconnect before any output
       ishWorkerExec({command: 'true', sessionId: 'sess-worker-n1', serviceFile: writeServiceFile(port), onLine: () => {}}),
       (error) => error.code === 'ECONNRESET');
     assert.equal(requests, 1, 'a response-phase disconnect must not retry the worker command');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// N-1 (round 2 follow-up): spawnIshExec's worker→one-shot fallback is
+// the same double-run window at the spawn layer — a worker disconnect
+// with no output must NOT fall back to one-shot, because the worker
+// may already have run the command. Only a failed connect
+// (ECONNREFUSED) proves it never ran and still falls back.
+test('spawnIshExec does not fall back to one-shot after a worker disconnect with no output', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const urls = [];
+  const {server, port, close} = await startMockServer((req, res) => {
+    requests++;
+    urls.push(req.url);
+    if (req.url === '/ish/worker/run') {
+      res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+      res.destroy(); // no output line, then kill the connection
+      return;
+    }
+    // Any one-shot fallback would arrive here.
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'rm -f /tmp/x'],
+      {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: 'sess-fallback-n1'}});
+    let stderr = '';
+    child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+    const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    assert.deepEqual(outcome, {code: 1, signal: null});
+    assert.match(stderr, /ish bridge unavailable/);
+    assert.equal(requests, 1, 'the worker disconnect must not fall back to a one-shot re-run');
+    assert.deepEqual(urls, ['/ish/worker/run']);
   } finally {
     clearWorkerState();
     await close();
@@ -2397,6 +2520,41 @@ test('ishExec rejects argv+command and argv+tty before sending HTTP (N-4)', asyn
       ishExec({argv: ['rg', 'x'], tty: true, serviceFile}),
       (error) => error.code === 'ISH_INVALID_ARGV');
     assert.equal(requests, 0, 'both rejected combinations must fail before any HTTP is sent');
+  } finally {
+    await close();
+  }
+});
+
+// R3-N1: without argv, command must be a non-empty string; NUL bytes in
+// command, argv elements, env keys/values or cwd are rejected up front —
+// the server would silently truncate them at its C string boundary.
+test('ishExec/ishWorkerExec reject missing/empty/NUL-bearing command, argv, env and cwd before sending HTTP (R3-N1)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
+    // ishExec: no argv and no/empty command.
+    await assert.rejects(ishExec({serviceFile}), invalid);
+    await assert.rejects(ishExec({command: '', serviceFile}), invalid);
+    // ishExec: NUL in command / argv element / env key / env value / cwd.
+    await assert.rejects(ishExec({command: 'echo\0hi', serviceFile}), invalid);
+    await assert.rejects(ishExec({argv: ['rg', 'x\0y'], serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: {'A\0B': '1'}, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: {A: '1\0'}, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', cwd: '/tmp\0x', serviceFile}), invalid);
+    // ishWorkerExec: no/empty/NUL command, NUL env/cwd.
+    await assert.rejects(ishWorkerExec({sessionId: 'sess-r3n1', serviceFile}), invalid);
+    await assert.rejects(ishWorkerExec({command: '', sessionId: 'sess-r3n1', serviceFile}), invalid);
+    await assert.rejects(ishWorkerExec({command: 'echo\0hi', sessionId: 'sess-r3n1', serviceFile}), invalid);
+    await assert.rejects(ishWorkerExec({command: 'echo hi', sessionId: 'sess-r3n1', env: {A: '1\0'}, serviceFile}), invalid);
+    await assert.rejects(ishWorkerExec({command: 'echo hi', sessionId: 'sess-r3n1', cwd: '/tmp\0x', serviceFile}), invalid);
+    assert.equal(requests, 0, 'all invalid inputs must fail before any HTTP is sent');
   } finally {
     await close();
   }

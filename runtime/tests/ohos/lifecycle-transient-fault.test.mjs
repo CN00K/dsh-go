@@ -141,6 +141,25 @@ test('transient journal append failure during pause still stops the budget clock
   assert.equal(f.c.status().confirmedPause, true);
 });
 
+// R3-1: a failed #pause() leaves the boundary paused but the pause record
+// unpersisted. The next native refresh (desired stays false, target already
+// false, so no transition fires) retries #pause() once; the record lands and
+// the marker clears, so a later refresh does not re-record.
+test('transient journal append failure during pause is retried by the next native refresh; the pause record lands', async t => {
+  const f = setup(t);
+  f.journal.failAppend(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.equal(f.c.status().blocked, false);
+  assert.equal(f.c.status().paused, true);
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), []);
+  await f.c.observeHost({});
+  assert.equal(f.c.status().paused, true);
+  assert.equal(f.c.status().confirmedPause, true);
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+});
+
 // N-6: a flushSession that throws is transient (covered above); one that
 // returns non-true means no durable flush listener is registered at all —
 // a persistent configuration failure no retry can fix — so it poisons.

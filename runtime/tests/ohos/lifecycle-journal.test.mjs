@@ -50,6 +50,20 @@ test('outcomes reference synced exact JSON bytes; identical concurrent results s
   assert.equal((await fs.stat(join(f.directory, b.body.result.path))).mode & 0o777, 0o600);
 });
 
+// R3-5: the same result bytes appended twice sequentially (the normal
+// outcome() retry) must share one verified file: the second call takes
+// the EEXIST path, returns the same sha256, and results/ still holds
+// exactly one file — it must not corrupt, duplicate or re-write it.
+test('identical results appended twice sequentially share one verified file (R3-5)', async t => {
+  const f = await fixture(t);
+  const result = { content: [{ type: 'text', text: 'same bytes twice' }], isError: false };
+  const a = await f.journal.appendResult(body('returned'), result);
+  const b = await f.journal.appendResult(body('outcome'), result);
+  assert.deepEqual(a.body.result, b.body.result);
+  assert.deepEqual(await f.journal.readResult(b.body.result), result);
+  assert.deepEqual(await fs.readdir(join(f.directory, 'results')), [b.body.result.sha256 + '.json']);
+});
+
 for (const damage of ['tail', 'checksum', 'sequence', 'empty']) test(`real ${damage} corruption preserves prefix and refuses new dispatch`, async t => {
   const f = await fixture(t);
   await f.journal.append(body('prepared')); await f.journal.append(body('dispatch'));

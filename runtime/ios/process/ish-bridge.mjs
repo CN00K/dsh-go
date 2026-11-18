@@ -414,7 +414,8 @@ function isStaleConnectionError(error) {
  * True only when the TCP connect itself failed (ECONNREFUSED): no
  * bytes were sent, so the request certainly never reached the service
  * and a retry cannot execute the command twice. N-1 (round 2): this
- * is the only transport error the exec retry loops treat as retryable.
+ * is the only transport error the exec retry loops — and the
+ * worker→one-shot fallback in spawnIshExec — treat as retryable.
  * Response-phase disconnects (ECONNRESET / HPE_*) are still stale
  * connections for cache invalidation (isStaleConnectionError above),
  * but they must not trigger a retry — the guest command may already
@@ -504,6 +505,36 @@ export function invalidateServiceInfo() {
 // /ish/exec client (node:http, chunked NDJSON)
 // ---------------------------------------------------------------------------
 
+// R3-N1: entry validation shared by ishExec and ishWorkerExec. Without
+// argv, command is required and must be a non-empty string; NUL bytes in
+// command, argv elements, env keys/values or cwd would be silently
+// truncated by the server's C string handling, so reject before any HTTP
+// is sent. Callers pass a valid argv (ishExec validates its shape first)
+// or no argv at all (ishWorkerExec takes command only).
+function assertValidExecInput(opts) {
+  if (opts.argv === undefined) {
+    if (typeof opts.command !== 'string' || opts.command.length === 0 || opts.command.includes('\0')) {
+      throw Object.assign(
+        new Error('ish command must be a non-empty string without NUL bytes'),
+        {code: 'ISH_INVALID_ARGV'});
+    }
+  } else if (opts.argv.some((a) => a.includes('\0'))) {
+    throw Object.assign(
+      new Error('ish argv must not contain NUL bytes'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+  if (typeof opts.cwd === 'string' && opts.cwd.includes('\0')) {
+    throw Object.assign(
+      new Error('ish cwd must not contain NUL bytes'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+  if (opts.env && Object.entries(opts.env).some(([k, v]) => k.includes('\0') || (typeof v === 'string' && v.includes('\0')))) {
+    throw Object.assign(
+      new Error('ish env keys and values must not contain NUL bytes'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+}
+
 /**
  * Run one command in the guest via POST /ish/exec.
  * @param opts.command shell source (required).
@@ -564,6 +595,9 @@ export async function ishExec(opts) {
       new Error('ish argv cannot be combined with tty'),
       {code: 'ISH_INVALID_ARGV'});
   }
+  // R3-N1: without argv command is required; NUL in command/argv/env/cwd
+  // fails here, before any HTTP is sent (see assertValidExecInput).
+  assertValidExecInput(opts);
   const body = JSON.stringify({
     ...(opts.command ? {command: opts.command} : {}),
     ...(opts.argv ? {argv: opts.argv} : {}),
@@ -1075,6 +1109,9 @@ export async function ishWorkerExec(opts) {
   if (!sessionId) {
     throw Object.assign(new Error('ishWorkerExec requires a sessionId'), {code: 'ISH_WORKER_NO_SESSION'});
   }
+  // R3-N1: command is required (no argv mode here); NUL in command/env/cwd
+  // fails before the op is queued, so no HTTP is sent (see assertValidExecInput).
+  assertValidExecInput(opts);
   const state = workerSessionState(sessionId);
   return enqueueWorkerOp(sessionId, async () => {
     const generation = state.generation;
@@ -1176,9 +1213,11 @@ export async function ishWorkerExec(opts) {
         // (ECONNREFUSED) retries. A response-phase ECONNRESET / HPE_*
         // must not retry: the worker command may already have run
         // without streaming anything yet. HTTP errors stay retryable
-        // (the server answers non-200 before running anything).
+        // (the server answers non-200 before running anything) except
+        // 429: a throttle is not a pre-run rejection a retry can fix,
+        // and re-hitting it immediately just extends the throttle.
         const retryable = isConnectFailedError(error)
-          || error?.code === 'ISH_HTTP_ERROR';
+          || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
         if (retryable && attempt === 0 && !sawOutput) continue;
         throw lastError;
       }
@@ -1235,6 +1274,13 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
       if (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode === 404) {
+        // R3-N2 (option b): a 404 after a retried transport error means
+        // the job is gone — most plausibly our first kill landed and its
+        // response was lost. The caller's question is "is the job dead",
+        // so answer true instead of reporting a kill that already
+        // happened as not-found. A 404 on the first attempt still
+        // throws: the job never existed (or died before we tried).
+        if (attempt > 0) return true;
         throw Object.assign(
           new Error(`ish job not found: session ${sessionId} pid ${pid}`),
           {code: ISH_JOB_NOT_FOUND});
@@ -1263,6 +1309,14 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
  */
 export async function ishWorkerStop(sessionId, opts = {}) {
   const state = workerSessions.get(sessionId);
+  // R3-N3: stop waits behind an in-flight run — enqueueWorkerOp chains
+  // onto the previous op with no timeout and no abort signal of its own,
+  // so a hung run starves the stop. Deliberately not fixed by pre-clearing
+  // state: clearing knownAlive/jobs before the run finishes would
+  // reintroduce the round-2 N-2 ordering break (a later run reusing the
+  // session while the old one is still in flight). The wait is bounded in
+  // practice by the run's own abort signal and server timeout, not by the
+  // queue — so this stays a documented trade-off, not a fix.
   return enqueueWorkerOp(sessionId, async () => {
   try {
     let lastError = null;
@@ -1366,7 +1420,10 @@ export function ishWebSocket(opts) {
         socket = null;
         handshakeDone = false;
         handshakeBuffer = Buffer.alloc(0);
-        if (attempt === 0) continue;
+        // R3-N-1: a 4xx refusal is deterministic (policy denial, bad
+        // request) — retrying the identical handshake cannot succeed,
+        // so fail immediately instead of spending the second attempt.
+        if (attempt === 0 && !(error?.statusCode >= 400 && error?.statusCode < 500)) continue;
         throw lastError;
       }
     }
@@ -1437,9 +1494,24 @@ export function ishWebSocket(opts) {
         const rest = handshakeBuffer.subarray(end + 4);
         const statusLine = head.split('\r\n')[0] ?? '';
         if (!statusLine.includes('101')) {
+          // R3-N-1: a refusal carries a JSON body, e.g. 403
+          // {"error": "OHOS_SANDBOX_DENIED ..."}. Surface its error field
+          // so the terminal shows why it was refused instead of a bare
+          // status line. The body normally arrives with the headers in
+          // one write; a split or empty body just falls back to the
+          // status line. statusCode lets the retry loop skip 4xx below.
+          const statusCode = Number(/^\S+ (\d{3})/.exec(statusLine)?.[1]);
+          let detail = '';
+          if (rest.length > 0) {
+            try {
+              const parsed = JSON.parse(rest.toString('utf8'));
+              if (typeof parsed?.error === 'string' && parsed.error) detail = `: ${parsed.error}`;
+            } catch {}
+          }
           fail(Object.assign(
-            new Error(`ish websocket upgrade failed: ${statusLine}`),
-            {code: 'ISH_WS_UPGRADE_FAILED', statusLine}));
+            new Error(`ish websocket upgrade failed: ${statusLine}${detail}`),
+            {code: 'ISH_WS_UPGRADE_FAILED', statusLine,
+              ...(Number.isInteger(statusCode) ? {statusCode} : {})}));
           return;
         }
         const accept = /^Sec-WebSocket-Accept:\s*(.+)$/im.exec(head)?.[1]?.trim();
@@ -2005,7 +2077,7 @@ export function spawnIshExec(argv, options = {}) {
         } catch (error) {
           const fallBack = !sawOutput && (error?.code === ISH_WORKER_UNSUPPORTED
             || error?.code === 'ISH_NOT_BOOTED' || error?.code === 'ISH_HTTP_ERROR'
-            || isStaleConnectionError(error));
+            || isConnectFailedError(error));
           if (!fallBack) throw error;
           // Worker unavailable (old service, start failure, or a
           // request the server rejected before running it): one-shot.

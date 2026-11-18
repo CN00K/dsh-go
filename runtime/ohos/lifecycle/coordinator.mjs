@@ -19,7 +19,9 @@ const fatalLifecycleError = error => ['ERR_OHOS_LIFECYCLE_IDENTITY', 'ERR_OHOS_L
 // A flushSession that throws is transient; one that returns non-true means
 // no durable session flush listener is registered at all — a persistent
 // configuration failure no retry can fix — so it poisons like an identity
-// failure. Only prepared()/committed() can produce this code.
+// failure. prepared()/committed() poison on this code; cancel() throws it
+// directly, without poisoning, when the cancelled session has no durable
+// checkpoint.
 const missingCheckpoint = error => error?.code === 'ERR_OHOS_LIFECYCLE_NO_CHECKPOINT';
 const keyOf = value => JSON.stringify([value.sessionId, value.callSeq]);
 const knownString = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\0');
@@ -60,6 +62,10 @@ export class BoundaryCoordinator {
   #cancelling = new Set();
   #onStage;
   #lastPause = false;
+  // R3-1: the last #pause() record never landed (transient journal failure).
+  // #refreshNative retries it once while the target stays paused; #pause()
+  // clears this on success and re-sets it in its catch on failure.
+  #pauseRetryPending = false;
   #manualPaused = false;
   #lastManualPaused = false;
   #readHost;
@@ -197,6 +203,15 @@ export class BoundaryCoordinator {
       this.#admissionTarget = desired;
       this.#hostControl = desired ? this.#resume() : this.#pause();
       // Polling has no request caller to consume failure; #controlTail retains the fault.
+      this.#hostControl.catch(() => {});
+    } else if (desired === false && this.#pauseRetryPending) {
+      // R3-1: the target is already paused but the last pause record never
+      // landed. Retry it once. Clear the marker first so each refresh retries
+      // at most once; a failed retry re-sets it in #pause()'s catch, a
+      // success clears it. N-2's target-reset does not apply here: the
+      // target is already false before #pause(), so there is nothing to reset.
+      this.#pauseRetryPending = false;
+      this.#hostControl = this.#pause();
       this.#hostControl.catch(() => {});
     }
     this.#updateNativePolling();
@@ -451,6 +466,8 @@ export class BoundaryCoordinator {
       await this.#record({ kind: 'pause', bootId: this.bootId, manualPaused });
       this.clock.pause();
       await this.#journal.flush();
+      // R3-1: the pause record landed; clear the retry marker.
+      this.#pauseRetryPending = false;
       return { ...this.status(), acknowledgedControlVersion: version };
     });
     this.#controlTail = work.catch(error => {
@@ -460,6 +477,13 @@ export class BoundaryCoordinator {
       // replaced it since this work started.
       if (this.#hostControl === work) this.#hostControl = undefined;
       if (fatalLifecycleError(error)) this.#fault ??= error;
+      // R3-1: the pause record never landed (transient journal failure).
+      // The boundary is still paused (N-3: gate built before the record),
+      // but the durable record is missing — #refreshNative retries it once
+      // while the target stays paused. If the retry also fails, this catch
+      // re-sets the marker; a stuck marker only causes one retry per
+      // refresh, never a tight loop.
+      this.#pauseRetryPending = true;
       // N-3: the gate was built before the record attempt, so the boundary
       // is paused whether or not the pause record landed: stop the budget
       // clock too, or the pause would keep charging tool budgets.
