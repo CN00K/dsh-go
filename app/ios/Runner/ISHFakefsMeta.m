@@ -253,10 +253,13 @@ int ish_fakefs_meta_remove_path(const char *metaDBPath,
     sqlite3_finalize(st);
     if (rc == 0) {
         // meta.db has no FK cascade: drop stats rows nothing references.
+        // (R7-3-4) The subquery must exclude NULL inodes: one NULL
+        // inode in paths makes the whole NOT IN predicate UNKNOWN and
+        // the cleanup deletes nothing.
         char *errmsg = NULL;
         if (sqlite3_exec(db,
                          "DELETE FROM stats WHERE inode NOT IN "
-                         "(SELECT inode FROM paths)",
+                         "(SELECT inode FROM paths WHERE inode IS NOT NULL)",
                          NULL, NULL, &errmsg) != SQLITE_OK) {
             NSLog(@"ISHFakefsMeta: orphan stats cleanup failed: %s",
                   errmsg ? errmsg : "(null)");
@@ -281,12 +284,19 @@ int ish_fakefs_meta_prune_dead_paths(const char *metaDBPath) {
     if (!db) return -1;
     int rc = -1;
     char *errmsg = NULL;
+    // (R7-3-3) Also delete rows ending in '/' with a non-empty stem
+    // ('/root/'), which the '//*' pattern misses. '?*/' requires at
+    // least one character before the trailing slash, so the "/" row
+    // itself is never matched. (R7-3-4) The orphan-stats subquery
+    // excludes NULL inodes, or a single NULL row disables the whole
+    // NOT IN cleanup.
     if (sqlite3_exec(db,
-                     "DELETE FROM paths WHERE CAST(path AS TEXT) GLOB '//*'",
+                     "DELETE FROM paths WHERE CAST(path AS TEXT) GLOB '//*' "
+                     "OR CAST(path AS TEXT) GLOB '?*/'",
                      NULL, NULL, &errmsg) == SQLITE_OK &&
         sqlite3_exec(db,
                      "DELETE FROM stats WHERE inode NOT IN "
-                     "(SELECT inode FROM paths)",
+                     "(SELECT inode FROM paths WHERE inode IS NOT NULL)",
                      NULL, NULL, &errmsg) == SQLITE_OK) {
         rc = 0;
     } else {
@@ -399,10 +409,21 @@ int ish_fakefs_meta_register_subtree(const char *metaDBPath,
     // "//" and "/root/" cannot produce dead rows ("//..." / "/root/"). "/" stays
     // "/" (length 1 is never stripped); the walker still joins it
     // correctly via the R5-3-1 trailing-slash rule.
+    // (R7-3-2) Collapse runs of '/' inside the prefix first
+    // ("/root//sub" -> "/root/sub"): the trailing-slash strip alone
+    // leaves interior "//", which the walker joins into dead rows
+    // ('/root//sub/...') that prune cannot match either.
     char normalized[PATH_MAX];
     size_t len = strlen(guestPrefix);
     if (len >= sizeof(normalized)) return -1;
     memcpy(normalized, guestPrefix, len + 1);
+    size_t w = 0;
+    for (size_t r = 0; r < len; r++) {
+        if (normalized[r] == '/' && w > 0 && normalized[w - 1] == '/') continue;
+        normalized[w++] = normalized[r];
+    }
+    normalized[w] = '\0';
+    len = w;
     while (len > 1 && normalized[len - 1] == '/') {
         normalized[--len] = '\0';
     }

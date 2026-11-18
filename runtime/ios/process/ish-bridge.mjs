@@ -1824,7 +1824,19 @@ const GUEST_ENV_DSH_ALLOW = new Set(['DSH_SESSION_ID', 'DSH_SHELL', 'DSH_PTY_SES
 export function guestEnv(hostEnv = {}, opts = {}) {
   const hasPty = opts.hasPty === true;
   const env = {};
-  for (const [key, value] of Object.entries(hostEnv ?? {})) {
+  // R7-1-1: a throwing env getter used to leak its raw error out of
+  // Object.entries (and spawnIshExec then misclassified it as
+  // ISH_BRIDGE_UNAVAILABLE). Enumeration failure is a client-side
+  // argument error.
+  let entries;
+  try {
+    entries = Object.entries(hostEnv ?? {});
+  } catch {
+    throw Object.assign(
+      new Error('ish env must be an object mapping strings to strings'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+  for (const [key, value] of entries) {
     if (typeof value !== 'string') continue;
     if (key === 'TERM') {
       // TERM only means something with a tty; without one it is
@@ -2070,8 +2082,18 @@ export function spawnIshExec(argv, options = {}) {
       // cd tool — a bare `cd` inside the guest shell never reaches it.
       // resolveExecCwd reuses the guest's final cwd from the previous
       // exec while the engine cwd is unchanged (see the marker below).
-      const sessionId = typeof options.env?.DSH_SESSION_ID === 'string'
-        ? options.env.DSH_SESSION_ID : null;
+      // R7-1-1: the DSH_SESSION_ID read is outside guestEnv's
+      // enumeration guard, so a throwing getter on that key needs the
+      // same ISH_INVALID_ARGV mapping here.
+      let sessionId = null;
+      try {
+        sessionId = typeof options.env?.DSH_SESSION_ID === 'string'
+          ? options.env.DSH_SESSION_ID : null;
+      } catch {
+        throw Object.assign(
+          new Error('ish env must be an object mapping strings to strings'),
+          {code: 'ISH_INVALID_ARGV'});
+      }
       const engineCwd = toGuest(options.cwd ?? process.cwd());
       const guestCwd = resolveExecCwd(sessionId, engineCwd);
       const env = guestEnv(options.env ?? {}, {hasPty: options.pty === true, ptyTerm: options.ptyTerm});
@@ -2166,7 +2188,12 @@ export function spawnIshExec(argv, options = {}) {
       if (settled) return;
       // Fail closed with the runner-failure signature so dsh-bash-sandbox
       // classifies this as SANDBOX_UNAVAILABLE (not a command failure).
-      const detail = error?.code === 'ISH_NOT_BOOTED' ? ISH_NOT_BOOTED : ISH_BRIDGE_UNAVAILABLE;
+      // R7-1-1: preserve ISH_INVALID_ARGV like ISH_NOT_BOOTED, so a
+      // throwing env getter is reported as an argument error instead of
+      // being rewritten as ISH_BRIDGE_UNAVAILABLE.
+      const detail = error?.code === 'ISH_NOT_BOOTED' ? ISH_NOT_BOOTED
+        : error?.code === 'ISH_INVALID_ARGV' ? 'ISH_INVALID_ARGV'
+        : ISH_BRIDGE_UNAVAILABLE;
       err.write(`${detail}: ${error?.message ?? error}\n`);
       finish(1, null);
     }

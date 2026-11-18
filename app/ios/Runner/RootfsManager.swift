@@ -623,11 +623,15 @@ struct RootfsManager {
             // (R6-3-3) Pre-R5-3-1 walks left "//..." dead rows in
             // meta.db; prune them (and their orphan stats) before
             // re-registering, so the walk below does not inherit them.
+            // (R7-3-5) Best-effort only: prune is pure hygiene (dead
+            // rows are invisible to the guest) and must not abort a
+            // recovery that re-registration could still complete —
+            // e.g. a transient SQLITE_BUSY past the 5 s timeout.
             let pruned = metaDBURL.path.withCString { dbPath in
                 ish_fakefs_meta_prune_dead_paths(dbPath)
             }
-            guard pruned == 0 else {
-                throw RootfsError.ioError("meta.db 清理死行失败 (rc=\(pruned))")
+            if pruned != 0 {
+                NSLog("RootfsManager: meta.db 清理死行失败 (rc=\(pruned))，继续重登记")
             }
             // (M-8) The shipped meta.db only registers factory files;
             // files added after install (apk packages, user writes to
@@ -701,11 +705,13 @@ struct RootfsManager {
             NSLog("RootfsManager: meta.db 缺少 /bin/sh，重新登记整棵 data/ 树")
             // (R6-3-3) Prune "//..." dead rows left by pre-R5-3-1
             // walks (and their orphan stats) before re-registering.
+            // (R7-3-5) Best-effort only, same as the M-8 call site:
+            // a failed prune must not abort the re-registration.
             let pruned = metaDBPath.withCString { dbPath in
                 ish_fakefs_meta_prune_dead_paths(dbPath)
             }
-            guard pruned == 0 else {
-                throw RootfsError.ioError("meta.db 清理死行失败 (rc=\(pruned))")
+            if pruned != 0 {
+                NSLog("RootfsManager: meta.db 清理死行失败 (rc=\(pruned))，继续重登记")
             }
             let rc = metaDBPath.withCString { dbPath in
                 dataURL.path.withCString { dataPath in

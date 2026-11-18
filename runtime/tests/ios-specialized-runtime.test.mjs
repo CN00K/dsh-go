@@ -23,7 +23,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const TOKEN = 'test-token-123';
-const PORT_ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
+const PORT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const TREE_RUNTIME = join(PORT_ROOT, 'runtime/ohos/process/runtime.mjs');
 const SPECIALIZE_PY = join(PORT_ROOT, 'tooling/ios/specialize-runtime.py');
 // N-2 caller file: the one stock terminal caller the iOS
@@ -53,38 +53,46 @@ test.after(() => rmSync(fakeRoot, { recursive: true, force: true }));
  */
 async function loadSpecializedRuntime() {
   const tmp = mkdtempSync(join(tmpdir(), 'ios-specialized-tree-'));
-  const processDir = join(tmp, 'runtime/ohos/process');
-  mkdirSync(processDir, { recursive: true });
-  mkdirSync(join(tmp, 'runtime/ios'), { recursive: true });
-  const script = [
-    'import importlib.util, sys',
-    "spec = importlib.util.spec_from_file_location('specialize_runtime', sys.argv[1])",
-    'mod = importlib.util.module_from_spec(spec)',
-    'spec.loader.exec_module(mod)',
-    "data = open(sys.argv[2], 'rb').read()",
-    "out = mod.diagnostics_for_ios('runtime/ohos/process/runtime.mjs', data)",
-    "open(sys.argv[3], 'wb').write(out)",
-  ].join('\n');
-  const outPath = join(processDir, 'runtime.mjs');
-  execFileSync('python3', ['-c', script, SPECIALIZE_PY, TREE_RUNTIME, outPath], { stdio: 'pipe' });
-  const realProcessDir = join(PORT_ROOT, 'runtime/ohos/process');
-  for (const entry of readdirSync(realProcessDir)) {
-    if (entry === 'runtime.mjs') continue;
-    // Node resolves a symlinked file's relative imports against its
-    // real path, so a symlinked command-router.mjs would import the
-    // UNSPECIALIZED tree runtime.mjs (no ishSpawnFor) instead of this
-    // tree's specialized copy. Copy it as a real file, as the composed
-    // runtime tree does in production.
-    if (entry === 'command-router.mjs') {
-      copyFileSync(join(realProcessDir, entry), join(processDir, entry));
-      continue;
+  try {
+    const processDir = join(tmp, 'runtime/ohos/process');
+    mkdirSync(processDir, { recursive: true });
+    mkdirSync(join(tmp, 'runtime/ios'), { recursive: true });
+    const script = [
+      'import importlib.util, sys',
+      "spec = importlib.util.spec_from_file_location('specialize_runtime', sys.argv[1])",
+      'mod = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(mod)',
+      "data = open(sys.argv[2], 'rb').read()",
+      "out = mod.diagnostics_for_ios('runtime/ohos/process/runtime.mjs', data)",
+      "open(sys.argv[3], 'wb').write(out)",
+    ].join('\n');
+    const outPath = join(processDir, 'runtime.mjs');
+    execFileSync('python3', ['-c', script, SPECIALIZE_PY, TREE_RUNTIME, outPath], { stdio: 'pipe' });
+    const realProcessDir = join(PORT_ROOT, 'runtime/ohos/process');
+    for (const entry of readdirSync(realProcessDir)) {
+      if (entry === 'runtime.mjs') continue;
+      // Node resolves a symlinked file's relative imports against its
+      // real path, so a symlinked command-router.mjs would import the
+      // UNSPECIALIZED tree runtime.mjs (no ishSpawnFor) instead of this
+      // tree's specialized copy. Copy it as a real file, as the composed
+      // runtime tree does in production.
+      if (entry === 'command-router.mjs') {
+        copyFileSync(join(realProcessDir, entry), join(processDir, entry));
+        continue;
+      }
+      symlinkSync(join(realProcessDir, entry), join(processDir, entry));
     }
-    symlinkSync(join(realProcessDir, entry), join(processDir, entry));
+    symlinkSync(join(PORT_ROOT, 'runtime/ios/process'), join(tmp, 'runtime/ios/process'));
+    symlinkSync(join(PORT_ROOT, 'node_modules'), join(tmp, 'node_modules'));
+    const { VirtualSubprocessRuntime } = await import(pathToFileURL(outPath).href);
+    return { VirtualSubprocessRuntime, tmp };
+  } catch (err) {
+    // The callers' t.after cleanup is only registered after this
+    // returns, so a failure here (anchor drift, broken import) would
+    // otherwise leak the tree mirror. Remove it, then rethrow.
+    rmSync(tmp, { recursive: true, force: true });
+    throw err;
   }
-  symlinkSync(join(PORT_ROOT, 'runtime/ios/process'), join(tmp, 'runtime/ios/process'));
-  symlinkSync(join(PORT_ROOT, 'node_modules'), join(tmp, 'node_modules'));
-  const { VirtualSubprocessRuntime } = await import(pathToFileURL(outPath).href);
-  return { VirtualSubprocessRuntime, tmp };
 }
 
 function deferred() {
@@ -162,8 +170,11 @@ async function fixture(t) {
   t.after(async () => {
     server.releaseAll();
     await runtime.dispose().catch(() => {});
-    await server.close();
-    rmSync(tmp, { recursive: true, force: true });
+    try {
+      await server.close();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
   const spawn = (argv, options = {}) => runtime.spawn({
     argv, cwd: work, graceMs: 200,
@@ -199,8 +210,11 @@ async function routerFixture(t) {
   t.after(async () => {
     server.releaseAll();
     await router.dispose().catch(() => {});
-    await server.close();
-    rmSync(tmp, { recursive: true, force: true });
+    try {
+      await server.close();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
   const spawn = (argv, options = {}) => router.spawn({
     argv, cwd: work, graceMs: 200,

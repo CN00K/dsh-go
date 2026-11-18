@@ -2771,7 +2771,63 @@ test('ishExec/ishWorkerExec reject a throwing or flipping env getter with ISH_IN
       get() { reads++; return reads === 1 ? 'bad\0x' : 'ok'; },
     });
     await assert.rejects(ishExec({command: 'echo hi', env: flippingEnv, serviceFile}), invalid);
+    // R7-1-2: pin the single-enumeration invariant itself, not just its
+    // consequence (rejection with no request sent).
+    assert.equal(reads, 1, 'env must be enumerated exactly once');
+    assert.equal(reads, 1, 'env must be enumerated exactly once');
     assert.equal(requests, 0, 'throwing/flipping env getters must fail before any HTTP is sent');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// R7-1-1: a throwing env getter must fail through spawnIshExec as
+// ISH_INVALID_ARGV (exit 1, stderr names the code), not as
+// "ish bridge unavailable". R6-1-1 only fixed ishExec/ishWorkerExec,
+// while spawnIshExec reads options.env first — via guestEnv and via
+// the DSH_SESSION_ID read. Both entry points are covered here.
+test('spawnIshExec reports a throwing env getter as ISH_INVALID_ARGV (R7-1-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const run = (env) => {
+      const child = spawnIshExec(
+        [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'echo hi'],
+        {cwd: join(fakeHome, 'workspace'), env});
+      let stderr = '';
+      child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+      return new Promise((done) => child.once('exit', (code) => done({code, stderr})));
+    };
+    // Throwing getter on an ordinary key: guestEnv enumerates it.
+    const throwingEnv = {};
+    Object.defineProperty(throwingEnv, 'A', {
+      enumerable: true,
+      get() { throw new Error('getter boom'); },
+    });
+    const first = await run(throwingEnv);
+    assert.equal(first.code, 1);
+    assert.match(first.stderr, /ISH_INVALID_ARGV/);
+    assert.doesNotMatch(first.stderr, /ish bridge unavailable/);
+    // Throwing getter on DSH_SESSION_ID itself: read before guestEnv.
+    const sessionEnv = {};
+    Object.defineProperty(sessionEnv, 'DSH_SESSION_ID', {
+      enumerable: true,
+      get() { throw new Error('session getter boom'); },
+    });
+    const second = await run(sessionEnv);
+    assert.equal(second.code, 1);
+    assert.match(second.stderr, /ISH_INVALID_ARGV/);
+    assert.doesNotMatch(second.stderr, /ish bridge unavailable/);
+    assert.equal(requests, 0, 'throwing env getters must fail before any HTTP is sent');
   } finally {
     clearWorkerState();
     await close();
