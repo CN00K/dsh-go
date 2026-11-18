@@ -30,6 +30,10 @@ static sqlite3 *ish_meta_open(const char *metaDBPath) {
         if (db) sqlite3_close(db);
         return NULL;
     }
+    // (M-9) The kernel also writes meta.db; with the default busy
+    // timeout of 0 a racing guest write fails host-side registration
+    // at once with SQLITE_BUSY. Wait up to 5 s for the lock instead.
+    sqlite3_busy_timeout(db, 5000);
     return db;
 }
 

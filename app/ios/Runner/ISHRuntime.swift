@@ -351,7 +351,13 @@ import Foundation
       // keep running: the next shell spawn then succeeds, no restart
       // needed. Only if the restore itself fails do we fall back to
       // the restart error.
-      if RootfsManager.criticalFilesPresent() {
+      // (H-3) The critical files alone are not enough: a missing
+      // meta.db makes every bind-mount registration fail
+      // (sqlite3_open has no CREATE), so the tree must go through
+      // restoreMissingFiles() below instead of reporting running
+      // with a dead workspace.
+      if RootfsManager.criticalFilesPresent()
+        && FileManager.default.fileExists(atPath: RootfsManager.metaDBURL.path) {
         // (Build 42) The loopback service must be (re)started here:
         // performReset stops it (listener.cancel(), token file
         // removed), and this early-return branch used to skip the
@@ -387,6 +393,23 @@ import Foundation
           self?.setPhase("error", error: ["code": "ish_rootfs_broken_restart_app", "message": message])
         }
         finish(result, error("ish_rootfs_broken_restart_app", message))
+        return
+      }
+      // (M-7) The kernel is still booted after a reset-while-booted
+      // (_isBooted is never cleared), so this branch — not
+      // ensureInstalled — is the next boot after a reset. Restore the
+      // /root backup here too. On failure the shipped tree is intact,
+      // so fail the boot WITHOUT clearing it: the backup is kept and
+      // a boot retry re-attempts the restore.
+      do {
+        try RootfsManager.restoreLatestUserRootBackup()
+      } catch {
+        let message = error.localizedDescription
+        NSLog("ISHRuntime: /root 备份恢复失败：%@", message)
+        DispatchQueue.main.async { [weak self] in
+          self?.setPhase("error", error: ["code": "ish_rootfs_io", "message": message])
+        }
+        finish(result, error("ish_rootfs_io", message))
         return
       }
       // (Build 42) Same as above: restart the loopback service, which
@@ -566,20 +589,9 @@ import Foundation
       // synchronously; the next boot reinstalls it from the bundled
       // zip). No relaunch required — reset is self-healing now
       // (retired the didResetWhileBooted flag, 2026-11-15).
-      if keepUserData {
-        let backup = RootfsManager.ishDirURL
-          .appendingPathComponent("rootfs-backup-\(Self.backupStamp())", isDirectory: true)
-        do {
-          try files.copyItem(at: RootfsManager.dataURL.appendingPathComponent("root"), to: backup)
-          DispatchQueue.main.async { [weak self] in
-            self?.log("Guest /root 已备份到 \(backup.lastPathComponent)")
-          }
-        } catch {
-          DispatchQueue.main.async { [weak self] in
-            self?.log("Guest /root 备份失败（继续重置）：\(error.localizedDescription)")
-          }
-        }
-      }
+      // (M-7) The backup is restored by the next boot (see
+      // RootfsManager.restoreLatestUserRootBackup).
+      if keepUserData { backupUserRootIfNeeded() }
       kernel.resetRootfsWhileBooted()
       let message = "rootfs 已重置，下次启动时将从内置包重装。"
       DispatchQueue.main.async { [weak self] in
@@ -590,6 +602,10 @@ import Foundation
       return
     }
     do {
+      // (M-7) The unbooted branch used to delete /root without any
+      // backup — keepUserData never reached RootfsManager.reset().
+      // Back up first; the next boot restores it.
+      if keepUserData { backupUserRootIfNeeded() }
       try RootfsManager.reset()
       DispatchQueue.main.async { [weak self] in
         self?.setPhase("notInstalled")
@@ -605,10 +621,20 @@ import Foundation
     }
   }
 
-  private static func backupStamp() -> String {
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "en_US_POSIX")
-    f.dateFormat = "yyyyMMdd-HHmmss"
-    return f.string(from: Date())
+  /// Back up Guest /root when asked (M-7); a backup failure only logs —
+  /// the reset still proceeds. The backup is restored by the next boot
+  /// (see RootfsManager.restoreLatestUserRootBackup).
+  private func backupUserRootIfNeeded() {
+    do {
+      if let backup = try RootfsManager.backupUserRoot() {
+        DispatchQueue.main.async { [weak self] in
+          self?.log("Guest /root 已备份到 \(backup.lastPathComponent)")
+        }
+      }
+    } catch {
+      DispatchQueue.main.async { [weak self] in
+        self?.log("Guest /root 备份失败（继续重置）：\(error.localizedDescription)")
+      }
+    }
   }
 }

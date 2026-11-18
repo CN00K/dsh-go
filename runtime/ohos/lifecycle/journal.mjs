@@ -130,10 +130,16 @@ export async function openBoundaryJournal({ directory, lockExclusive, fs = nodeF
     if (corruption) throw corrupt('Boundary journal has an invalid or incomplete tail');
     if (poison) throw fail('ERR_OHOS_LIFECYCLE_POISONED', 'Boundary journal persistence failed', poison);
   };
+  // Only a failure that may have torn the tail, or confirmed corruption,
+  // poisons the journal. A failure before any byte reached the log (a
+  // rejected observer, a failed stat check, an oversized record, a result
+  // file that never made it into the log) leaves the log intact, so the
+  // next append must still be allowed.
+  const damagesTail = error => error?.code === 'ERR_OHOS_LIFECYCLE_CORRUPT' || error?.damagedTail === true;
   const enqueue = operation => {
     if (!accepting) return Promise.reject(fail('ERR_OHOS_LIFECYCLE_CLOSED', 'Boundary journal is closing'));
     const result = tail.then(() => { check(); return operation(); });
-    tail = result.catch(error => { poison ??= error; });
+    tail = result.catch(error => { if (damagesTail(error)) poison ??= error; });
     return result;
   };
   async function writeAll(handle, bytes) {
@@ -151,8 +157,17 @@ export async function openBoundaryJournal({ directory, lockExclusive, fs = nodeF
     if (bytes.length > maximumRecordBytes) throw new RangeError('Boundary record exceeds 1 MiB');
     if ((await file.stat()).size + bytes.length > 64 * 1024 * 1024) throw new RangeError('Boundary journal exceeds 64 MiB; explicit maintenance is required');
     await onStage('before-record', record);
-    await writeAll(file, bytes);
-    await file.sync();
+    try {
+      await writeAll(file, bytes);
+      await file.sync();
+    } catch (error) {
+      // The write may have partially landed, or sync may have failed after
+      // the write, so the tail can no longer be trusted: the record is in
+      // the file but never entered memory, and the next append would reuse
+      // its sequence number. A failure before this point never reached the
+      // log and is left untagged, so enqueue does not poison on it.
+      throw Object.assign(error, { damagedTail: true });
+    }
     if (!same(await file.stat(), await fs.lstat(logPath))) throw corrupt('Boundary log path changed during persistence');
     records.push(record);
     await onStage('record-durable', record);

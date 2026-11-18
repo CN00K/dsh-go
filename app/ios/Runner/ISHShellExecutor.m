@@ -47,6 +47,7 @@
 #include "ish/fs/devices.h"
 #include "ish/kernel/signal.h"
 #include "ish/kernel/errno.h"
+#include "ish/misc.h"       // IS_ERR / ERR_PTR (argv PATH + cwd probes)
 #include "ish/util/sync.h"
 #include <sys/stat.h>
 #include <unistd.h>
@@ -392,6 +393,8 @@ static void ish_executor_close_fd(int fd) {
 - (ISHShellExecution *)startExecutionWithArgv:(NSArray<NSString *> *)argv
                                     stdinData:(nullable NSData *)stdinData
                                     fsContext:(uint64_t)fsContext
+                                          env:(nullable NSDictionary<NSString *, NSString *> *)env
+                                          cwd:(nullable NSString *)cwd
                                       timeout:(NSTimeInterval)timeout
                                          isTty:(BOOL)isTty
                                           cols:(int)cols
@@ -401,7 +404,9 @@ static void ish_executor_close_fd(int fd) {
 - (void)runRecord:(ISHExecRecord *)record
              argv:(NSArray<NSString *> *)argv
         stdinData:(nullable NSData *)stdinData
-        fsContext:(uint64_t)fsContext;
+        fsContext:(uint64_t)fsContext
+              env:(nullable NSDictionary<NSString *, NSString *> *)env
+              cwd:(nullable NSString *)cwd;
 - (void)runTtyRecord:(ISHExecRecord *)record
                 argv:(NSArray<NSString *> *)argv
            stdinData:(nullable NSData *)stdinData
@@ -586,6 +591,29 @@ static void ish_executor_close_fd(int fd) {
                              completion:completion];
 }
 
+/// Direct argv exec (route B, /ish/exec argv mode): no shell. env/cwd
+/// are threaded to runRecord; argv is passed through verbatim.
+- (ISHShellExecution *)executeArgv:(NSArray<NSString *> *)argv
+                               env:(nullable NSDictionary<NSString *, NSString *> *)env
+                               cwd:(nullable NSString *)cwd
+                         stdinData:(nullable NSData *)stdinData
+                         fsContext:(uint64_t)fsContext
+                           timeout:(NSTimeInterval)timeout
+                     outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                        completion:(void (^)(ISHShellExecutionResult *result))completion {
+    return [self startExecutionWithArgv:argv
+                              stdinData:stdinData
+                              fsContext:fsContext
+                                    env:env
+                                    cwd:cwd
+                                timeout:timeout
+                                  isTty:NO
+                                   cols:0
+                                   rows:0
+                          outputHandler:outputHandler
+                             completion:completion];
+}
+
 /// PTY variant (stage 5.3, ENV-02). Same one-shot shape as
 /// executeCommand: but the command runs on a fresh fake PTY (see the
 /// header). Output is merged (isStderr is always NO); the result's
@@ -637,6 +665,8 @@ static void ish_executor_close_fd(int fd) {
 - (ISHShellExecution *)startExecutionWithArgv:(NSArray<NSString *> *)argv
                                     stdinData:(nullable NSData *)stdinData
                                     fsContext:(uint64_t)fsContext
+                                          env:(nullable NSDictionary<NSString *, NSString *> *)env
+                                          cwd:(nullable NSString *)cwd
                                       timeout:(NSTimeInterval)timeout
                                          isTty:(BOOL)isTty
                                           cols:(int)cols
@@ -677,7 +707,8 @@ static void ish_executor_close_fd(int fd) {
         return handle;
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-        [self runRecord:record argv:argv stdinData:stdinData fsContext:fsContext];
+        [self runRecord:record argv:argv stdinData:stdinData fsContext:fsContext
+                    env:env cwd:cwd];
     });
     return handle;
 }
@@ -847,10 +878,47 @@ static void ish_executor_close_fd(int fd) {
 
 // --- Start path (runs on a global-queue thread) -------------------------------
 
+// B (argv mode) helpers. Both are pure functions over their arguments.
+
+// Same rule as IShLoopbackService.isValidShellName ([A-Za-z_][A-Za-z0-9_]*):
+// the request env may only set names the shell path would export.
+static BOOL ish_executor_is_valid_env_name(NSString *name) {
+    if (name.length == 0) return NO;
+    unichar first = [name characterAtIndex:0];
+    if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_')) return NO;
+    for (NSUInteger i = 1; i < name.length; i++) {
+        unichar c = [name characterAtIndex:i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_')) return NO;
+    }
+    return YES;
+}
+
+// Resolve a bare program name against the guest PATH (execvp
+// semantics): try each directory in turn; the first entry that opens
+// AND is a regular file with any execute bit wins. The probe fd is
+// closed in all cases (mirrors __do_execve's fd->open_stat reuse +
+// 0111 check). An empty PATH component means the guest cwd, as in
+// execvp. Returns nil when nothing resolves.
+static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString *path) {
+    for (NSString *dir in [path componentsSeparatedByString:@":"]) {
+        NSString *candidate = dir.length > 0
+            ? [dir stringByAppendingPathComponent:name] : name;
+        struct fd *fd = generic_open(candidate.UTF8String, O_RDONLY_, 0);
+        if (IS_ERR(fd)) continue;
+        uint32_t mode = fd->open_stat.mode;
+        fd_close(fd);
+        if ((mode & 0111) != 0 && (mode & S_IFMT) == S_IFREG) return candidate;
+    }
+    return nil;
+}
+
 - (void)runRecord:(ISHExecRecord *)record
              argv:(NSArray<NSString *> *)argv
         stdinData:(nullable NSData *)stdinData
-        fsContext:(uint64_t)fsContext {
+        fsContext:(uint64_t)fsContext
+              env:(nullable NSDictionary<NSString *, NSString *> *)env
+              cwd:(nullable NSString *)cwd {
     int stdinPipe[2] = {-1, -1};
     int stdoutPipe[2] = {-1, -1};
     int stderrPipe[2] = {-1, -1};
@@ -915,6 +983,31 @@ static void ish_executor_close_fd(int fd) {
     }
     // fs_context for the path-translate hook (inherited verbatim on fork).
     current->group->fs_context = fsContext;
+    // B (argv mode): the request cwd becomes the child's working
+    // directory — no shell `cd` runs here. open_dir's own steps
+    // (stat-is-dir + generic_open) are inlined: open_dir is static in
+    // kernel/fs.c, so it cannot be called. generic_open stats the fd
+    // (open_stat), the same reuse __do_execve relies on. fs_chdir
+    // takes ownership of the fd (it closes the old pwd), so on success
+    // nothing is closed here. On failure mirror the adhoc-fd block
+    // below: close the guest pipe ends, zombie-mark the never-exec'd
+    // task, fail with CreationFailed.
+    if (cwd != nil && cwd.length > 0) {
+        struct fd *dirFd = generic_open(cwd.UTF8String, O_RDONLY_, 0);
+        if (IS_ERR(dirFd) || !(dirFd->open_stat.mode & S_IFDIR)) {
+            if (!IS_ERR(dirFd)) fd_close(dirFd);
+            NSLog(@"ISHShellExecutor: cwd %@ is not a guest directory", cwd);
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe
+                          stderrPipe:stderrPipe];
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            [self failRecord:record withCode:ISHShellExecutionErrorCreationFailed];
+            return;
+        }
+        fs_chdir(current->fs, dirFd);
+    }
     // Wire stdio: adhoc fds over the (dup'd) host pipe fds.
     struct fd *inFd = ish_executor_fd_from_host_fd(stdinPipe[0]);
     struct fd *outFd = ish_executor_fd_from_host_fd(stdoutPipe[1]);
@@ -966,22 +1059,65 @@ static void ish_executor_close_fd(int fd) {
     // present. TERM is set only when a pty is present: the PTY path
     // sets it in ISHKernel.executeCommand, and the bridge forwards it
     // only when the exec is pty-backed (guestEnv opts.hasPty).
-    EXEC_ENVP_APPEND("HOME=/root");
-    EXEC_ENVP_APPEND("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    EXEC_ENVP_APPEND("LANG=C.UTF-8");
-    EXEC_ENVP_APPEND("ENV=/etc/profile");
+    // B (argv mode): the request env (if any) wins over the fixed
+    // defaults and the shared custom environment — the same precedence
+    // the shell path gets from `export` (buildShellCommand). The
+    // command path passes env == nil, so every nil-check below is a
+    // no-op there and the envp is byte-identical to before. Keys that
+    // are not valid shell names are ignored, as in buildShellCommand.
+    // The effective PATH is also what a bare argv[0] resolves against
+    // below, so the resolved program and the child's PATH agree.
+    NSString *effectivePath = env[@"PATH"] ?: @"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    if (env[@"HOME"] == nil) EXEC_ENVP_APPEND("HOME=/root");
+    EXEC_ENVP_APPEND([[NSString stringWithFormat:@"PATH=%@", effectivePath] UTF8String]);
+    if (env[@"LANG"] == nil) EXEC_ENVP_APPEND("LANG=C.UTF-8");
+    if (env[@"ENV"] == nil) EXEC_ENVP_APPEND("ENV=/etc/profile");
     // Shared custom environment (set once by the channel layer on
     // ISHKernel.customEnvironment). Never contains secrets.
     for (NSString *key in [ISHKernel shared].customEnvironment) {
         NSString *value = [ISHKernel shared].customEnvironment[key];
         if (![key isKindOfClass:[NSString class]] ||
             ![value isKindOfClass:[NSString class]]) continue;
+        if (env[key] != nil) continue;
+        NSString *pair = [NSString stringWithFormat:@"%@=%@", key, value];
+        EXEC_ENVP_APPEND(pair.UTF8String);
+    }
+    for (NSString *key in [env.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSString *value = env[key];
+        if (![value isKindOfClass:[NSString class]]) continue;
+        if (!ish_executor_is_valid_env_name(key)) continue;
+        // PATH is already emitted above with the effective value.
+        if ([key isEqualToString:@"PATH"]) continue;
         NSString *pair = [NSString stringWithFormat:@"%@=%@", key, value];
         EXEC_ENVP_APPEND(pair.UTF8String);
     }
 #undef EXEC_ENVP_APPEND
     envpBuf[envpPos] = '\0';
-    const char *execPath = argv[0].UTF8String;
+    // B (argv mode): a bare argv[0] (no '/') is resolved against the
+    // effective PATH before do_execve (execvp semantics — the kernel
+    // does no PATH lookup; __do_execve opens the file directly). The
+    // command path's argv[0] is always "/bin/bash", so this never
+    // fires there; a path argv[0] is used verbatim. argv[0] itself
+    // stays as the client sent it — only the file argument changes.
+    // Unresolved (or not executable) fails exactly like a do_execve
+    // failure below: zombie-mark + ExecFailed.
+    NSString *execPathStr = argv[0];
+    if ([execPathStr rangeOfString:@"/"].location == NSNotFound) {
+        NSString *resolved = ish_executor_resolve_guest_executable(execPathStr, effectivePath);
+        if (resolved == nil) {
+            NSLog(@"ISHShellExecutor: argv[0] %@ not found on PATH", execPathStr);
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe
+                          stderrPipe:stderrPipe];
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            [self failRecord:record withCode:ISHShellExecutionErrorExecFailed];
+            return;
+        }
+        execPathStr = resolved;
+    }
+    const char *execPath = execPathStr.UTF8String;
     err = do_execve(execPath, argc, argvBuf, envpBuf);
     if (err < 0) {
         NSLog(@"ISHShellExecutor: do_execve(%s) failed: %d", execPath, err);

@@ -9,6 +9,12 @@ import { setImmediate as nextIoTurn } from 'node:timers/promises';
 export const lifecycleSymbol = Symbol.for('dsh.go.ohos.lifecycle');
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const fail = (code, message, cause) => Object.assign(new Error(message, { cause }), { code });
+// Only a failed durable identity check or confirmed journal damage poisons
+// the shared boundary. A transient checkpoint, session-read or append
+// failure fails only this call so the scheduler can retry it; poisoning
+// here would lock every later dispatch until the engine restarts.
+const fatalLifecycleError = error => ['ERR_OHOS_LIFECYCLE_IDENTITY', 'ERR_OHOS_LIFECYCLE_SEQUENCE',
+  'ERR_OHOS_LIFECYCLE_CORRUPT', 'ERR_OHOS_LIFECYCLE_POISONED'].includes(error?.code);
 const keyOf = value => JSON.stringify([value.sessionId, value.callSeq]);
 const knownString = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\0');
 const resultFor = (identity, result) => ({
@@ -131,7 +137,7 @@ export class BoundaryCoordinator {
       this.#fold(record.body);
       await this.#onStage(record.body.kind, record.body);
       return record.body;
-    } catch (error) { this.#fault ??= error; throw error; }
+    } catch (error) { if (fatalLifecycleError(error)) this.#fault ??= error; throw error; }
   }
   #row(meta) {
     const row = this.#rows.get(keyOf({ sessionId: meta.session.id, callSeq: meta.callSeq }));
@@ -241,7 +247,7 @@ export class BoundaryCoordinator {
       this.#updateNativePolling();
       await this.#record({ kind: 'prepared', bootId: this.bootId, identity });
     } catch (error) {
-      if (error?.code !== 'ERR_OHOS_LIFECYCLE_CANCELLED' && !meta.signal?.aborted) this.#fault ??= error;
+      if (error?.code !== 'ERR_OHOS_LIFECYCLE_CANCELLED' && !meta.signal?.aborted && fatalLifecycleError(error)) this.#fault ??= error;
       throw error;
     }
   }
@@ -285,7 +291,7 @@ export class BoundaryCoordinator {
       await this.#record({ kind: 'committed', bootId: this.bootId, identity: row.identity,
         sessionResultSeq: matches[0].seq, sessionResultHash: hash(matches[0].data) });
       this.#finishCall(keyOf(row.identity));
-    } catch (error) { this.#fault ??= error; throw error; }
+    } catch (error) { if (fatalLifecycleError(error)) this.#fault ??= error; throw error; }
   }
   #finishCall(key) {
     const pending = this.#pending.get(key);
@@ -439,24 +445,46 @@ export class BoundaryCoordinator {
       await this.#journal.flush();
       return { ...this.status(), acknowledgedControlVersion: version };
     });
-    this.#controlTail = work.catch(error => { this.#fault ??= error; });
+    this.#controlTail = work.catch(error => { if (fatalLifecycleError(error)) this.#fault ??= error; });
     return work;
   }
   #resume() {
     const version = ++this.#controlVersion;
     const manualPaused = this.#manualPaused;
+    // H-2: a transport revalidation failure is transient — it must not
+    // poison the shared boundary. Track it separately from the journal
+    // failures below, which do poison (a failed durable checkpoint or
+    // identity check is not recoverable by retrying).
+    let transportFailed = false;
     const work = this.#controlTail.then(async () => {
       // Process already queued completion/close callbacks before reporting a
       // recovery view. Pending calls still own their original handles.
       await nextIoTurn();
-      await this.revalidateTransport();
+      try {
+        await this.revalidateTransport();
+      } catch (error) {
+        transportFailed = true;
+        throw error;
+      }
       await this.#record({ kind: 'resume', bootId: this.bootId, manualPaused });
       if (version === this.#controlVersion) {
         this.clock.resume(); const gate = this.#gate; this.#gate = undefined; gate?.resolve();
       }
       return this.status();
     });
-    this.#controlTail = work.catch(error => { this.#fault ??= error; });
+    this.#controlTail = work.catch(error => {
+      if (transportFailed) {
+        // The gate stays closed, but reset the admission target so the
+        // next native refresh retries this resume instead of leaving
+        // admission paused forever. Without this reset, fixing only the
+        // #fault write would turn "permanently blocked" into
+        // "permanently paused": #refreshNative skips #resume() when
+        // desired === #admissionTarget (already true).
+        this.#admissionTarget = false;
+        return;
+      }
+      if (fatalLifecycleError(error)) this.#fault ??= error;
+    });
     return work;
   }
   async cancel(sessionId) {

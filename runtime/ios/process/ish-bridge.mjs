@@ -180,6 +180,11 @@ const SERVICE_FILE_POLL_MS = 250;
  * instantly because the 30 s window had not elapsed).
  */
 const SERVICE_FILE_RETRY_MIN_MS = 5_000;
+/** Give up a WS handshake after this long (M-3): a clean server FIN
+ * during the upgrade otherwise leaves `ready` pending forever. */
+const WS_HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Cap for input queued before the WS handshake completes (M-6). */
+const PTY_PENDING_MAX_BYTES = 64 * 1024;
 
 /**
  * The loopback service is down: ish-service.json is missing (iSH not
@@ -256,15 +261,15 @@ export function toGuest(hostPath) {
   const roots = hostRoots();
   if (!roots || typeof hostPath !== 'string' || hostPath.length === 0) return null;
   const resolved = resolve(hostPath);
-  const relWorkspace = relativeTo(resolved, roots.workspace);
+  const relWorkspace = relativeUnderHostRoot(resolved, roots.workspace);
   if (relWorkspace !== null) return joinGuest(GUEST_WORKSPACE, relWorkspace);
   // Guest /tmp lives under the rootfs data dir, not under <root>/tmp
   // (that is the host-only TMPDIR — the old mapping claimed host temp
   // files were guest /tmp files).
-  const relDataTmp = relativeTo(resolved, join(roots.data, 'tmp'));
+  const relDataTmp = relativeUnderHostRoot(resolved, join(roots.data, 'tmp'));
   if (relDataTmp !== null) return joinGuest(GUEST_TMP, relDataTmp);
   // Any other file under the rootfs data dir is a guest file.
-  const relData = relativeTo(resolved, roots.data);
+  const relData = relativeUnderHostRoot(resolved, roots.data);
   if (relData !== null) return joinGuest('/', relData);
   return null;
 }
@@ -338,9 +343,22 @@ function relativeTo(path, base) {
  * `Library/Application Support/`, which no guest path has.
  */
 function underHostRoot(path, root) {
-  if (relativeTo(path, root) !== null) return true;
+  return relativeUnderHostRoot(path, root) !== null;
+}
+
+/**
+ * Relative path of `path` under host `root`, or null when outside.
+ * Same /private-tolerant comparison as underHostRoot: a host path
+ * must match under either the /var/... or the /private/var/... spelling
+ * (M-5: toGuest used plain relativeTo, so a /var-spelled workspace
+ * path missed a /private/var-spelled root and the exec silently ran
+ * in the wrong guest directory).
+ */
+function relativeUnderHostRoot(path, root) {
+  const direct = relativeTo(path, root);
+  if (direct !== null) return direct;
   const stripPrivate = (value) => value.startsWith('/private/') ? value.slice('/private'.length) : value;
-  return relativeTo(stripPrivate(path), stripPrivate(root)) !== null;
+  return relativeTo(stripPrivate(path), stripPrivate(root));
 }
 
 /** Join guest path segments with '/' (guest is always POSIX). */
@@ -447,17 +465,21 @@ export async function getServiceInfo(opts = {}) {
 
 /**
  * Drop the cached service info (call after a connection failure, then
- * retry once). Also resets the wait state so the retry does a fresh
- * read of ish-service.json instead of failing fast on the 5s window
- * (fix, build 37: the loopback service can restart with a new
- * port/token — e.g. stop/start across a terminal reopen — and the
- * bridge kept dialling the stale cached port/token forever, because
- * only the /ish/exec path invalidated and the WS path never retried).
+ * retry once). The retry does a fresh read of ish-service.json instead
+ * of failing fast on the 5s window (fix, build 37: the loopback service
+ * can restart with a new port/token — e.g. stop/start across a terminal
+ * reopen — and the bridge kept dialling the stale cached port/token
+ * forever, because only the /ish/exec path invalidated and the WS path
+ * never retried).
+ * M-4: this deliberately does NOT reset waitedForServiceFile. The 30s
+ * first-boot wait is once per process: re-arming it here made every
+ * retry against a stopped service wait the full 30s before failing.
+ * A retry re-reads the file once and fails fast when it is still
+ * missing (lastMissingCheck is reset below for that fresh read).
  */
 export function invalidateServiceInfo() {
   cachedService = null;
   cachedServiceFile = null;
-  waitedForServiceFile = false;
   lastMissingCheck = 0;
   // A restart may bring a newer loopback build; re-probe the worker
   // endpoints instead of trusting the old 404 forever.
@@ -493,19 +515,35 @@ export function invalidateServiceInfo() {
  *   A line with any other nonce-shaped text is ordinary output.
  * @param opts.onSessionCwd(cwd) called with the guest's final cwd
  *   (guest absolute path) when a valid marker line arrives.
+ * @param opts.readOnly true when the session policy is read-only: the
+ *   server refuses the exec with OHOS_SANDBOX_DENIED instead of
+ *   running it on the always-writable workspace mount (H-1).
  * @param opts.signal AbortSignal; aborting closes the connection, which
  *   makes the Swift side cancel the exec and kill the guest process group.
  * @returns {exitCode, durationMs, timedOut?, cancelled?} from the final frame.
  */
 export async function ishExec(opts) {
+  // B (argv mode): a direct guest exec — argv is sent verbatim, never
+  // joined into a shell string. Validate here (the server re-validates
+  // and answers 400); an invalid argv fails before any HTTP is sent.
+  if (opts.argv !== undefined) {
+    if (!Array.isArray(opts.argv) || opts.argv.length === 0
+      || opts.argv.some((a) => typeof a !== 'string' || a.length === 0)) {
+      throw Object.assign(
+        new Error('ish argv must be a non-empty array of non-empty strings'),
+        {code: 'ISH_INVALID_ARGV'});
+    }
+  }
   const body = JSON.stringify({
-    command: opts.command,
+    ...(opts.command ? {command: opts.command} : {}),
+    ...(opts.argv ? {argv: opts.argv} : {}),
     ...(opts.cwd ? {cwd: opts.cwd} : {}),
     ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
     ...(opts.stdinData && opts.stdinData.length > 0
       ? {stdinData: Buffer.from(opts.stdinData).toString('base64')} : {}),
     ...(opts.cwdNonce ? {cwdNonce: opts.cwdNonce} : {}),
     ...(opts.tty ? {tty: true} : {}),
+    ...(opts.readOnly ? {readOnly: true} : {}),
     timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
   });
   // Session-cwd marker filter (ENV-14): the Swift wrapper prints one
@@ -514,14 +552,23 @@ export async function ishExec(opts) {
   // onSessionCwd. Only the exact nonce for this exec matches, so a
   // command that prints a look-alike line cannot corrupt the
   // remembered cwd (a wrong-nonce marker is delivered as normal output).
-  const execOpts = opts.cwdNonce ? {...opts, onLine: (frame) => {
-    const marker = parseCwdMarker(frame, opts.cwdNonce);
-    if (marker !== null) {
-      opts.onSessionCwd?.(marker);
-      return;
+  // H-5: once a line has streamed, the command already ran — a retry
+  // would execute a non-idempotent command twice. Same rule as the
+  // worker→one-shot fallback in spawnIshExec (sawOutput). The cwd
+  // marker counts too: the Swift wrapper prints it after the command
+  // finishes, so it proves the command ran.
+  let sawOutput = false;
+  const execOpts = {...opts, onLine: (frame) => {
+    sawOutput = true;
+    if (opts.cwdNonce) {
+      const marker = parseCwdMarker(frame, opts.cwdNonce);
+      if (marker !== null) {
+        opts.onSessionCwd?.(marker);
+        return;
+      }
     }
     opts.onLine?.(frame);
-  }} : opts;
+  }};
   // Retry once with a fresh read of ish-service.json (same stale-cache
   // fix as the WS path, build 37): postNdjson invalidates on
   // ECONNREFUSED/ECONNRESET and on llhttp parse errors (HPE_* — a
@@ -541,7 +588,7 @@ export async function ishExec(opts) {
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
       const retryable = isStaleConnectionError(error)
         || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
-      if (retryable && attempt === 0) continue;
+      if (retryable && attempt === 0 && !sawOutput) continue;
       throw lastError;
     }
   }
@@ -743,6 +790,9 @@ export async function ishStatus(opts = {}) {
 
 /** Error code when the service predates the worker endpoints (HTTP 404). */
 export const ISH_WORKER_UNSUPPORTED = 'ish_worker_unsupported';
+/** Error code when a run is refused because the session already has
+ * one in flight (HTTP 409, M-10). */
+export const ISH_WORKER_BUSY = 'ish_worker_busy';
 /** Error code when a job kill names a pid that is not a job of the worker. */
 export const ISH_JOB_NOT_FOUND = 'ish_job_not_found';
 
@@ -966,6 +1016,9 @@ function postJson(service, path, bodyObj, opts = {}) {
  *   (protocol lines — END marker, jobs blocks — are swallowed).
  * @param opts.onSessionCwd(cwd) called with the worker's final cwd
  *   (from the END marker).
+ * @param opts.readOnly true when the session policy is read-only: the
+ *   server refuses the run with OHOS_SANDBOX_DENIED instead of
+ *   running it on the always-writable workspace mount (H-1).
  * @param opts.signal AbortSignal; aborting cancels the HTTP request,
  *   which makes the Swift side kill the current command (never the
  *   worker). An abort that lands while the run is still queued behind
@@ -990,6 +1043,7 @@ export async function ishWorkerExec(opts) {
       ...(opts.cwd && (!state.knownAlive || opts.cwd !== state.cwd) ? {cwd: opts.cwd} : {}),
       ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
       nonce,
+      ...(opts.readOnly ? {readOnly: true} : {}),
       timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
     });
     // Protocol-line filter: the END marker and the jobs snapshot blocks
@@ -999,7 +1053,13 @@ export async function ishWorkerExec(opts) {
     let inJobsBlock = false;
     let inJobpidsBlock = false;
     const jobsLines = [];
+    // H-5: same rule as ishExec — any streamed frame (including the
+    // protocol lines, which the wrapper prints after the command
+    // finishes) proves the command ran, so a mid-stream disconnect
+    // must not retry.
+    let sawOutput = false;
     const execOpts = {...opts, onLine: (frame) => {
+      sawOutput = true;
       const end = parseWorkerEndMarker(frame, nonce);
       if (end) {
         if (state.generation === generation) state.cwd = end.cwd;
@@ -1056,9 +1116,22 @@ export async function ishWorkerExec(opts) {
             new Error('ish worker endpoints are not available on this service'),
             {code: ISH_WORKER_UNSUPPORTED});
         }
+        if (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode === 409) {
+          // M-10: the server already has a run in flight for this
+          // session (worker_busy). Do not retry: an immediate retry
+          // would hit the same run, and the per-session queue in this
+          // bridge already serialises our own runs — a 409 can only
+          // come from another client, so surface it and let the
+          // caller decide when to retry. (Deliberately not a
+          // one-shot fallback: that would run the command concurrently
+          // with the in-flight run and break per-session ordering.)
+          throw Object.assign(
+            new Error(`ish worker busy: session ${sessionId} already has a run in flight`),
+            {code: ISH_WORKER_BUSY});
+        }
         const retryable = isStaleConnectionError(error)
           || error?.code === 'ISH_HTTP_ERROR';
-        if (retryable && attempt === 0) continue;
+        if (retryable && attempt === 0 && !sawOutput) continue;
         throw lastError;
       }
     }
@@ -1135,29 +1208,38 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
  */
 export async function ishWorkerStop(sessionId, opts = {}) {
   const state = workerSessions.get(sessionId);
-  let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) invalidateServiceInfo();
-    const service = await getServiceInfo(opts);
-    if (!service) throw bridgeUnavailableError(opts);
-    try {
-      await postJson(service, '/ish/worker/stop', {sessionId}, opts);
-      break;
-    } catch (error) {
-      lastError = error;
-      if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
-      const retryable = isStaleConnectionError(error)
-        || error?.code === 'ISH_HTTP_ERROR';
-      if (retryable && attempt === 0) continue;
-      throw lastError;
+  try {
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) invalidateServiceInfo();
+      const service = await getServiceInfo(opts);
+      // M-2: a stop is teardown — no service file means there is
+      // nothing left to stop, so this is success, not an error.
+      if (!service) return true;
+      try {
+        await postJson(service, '/ish/worker/stop', {sessionId}, opts);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
+        const retryable = isStaleConnectionError(error)
+          || error?.code === 'ISH_HTTP_ERROR';
+        if (retryable && attempt === 0) continue;
+        throw lastError;
+      }
     }
-  }
-  if (state) {
-    state.knownAlive = false;
-    state.generation += 1;
-    const now = Date.now();
-    for (const job of state.jobs.values()) {
-      if (job.state !== 'done') { job.state = 'done'; job.endedAt = now; }
+  } finally {
+    // M-2: local state is cleared regardless of the outcome — the old
+    // code only reached this block on the success path, so a failed
+    // stop left the session marked knownAlive with a stale cwd and
+    // jobs still "running".
+    if (state) {
+      state.knownAlive = false;
+      state.generation += 1;
+      const now = Date.now();
+      for (const job of state.jobs.values()) {
+        if (job.state !== 'done') { job.state = 'done'; job.endedAt = now; }
+      }
     }
   }
   return true;
@@ -1253,32 +1335,69 @@ export function ishWebSocket(opts) {
       '', '',
     ].join('\r\n');
     socket.write(handshake);
+    // M-3: the old promise only listened for 'data' and 'error', so a
+    // clean server FIN during the upgrade (no data, no error) left
+    // `ready` pending forever. Reject on 'close'/'end' too, and cap
+    // the whole handshake with a timeout. Listeners are removed on
+    // settle so the post-handshake handlers below are the only ones.
     await new Promise((resolvePromise, rejectPromise) => {
+      let settled = false;
+      const cleanup = () => {
+        socket.off('data', onData);
+        socket.off('error', onError);
+        socket.off('close', onClose);
+        socket.off('end', onEnd);
+      };
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        rejectPromise(error);
+      };
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        resolvePromise();
+      };
+      const onError = (error) => fail(error);
+      const onClose = () => fail(Object.assign(
+        new Error('ish websocket closed during handshake'),
+        {code: 'ISH_WS_CLOSED_DURING_HANDSHAKE'}));
+      const onEnd = () => fail(Object.assign(
+        new Error('ish websocket ended during handshake'),
+        {code: 'ISH_WS_CLOSED_DURING_HANDSHAKE'}));
+      const timer = setTimeout(() => fail(Object.assign(
+        new Error('ish websocket handshake timed out'),
+        {code: 'ISH_WS_HANDSHAKE_TIMEOUT'})), WS_HANDSHAKE_TIMEOUT_MS);
       const onData = (chunk) => {
         handshakeBuffer = Buffer.concat([handshakeBuffer, chunk]);
         const end = handshakeBuffer.indexOf('\r\n\r\n');
         if (end < 0) return;
         const head = handshakeBuffer.subarray(0, end).toString('latin1');
         const rest = handshakeBuffer.subarray(end + 4);
-        socket.off('data', onData);
         const statusLine = head.split('\r\n')[0] ?? '';
         if (!statusLine.includes('101')) {
-          rejectPromise(Object.assign(
+          fail(Object.assign(
             new Error(`ish websocket upgrade failed: ${statusLine}`),
             {code: 'ISH_WS_UPGRADE_FAILED', statusLine}));
           return;
         }
         const accept = /^Sec-WebSocket-Accept:\s*(.+)$/im.exec(head)?.[1]?.trim();
         if (accept !== expectedAccept) {
-          rejectPromise(Object.assign(new Error('ish websocket accept mismatch'), {code: 'ISH_WS_ACCEPT_MISMATCH'}));
+          fail(Object.assign(new Error('ish websocket accept mismatch'), {code: 'ISH_WS_ACCEPT_MISMATCH'}));
           return;
         }
         handshakeDone = true;
         if (rest.length > 0) feedFrames(rest);
-        resolvePromise();
+        done();
       };
       socket.on('data', onData);
-      socket.once('error', rejectPromise);
+      socket.once('error', onError);
+      socket.once('close', onClose);
+      socket.once('end', onEnd);
     });
     socket.on('data', (chunk) => feedFrames(chunk));
     socket.on('error', (error) => { emit('error', error); closeSocket(); });
@@ -1378,6 +1497,7 @@ export function ishWebSocket(opts) {
 
   return {
     ready,
+    get handshakeDone() { return handshakeDone; },
     sendBinary: (data) => sendFrame(0x2, Buffer.from(data)),
     sendText: (text) => sendFrame(0x1, Buffer.from(text, 'utf8')),
     close: (code = 1000) => {
@@ -1641,9 +1761,26 @@ export function extractBashCommand(argv) {
  * streamed and only for failures that prove the command never ran;
  * anything else fails closed. child.ishWorker reports which path
  * served the exec (like child.ishTty for the PTY path).
+ *
+ * Read-only sessions (H-1): options.readOnly === true (from the
+ * session policy.mode, via the adapter) is forwarded to both the
+ * worker run and the one-shot POST as {readOnly: true}; the server
+ * refuses the exec with OHOS_SANDBOX_DENIED instead of running it.
+ * The workspace bind mount is always writable, so the denial happens
+ * server-side per request — never by remounting.
+ *
+ * Argv mode (B): when argv is not a bash triplet, it is a direct
+ * guest exec (rg/git/node/gh/python3/pip from the adapter) — argv is
+ * sent verbatim, no shell is involved, the worker is skipped, and no
+ * cwd marker is requested (there is no shell to print one).
  */
 export function spawnIshExec(argv, options = {}) {
   const command = extractBashCommand(argv);
+  // B (argv mode): a non-bash argv is a direct guest exec, not a shell
+  // command — rg/git/node/gh/python3/pip arrive here from the adapter
+  // without the /ish-runner wrap. The worker is bash-only, so argv
+  // execs always take the one-shot path below.
+  const guestArgv = command === null ? argv : null;
   const child = new EventEmitter();
   const stdioOpt = Array.isArray(options.stdio) ? options.stdio : ['pipe', 'pipe', 'pipe'];
   const out = createSink(stdioOpt[1], process.stdout);
@@ -1677,7 +1814,7 @@ export function spawnIshExec(argv, options = {}) {
   child.exitCode = null;
   child.signalCode = null;
   child.killed = false;
-  child.spawnfile = ISH_RUNNER_COMMAND;
+  child.spawnfile = guestArgv && guestArgv.length > 0 ? guestArgv[0] : ISH_RUNNER_COMMAND;
   child.spawnargs = argv;
 
   let settled = false;
@@ -1708,7 +1845,13 @@ export function spawnIshExec(argv, options = {}) {
       child.emit('close', code, signal);
       return;
     }
-    Promise.all(streams.map((s) => new Promise((done) => s.once('close', done))))
+    // T-3: if the consumer already destroyed a stream, its 'close'
+    // already fired (or never will again) — count it done now instead
+    // of waiting forever for an event that already happened.
+    Promise.all(streams.map((s) => new Promise((done) => {
+      if (s.closed || s.destroyed) { done(); return; }
+      s.once('close', done);
+    })))
       .then(() => child.emit('close', code, signal));
   };
 
@@ -1753,13 +1896,18 @@ export function spawnIshExec(argv, options = {}) {
         (stream === 'stderr' ? err : out).write(line + '\n');
       };
       const runOneShot = () => ishExec({
-        command,
+        ...(command !== null ? {command} : {}),
+        ...(guestArgv ? {argv: guestArgv} : {}),
         cwd: guestCwd ?? undefined,
         env,
         stdinData,
-        ...(cwdNonce ? {cwdNonce} : {}),
+        // B: the cwd marker is a shell-wrapper feature (ENV-14) — an
+        // argv exec has no shell to print it, and it cannot change the
+        // session shell's cwd, so no nonce is sent in argv mode.
+        ...(cwdNonce && command !== null ? {cwdNonce} : {}),
         onSessionCwd: (cwd) => noteExecCwd(sessionId, cwd),
         tty: options.tty === true,
+        ...(options.readOnly ? {readOnly: true} : {}),
         timeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
         signal: abortController.signal,
         onLine: emitLine,
@@ -1775,8 +1923,10 @@ export function spawnIshExec(argv, options = {}) {
       // a command that already produced output — or may have run —
       // would execute it twice, so those fail closed instead.
       let result = null;
+      // B: argv execs never take the worker (bash-only); they go
+      // one-shot via runOneShot below.
       const useWorker = options.worker !== false && sessionId && !options.tty
-        && !stdinData && !workerUnsupported;
+        && !stdinData && !workerUnsupported && command !== null;
       if (useWorker) {
         let sawOutput = false;
         try {
@@ -1791,6 +1941,7 @@ export function spawnIshExec(argv, options = {}) {
             timeoutMs: DEFAULT_EXEC_TIMEOUT_MS,
             signal: abortController.signal,
             onSessionCwd: (cwd) => noteExecCwd(sessionId, cwd),
+            ...(options.readOnly ? {readOnly: true} : {}),
             onLine: (frame) => { sawOutput = true; emitLine(frame); },
           });
           child.ishWorker = true;
@@ -1804,7 +1955,18 @@ export function spawnIshExec(argv, options = {}) {
           result = null;
         }
       }
-      if (result === null) result = await runOneShot();
+      if (result === null) {
+        // M-16: the one-shot path goes through the same per-session
+        // queue as worker runs, so two overlapping bash calls for one
+        // session cannot run concurrently in the guest (cwd memory and
+        // output order would interleave). This is safe here: the
+        // worker slot above has already been released by the time we
+        // get here, so no self-deadlock. Without a session id there is
+        // no queue to join — the exec runs unqueued, as before.
+        result = sessionId
+          ? await enqueueWorkerOp(sessionId, runOneShot)
+          : await runOneShot();
+      }
       if (settled) return;
       if (result.cancelled) {
         finish(null, 'SIGTERM');
@@ -1896,6 +2058,13 @@ export class IshPtyTerminal {
     this._pausedBuffers = [];
     this._exited = false;
     this._ws = null;
+    // Input written before the WS handshake completes (M-6): queued
+    // and flushed in order once `ready` resolves, instead of being
+    // silently dropped by sendFrame's handshakeDone check. Bounded
+    // (PTY_PENDING_MAX_BYTES) so a handshake that never completes
+    // cannot grow it without bound; excess input is dropped.
+    this._pendingFrames = [];
+    this._pendingBytes = 0;
     // Kernel session id, learned from the server's session hello
     // ({"type":"session","sessionId":"..."}) right after the upgrade.
     // Null until the hello arrives (older servers never send it).
@@ -1927,14 +2096,30 @@ export class IshPtyTerminal {
 
   write(data) {
     if (this._exited) return;
-    this._ws?.sendBinary(Buffer.from(String(data), 'utf8'));
+    const bytes = Buffer.from(String(data), 'utf8');
+    // M-6: queue input that arrives before the handshake completes;
+    // sendFrame would silently drop it. Flushed in order by _open
+    // once `ready` resolves.
+    if (!this._ws?.handshakeDone) {
+      if (this._pendingBytes + bytes.length <= PTY_PENDING_MAX_BYTES) {
+        this._pendingFrames.push(bytes);
+        this._pendingBytes += bytes.length;
+      }
+      return;
+    }
+    this._ws.sendBinary(bytes);
   }
 
   resize(cols, rows) {
     this._cols = cols;
     this._rows = rows;
     if (this._exited) return;
-    this._ws?.sendText(JSON.stringify({type: 'resize', cols, rows}));
+    // M-6: a resize before the handshake is not lost — _open sends
+    // the latest size right after `ready` resolves, so there is
+    // nothing to queue; only send immediately once upgraded.
+    if (this._ws?.handshakeDone) {
+      this._ws.sendText(JSON.stringify({type: 'resize', cols, rows}));
+    }
   }
 
   pause() {
@@ -2003,6 +2188,11 @@ export class IshPtyTerminal {
       }
       return;
     }
+    // M-6: flush input queued during the handshake, in order, before
+    // the initial resize.
+    for (const bytes of this._pendingFrames) ws.sendBinary(bytes);
+    this._pendingFrames = [];
+    this._pendingBytes = 0;
     // Shell is up. Size it. No default cd: the shell starts in its
     // own default directory; the user cds where they want. (The old
     // code sent `cd -- '<session cwd>'` as the first input, which
@@ -2022,6 +2212,10 @@ export class IshPtyTerminal {
   _exit(outcome) {
     if (this._exited) return;
     this._exited = true;
+    // M-6: the handshake failed (or the terminal was killed) — queued
+    // pre-handshake input will never be delivered; drop it.
+    this._pendingFrames = [];
+    this._pendingBytes = 0;
     const tail = this._decoder.end();
     if (tail) this._emitData(tail);
     for (const listener of [...this._exitListeners]) listener(outcome);

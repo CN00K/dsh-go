@@ -80,7 +80,8 @@ final class IshRuntimeBridge {
   /// Stop then run again (a boot when the kernel is not booted).
   Future<void> restart() => _service.restart();
 
-  /// Deletes the rootfs; [keepUserData] backs up the guest's /root first.
+  /// Deletes the rootfs; [keepUserData] backs up the guest's /root first
+  /// and restores it on the next install.
   Future<void> reset({bool keepUserData = false}) => _service.reset(keepUserData: keepUserData);
 
   Future<List<String>> getLogs({int lines = 100}) => _service.getLogs(lines: lines);

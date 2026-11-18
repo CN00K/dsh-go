@@ -159,6 +159,37 @@ final class IShLoopbackService {
   /// HTTPConnection would deallocate mid-request). Guarded by `queue`.
   private var connections: [ObjectIdentifier: HTTPConnection] = [:]
 
+  /// Sessions with a worker run currently in flight (M-10). A worker
+  /// has a single output-handler slot (beginWorkerRun overwrites it),
+  /// so a second concurrent run on the same session would steal the
+  /// first run's output and hang it until the wall-clock timeout.
+  /// Claim/release are lock-guarded and release is idempotent (a
+  /// double release just removes an absent element), so it is safe to
+  /// release from every terminal path: WorkerSession.completeRun, its
+  /// cancel-before-attach branch, and deinit as a backstop (the
+  /// connection can drop the session mid-cancel, so the run may never
+  /// reach completeRun); handleWorkerRun also releases on its
+  /// worker_start_failed paths.
+  fileprivate static let workerRunLock = NSLock()
+  fileprivate static var workerRunsInFlight: Set<String> = []
+
+  /// Claim the in-flight slot for sessionId; false when a run is
+  /// already in flight on this session.
+  fileprivate static func claimWorkerRun(sessionId: String) -> Bool {
+    workerRunLock.lock()
+    defer { workerRunLock.unlock() }
+    guard !workerRunsInFlight.contains(sessionId) else { return false }
+    workerRunsInFlight.insert(sessionId)
+    return true
+  }
+
+  /// Release the in-flight slot for sessionId (idempotent).
+  fileprivate static func releaseWorkerRun(sessionId: String) {
+    workerRunLock.lock()
+    defer { workerRunLock.unlock() }
+    workerRunsInFlight.remove(sessionId)
+  }
+
   private init() {}
 
   // MARK: - Lifecycle
@@ -688,10 +719,37 @@ private struct HTTPRequest {
 extension HTTPConnection {
   func handleExec(_ request: HTTPRequest) {
     guard service != nil else { close(); return }
-    guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
-          let command = json["command"] as? String, !command.isEmpty else {
-      sendJSON(status: 400, reason: "Bad Request", object: ["error": "command is required"])
+    guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "request body must be a JSON object"])
       return
+    }
+    // B (argv mode): a direct guest exec — argv runs without a shell,
+    // verbatim. command and argv are mutually exclusive; argv must be
+    // a non-empty array of strings (a non-string element fails the
+    // cast, so it 400s here).
+    let argv: [String]?
+    if json["argv"] != nil {
+      guard let parsed = json["argv"] as? [String], !parsed.isEmpty else {
+        sendJSON(status: 400, reason: "Bad Request", object: ["error": "argv must be a non-empty array of strings"])
+        return
+      }
+      guard json["command"] == nil else {
+        sendJSON(status: 400, reason: "Bad Request", object: ["error": "argv and command are mutually exclusive"])
+        return
+      }
+      argv = parsed
+    } else {
+      argv = nil
+    }
+    let command: String?
+    if argv == nil {
+      guard let c = json["command"] as? String, !c.isEmpty else {
+        sendJSON(status: 400, reason: "Bad Request", object: ["error": "command is required"])
+        return
+      }
+      command = c
+    } else {
+      command = nil
     }
     var stdinData: Data?
     if let b64 = json["stdinData"] as? String {
@@ -726,16 +784,39 @@ extension HTTPConnection {
     if let n = json["rows"] as? NSNumber { rows = n.intValue }
     cols = max(2, min(cols, 500))
     rows = max(1, min(rows, 200))
-    let shellCommand = Self.buildShellCommand(
-      command: command,
-      cwd: json["cwd"] as? String,
-      env: json["env"] as? [String: String],
-      cwdNonce: cwdNonce)
+    // B: argv mode is pipe-only — a tty needs a shell to drive the
+    // PTY session, and argv execs have none.
+    if argv != nil && tty {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "argv mode does not support tty"])
+      return
+    }
+    // Command path only: build the /bin/bash -c string (env exports +
+    // cd + cwd marker). Argv mode skips this entirely — env/cwd go to
+    // the executor directly, and no shell prints the cwd marker.
+    let shellCommand: String?
+    if let command {
+      shellCommand = Self.buildShellCommand(
+        command: command,
+        cwd: json["cwd"] as? String,
+        env: json["env"] as? [String: String],
+        cwdNonce: cwdNonce)
+    } else {
+      shellCommand = nil
+    }
     guard ISHKernel.shared.isBooted else {
       sendJSON(status: 503, reason: "Service Unavailable", object: ["error": "ish_not_booted"])
       return
     }
-    let session = ExecSession(connection: self, cwdNonce: cwdNonce)
+    // H-1: a read-only session must never reach the guest shell — the
+    // workspace bind mount is always writable, so fail closed here
+    // instead of running the command.
+    if (json["readOnly"] as? Bool) == true {
+      sendReadOnlyDenied()
+      return
+    }
+    // B: no cwd marker in argv mode — an argv exec has no shell to
+    // print it, and it cannot change the session shell's cwd.
+    let session = ExecSession(connection: self, cwdNonce: argv == nil ? cwdNonce : nil)
     execSession = session
     if tty {
       // Cap pre-check (stage 5.3): refuse with 429 BEFORE any
@@ -750,11 +831,15 @@ extension HTTPConnection {
                  object: ["error": "pty_session_limit"])
         return
       }
-      session.startTty(command: shellCommand, stdinData: stdinData,
+      session.startTty(command: shellCommand!, stdinData: stdinData,
                        fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0,
                        cols: cols, rows: rows)
+    } else if let argv {
+      session.startArgv(argv: argv, env: json["env"] as? [String: String],
+                        cwd: json["cwd"] as? String, stdinData: stdinData,
+                        fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0)
     } else {
-      session.start(command: shellCommand, stdinData: stdinData,
+      session.start(command: shellCommand!, stdinData: stdinData,
                     fsContext: fsContext, timeout: TimeInterval(timeoutMs) / 1000.0)
     }
   }
@@ -882,6 +967,27 @@ private final class ExecSession {
     let started = Date()
     execution = ISHShellExecutor.shared().executeCommand(
       command, stdinData: stdinData, fsContext: fsContext, timeout: timeout,
+      outputHandler: { [weak self] isStderr, chunk in
+        self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
+      },
+      completion: { [weak self] result in
+        self?.queue.async { [weak self] in self?.onComplete(result: result, started: started) }
+      })
+  }
+
+  /// Direct argv exec (route B): the same NDJSON streaming shape as
+  /// start(), but argv runs without a shell via
+  /// ISHShellExecutor.executeArgv. env/cwd are applied by the
+  /// executor (no shell `export`/`cd`, no cwd marker — an argv exec
+  /// cannot change the session shell's cwd, so cwdNonce is nil here).
+  func startArgv(argv: [String], env: [String: String]?, cwd: String?,
+                 stdinData: Data?, fsContext: UInt64, timeout: TimeInterval) {
+    // Send the chunked headers first, then stream.
+    connection?.sendChunkedHeaders()
+    let started = Date()
+    execution = ISHShellExecutor.shared().executeArgv(
+      argv, env: env, cwd: cwd, stdinData: stdinData, fsContext: fsContext,
+      timeout: timeout,
       outputHandler: { [weak self] isStderr, chunk in
         self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
       },
@@ -1146,11 +1252,25 @@ extension HTTPConnection {
       sendJSON(status: 503, reason: "Service Unavailable", object: ["error": "ish_not_booted"])
       return
     }
+    // H-1: same denial as /ish/exec, before registering the session
+    // or touching the worker.
+    if (json["readOnly"] as? Bool) == true {
+      sendReadOnlyDenied()
+      return
+    }
+    // (M-10) One run per session at a time: a second concurrent run
+    // would overwrite the worker's single output handler (see
+    // beginWorkerRun) and hang the first run until its wall-clock
+    // timeout. Fail fast with 409; the bridge retries/queues.
+    guard IShLoopbackService.claimWorkerRun(sessionId: sessionId) else {
+      sendJSON(status: 409, reason: "Conflict", object: ["error": "worker_busy"])
+      return
+    }
     // Register the session NOW (service queue), before the possibly
     // blocking worker creation: close() must be able to cancel a run
     // that is still starting, or a command aborted mid-start would run
     // to completion on the worker and block the session.
-    let session = WorkerSession(connection: self, nonce: nonce)
+    let session = WorkerSession(connection: self, nonce: nonce, sessionId: sessionId)
     workerSession = session
     let shellCommand = Self.buildWorkerCommand(command: command, cwd: cwd, env: env, nonce: nonce)
     let baseEnvText = Self.buildBaseEnvExports(env: env)
@@ -1158,13 +1278,20 @@ extension HTTPConnection {
     // emulation): do it off the service queue so other requests
     // (status, pty upgrade) are not stalled behind it.
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      guard let self else { return }
+      guard let self else {
+        // (M-10) Connection gone before the worker started: the run
+        // never reaches completeRun, so release the slot here.
+        IShLoopbackService.releaseWorkerRun(sessionId: sessionId)
+        return
+      }
       var worker = ISHShellExecutor.shared().worker(forSession: sessionId, fsContext: fsContext,
                                                              baseEnvText: baseEnvText)
       if worker == nil {
         // The bridge falls back to one-shot /ish/exec for this command.
         self.sendJSON(status: 503, reason: "Service Unavailable",
                       object: ["error": "worker_start_failed"])
+        // (M-10) No run started; release the slot.
+        IShLoopbackService.releaseWorkerRun(sessionId: sessionId)
         return
       }
       // fs_context is per agent run: a worker started under a different
@@ -1177,6 +1304,8 @@ extension HTTPConnection {
         if worker == nil {
           self.sendJSON(status: 503, reason: "Service Unavailable",
                         object: ["error": "worker_start_failed"])
+          // (M-10) No run started; release the slot.
+          IShLoopbackService.releaseWorkerRun(sessionId: sessionId)
           return
         }
       }
@@ -1243,6 +1372,8 @@ private final class WorkerSession {
   private var cancelled = false
   private var timedOut = false
   private let nonce: String
+  /// The session id, for the M-10 in-flight run slot.
+  private let sessionId: String
   private var worker: ISHWorkerShell?
   private var startedAt = Date()
   private var wallClockTimeout: TimeInterval = 600
@@ -1266,9 +1397,17 @@ private final class WorkerSession {
   /// arming) is ignored.
   private var watchdogToken = 0
 
-  init(connection: HTTPConnection, nonce: String) {
+  init(connection: HTTPConnection, nonce: String, sessionId: String) {
     self.connection = connection
     self.nonce = nonce
+    self.sessionId = sessionId
+  }
+
+  deinit {
+    // (M-10) Backstop: close() drops the session after cancel(), so a
+    // cancelled run may deallocate before completeRun; release here so
+    // the session is not 409'd forever. Idempotent with completeRun.
+    IShLoopbackService.releaseWorkerRun(sessionId: sessionId)
   }
 
   /// Attach the (possibly newly created) worker and start the run.
@@ -1310,6 +1449,8 @@ private final class WorkerSession {
         // No worker yet (still starting): the command was never
         // written, and attachWorker will see cancelled and skip it.
         self.finished = true
+        // (M-10) No run will ever complete; release the slot now.
+        IShLoopbackService.releaseWorkerRun(sessionId: self.sessionId)
       }
     }
   }
@@ -1524,6 +1665,12 @@ private final class WorkerSession {
       ISHShellExecutor.shared().endWorkerRun(worker)
       self.worker = nil
     }
+    // (M-10) Release the in-flight slot only AFTER endWorkerRun has
+    // cleared the output handler: releasing earlier would let the next
+    // run install its handler first, and this run's endWorkerRun would
+    // then clear it (same clobber in reverse). Release is idempotent
+    // (deinit re-releases).
+    IShLoopbackService.releaseWorkerRun(sessionId: sessionId)
     sendJSONFrame(frame)
     // Close only after the terminating chunk has been handed to the
     // network stack (same reason as ExecSession.onComplete).
@@ -1568,6 +1715,33 @@ extension HTTPConnection {
   /// the stream die mid-response as "aborted").
   fileprivate func sendChunkEnd(completion: @escaping () -> Void = {}) {
     send(Data("0\r\n\r\n".utf8), completion: completion)
+  }
+
+  /// Deny a read-only exec/worker run as a normal NDJSON result: exit 1
+  /// with the sandbox message on stderr, so the bridge reports the
+  /// command as failed (the same shape as the virtual path's EACCES
+  /// throw) instead of a bridge/HTTP error that would trigger a retry
+  /// or a worker→one-shot fallback. The workspace bind mount is always
+  /// writable, so the denial happens here per request — never by
+  /// remounting (which would race concurrent execs). (H-1)
+  fileprivate func sendReadOnlyDenied() {
+    sendChunkedHeaders()
+    let line = (try? JSONSerialization.data(
+      withJSONObject: ["stream": "stderr",
+                       "line": "EACCES: OHOS_SANDBOX_DENIED: 当前调用是 read-only，不能修改文件"],
+      options: [])) ?? Data()
+    var lineChunk = line
+    lineChunk.append(0x0A)
+    sendChunk(lineChunk)
+    let frame = (try? JSONSerialization.data(
+      withJSONObject: ["exitCode": 1, "durationMs": 0],
+      options: [])) ?? Data()
+    var frameChunk = frame
+    frameChunk.append(0x0A)
+    sendChunk(frameChunk)
+    // Close only after the terminating chunk has been handed to the
+    // network stack (same reason as ExecSession.onComplete).
+    sendChunkEnd { [weak self] in self?.closeFromAnyQueue() }
   }
 }
 

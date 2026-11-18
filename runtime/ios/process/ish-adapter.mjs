@@ -16,14 +16,17 @@
 // already run before this adapter is called (confine() validated the
 // cwd/mode when the ticket was issued), and the bridge's toGuest()
 // rejects every host path outside the workspace and the rootfs data
-// dir. The adapter does not re-check the grant: the guest can only
-// ever see the workspace and the rootfs data dir, whichever cwd it
-// is given (an unmapped cwd falls back to the guest default, as in
-// 1.0.x). See ENGINE_HOOK.md.
+// dir. A logical workspace path (a user-granted external directory)
+// has no guest mapping, and a policy carrying a grant limits the
+// session to that directory while the guest can only ever see the
+// workspace bind mount — so both decline here (M-15) and the virtual
+// runtime rejects the spawn explicitly instead of running it in the
+// guest default directory. See ENGINE_HOOK.md.
 import { basename } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { OutputCollector } from '@deepseek-ai/dsh-subprocess-local/output';
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess';
+import { isLogicalWorkspacePath } from '../../ohos/process/files/process-authority.mjs';
 import { ISH_RUNNER_COMMAND, spawnIshExec, ishPtySpawn, installIshBridge } from './ish-bridge.mjs';
 
 const ISH_PTY_SYMBOL = Symbol.for('dsh.ish.pty');
@@ -33,19 +36,51 @@ const ISH_PTY_SYMBOL = Symbol.for('dsh.ish.pty');
 // adapter) runs in the engine worker thread, where that install never
 // landed — on device both entry points bailed to the virtual shell /
 // virtual PTY error even though the loopback was up. Install lazily on
-// first use, in the calling thread; installIshBridge never throws, and
-// the guard keeps each thread to a single install.
+// first use, in the calling thread; the guard keeps each thread to a
+// single install. (T-2) installIshBridge is documented as never
+// throwing, but nothing in its body guarantees that: if it does throw,
+// catch it here, log it once, and report "not installed" so the caller
+// falls back to the virtual implementation instead of seeing an
+// exception escape spawn.
+let bridgeInstallFailed = false;
 const bridgeInstalled = () => globalThis[ISH_PTY_SYMBOL] !== undefined;
 const ensureBridge = () => {
   if (bridgeInstalled()) return true;
-  installIshBridge();
+  try {
+    installIshBridge();
+  } catch (error) {
+    if (!bridgeInstallFailed) {
+      bridgeInstallFailed = true;
+      console.error(`[ish-adapter] installIshBridge failed, falling back to the virtual shell: ${error?.message ?? error}`);
+    }
+    return false;
+  }
   return bridgeInstalled();
 };
 
-// Only agent bash goes to the guest: ['bash', '-c', command]. Anything
-// else (rg/git/node workers, 'sh', node scripts) stays virtual.
+// Only agent bash goes to the guest as a shell command: ['bash',
+// '-c', command]. Agent rg/git/node/gh/python3/pip go to the guest
+// as a direct argv exec (B): the argv is passed verbatim, no shell
+// is involved. Anything else (other commands, 'sh', node scripts)
+// stays virtual.
 const isBashArgv = (argv) => Array.isArray(argv) && argv.length === 3
   && basename(argv[0]) === 'bash' && argv[1] === '-c' && typeof argv[2] === 'string';
+
+/** Guest CLI commands routed as a direct argv exec (B). */
+const GUEST_CLI_COMMANDS = new Set(['rg', 'git', 'node', 'gh', 'python3', 'pip', 'pip3']);
+
+/**
+ * The guest CLI name for a direct argv exec, or null. All elements
+ * must be strings; the command itself must be a bare name (a path
+ * such as /usr/bin/rg is not an agent CLI call — it stays virtual).
+ */
+const guestCliName = (argv) => {
+  if (!Array.isArray(argv) || argv.length === 0
+    || argv.some((a) => typeof a !== 'string' || a.length === 0)) return null;
+  const name = basename(argv[0]);
+  if (name !== argv[0]) return null;
+  return GUEST_CLI_COMMANDS.has(name) ? name : null;
+};
 
 /**
  * Adapt one bash spawn to the virtual handle shape, or return undefined
@@ -58,8 +93,26 @@ const isBashArgv = (argv) => Array.isArray(argv) && argv.length === 3
  * the adapter preserves that contract instead of silently dropping
  * bytes the bridge only collects for 25ms.
  */
-export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => {} } = {}) {
-  if (!ensureBridge() || !isBashArgv(argv)) return undefined;
+export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => {}, policy, concurrent } = {}) {
+  // M-15: a logical workspace cwd (or a policy carrying a grant) has no
+  // guest mapping: toGuest() returns null and the bridge would silently
+  // run in the guest default directory, outside the granted directory.
+  // Decline before installing the bridge so the virtual runtime rejects
+  // the spawn explicitly (ERR_WORKSPACE_CONFINEMENT_REQUIRED without a
+  // grant, ERR_WORKSPACE_SCOPE_UNSUPPORTED for node/git with one).
+  if (isLogicalWorkspacePath(spec.cwd) || policy?.grant) return undefined;
+  const isBash = isBashArgv(argv);
+  // B: agent rg/git/node/gh/python3/pip go to the guest as a direct
+  // argv exec (no shell). `node` is special: pluginNode spawns `node`
+  // for engine plugin scripts, so it is only routed when the caller
+  // says this is the agent-facing (non-concurrent) runtime; the other
+  // CLIs have no such collision and route unless explicitly concurrent.
+  // (The specialize patch passes concurrent: this.#concurrent.)
+  const cliName = isBash ? null : guestCliName(argv);
+  const isCli = cliName !== null && (cliName === 'node'
+    ? concurrent === false
+    : concurrent !== true);
+  if (!ensureBridge() || (!isBash && !isCli)) return undefined;
   if (spec.stdio.control === 'pipe' || spec.stdio.stdin === 'pipe') return undefined;
 
   const collected = {};
@@ -88,12 +141,19 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
   // spawnIshExec expects the confined argv (['/ish-runner', '--', ...]);
   // extractBashCommand splits at '--'. The '--' re-wrap is the adapter's
   // own: virtual.spawn already unwrapped the ohos ticket to the plain
-  // ['bash', '-c', command] argv.
-  const child = spawnIshExec([ISH_RUNNER_COMMAND, '--', ...argv], {
+  // ['bash', '-c', command] argv. B: a CLI argv goes verbatim (no wrap)
+  // — spawnIshExec detects a non-bash argv as argv mode.
+  // H-1: the ticket unwrap already validated the session mode; forward
+  // it so the server can refuse a read-only exec (the workspace bind
+  // mount is always writable, so the virtual path's EACCES enforcement
+  // has no equivalent here unless the server denies per request).
+  const readOnly = policy?.mode === 'read-only';
+  const child = spawnIshExec(isBash ? [ISH_RUNNER_COMMAND, '--', ...argv] : argv, {
     cwd: spec.cwd,
     env,
     signal: spec.signal,
     stdio: [spec.stdio.stdin === 'ignore' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    ...(readOnly ? { readOnly: true } : {}),
   });
 
   const completion = Promise.withResolvers();

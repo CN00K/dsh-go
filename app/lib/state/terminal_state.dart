@@ -316,10 +316,11 @@ abstract final class TerminalCopy {
   /// Label for the reset button on a failed tab.
   static String get ishResetAction => '重置并重装';
 
-  /// Copy for the reset button: resetting only wipes the Linux sandbox
-  /// and reinstalls the bundled rootfs; chat history in the app is
-  /// untouched.
-  static String get ishResetNote => '重置只会清除 Linux 沙箱并用新版 rootfs 重装，不影响 App 里的聊天记录。';
+  /// Copy for the reset button: resetting wipes the Linux sandbox and
+  /// reinstalls the bundled rootfs; the guest's /root is backed up
+  /// first and restored after the reinstall; chat history in the app
+  /// is untouched.
+  static String get ishResetNote => '重置会清除 Linux 沙箱并用新版 rootfs 重装，/root 下的数据会先备份、装好后恢复；不影响 App 里的聊天记录。';
 
   static String? _bootErrorText(Object? error) {
     if (error == null) return null;

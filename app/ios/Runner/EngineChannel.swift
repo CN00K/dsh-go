@@ -559,7 +559,19 @@ final class EngineChannel: NSObject, FlutterStreamHandler {
   // conversation has appeared in its session list.
   private var localTurnRunning = false
   private var phoneTaskRunning = false
-  private var continuedEnabled = true
+  // Startup default for the switch Dart owns: SharedPreferences persists
+  // under `flutter.<key>` in UserDefaults (same as `flutter.app_language`
+  // in NativeMediaChannel, from lib/state/locale_state.dart), so read the
+  // last saved value instead of assuming on. Dart's value is
+  // `notify_enabled && notify_continued_run` (continued_run.dart), and an
+  // absent key means "never touched", which Dart also defaults to on —
+  // hence object(forKey:) as? Bool, not bool(forKey:) (false when absent).
+  private var continuedEnabled: Bool = {
+    let defaults = UserDefaults.standard
+    let enabled = defaults.object(forKey: "flutter.notify_enabled") as? Bool ?? true
+    let continuedRun = defaults.object(forKey: "flutter.notify_continued_run") as? Bool ?? true
+    return enabled && continuedRun
+  }()
   private let pathMonitor = NWPathMonitor()
   private var pathStarted = false
 

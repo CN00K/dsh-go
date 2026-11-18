@@ -33,3 +33,23 @@ test('explicit resume joins serialized transport revalidation before acknowledge
  await Promise.race([entered.promise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('resume skipped revalidation')),500))]);
  assert.equal(done,false);release.resolve();await resumed;assert.equal(done,true);
 });
+
+// H-2: a transient transport failure during resume must not poison the
+// boundary, and the next native refresh must retry the resume instead
+// of leaving admission paused forever.
+test('transient transport failure during resume does not poison the boundary and the next refresh retries resume',async t=>{
+ const f=setup(t);
+ let failNext=true;
+ f.c.revalidateTransport=async()=>{if(failNext){failNext=false;throw Object.assign(new Error('transient transport'),{code:'ERR_OHOS_LIFECYCLE_TRANSPORT'});}};
+ await f.c.pause();
+ await assert.rejects(f.c.resume(),/transient transport/);
+ // Paused, not poisoned: admission still works, the gate stays closed.
+ assert.equal(f.c.status().blocked,false);
+ assert.equal(f.c.status().paused,true);
+ assert.equal(f.c.admit('s'),false);
+ // The next native refresh retries the resume and opens the gate.
+ await f.c.observeHost({});
+ assert.equal(f.c.status().paused,false);
+ assert.equal(f.c.admit('s'),true);
+ assert.deepEqual(f.journal.records.map(x=>x.body.kind),['pause','resume']);
+});

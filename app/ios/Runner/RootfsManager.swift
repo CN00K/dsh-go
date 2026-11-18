@@ -19,6 +19,11 @@
 //  - progress callback (0.0–1.0, delivered on the main queue).
 //  - reset() (refuses while the kernel is booted — use
 //    ISHKernel.resetRootfsWhileBooted for the booted case).
+//  - /root backup + restore (M-7): backupUserRoot() copies data/root
+//    to iSH/rootfs-backup-<stamp>/ before a reset; the next
+//    ensureInstalled (fresh install or .alreadyInstalled retry) or
+//    the booted-branch restoreMissingFiles moves it back. Only the
+//    latest backup is kept.
 //
 //  Rootfs home (design §2.6): Application Support/iSH/rootfs/
 //  (permissions 0700), NOT ~/Documents — the Documents directory is
@@ -172,7 +177,12 @@ struct RootfsManager {
         let zip = try resolveZipURL(zipURL)
         let data = try Data(contentsOf: zip)
         let current = zipSHA256(of: data)
-        guard let installed = installedHash() else { return true }
+        guard let installed = installedHash() else {
+            // (M-11) A missing marker is not an upgrade (see
+            // ensureInstalled): the marker is rewritten on the next
+            // ensureInstalled instead of forcing a reset.
+            return false
+        }
         return installed != current
     }
 
@@ -189,13 +199,43 @@ struct RootfsManager {
         let hash = zipSHA256(of: zipData)
         reportProgress(progress, 0.05)
         if isInstalled {
-            if installedHash() == hash {
+            // (M-11) A missing .zip-sha256 marker is not an upgrade:
+            // the zip is unchanged, so rewrite the marker in place
+            // instead of demanding a destructive reset.
+            var installed = installedHash()
+            if installed == nil {
+                NSLog("RootfsManager: .zip-sha256 丢失，原地重写 marker（非升级）")
+                try hash.write(to: hashURL, atomically: true, encoding: .utf8)
+                installed = hash
+            }
+            if installed == hash {
                 // Self-healing (build 38): the hash marker only proves
                 // the zip is the same, not that the extracted tree is
                 // intact. A tree missing bin/sh or bin/busybox boots
                 // fine but can never spawn a shell (close 1011 on every
                 // terminal open). Re-extract instead of booting it.
                 if criticalFilesPresent() {
+                    // H-3: the hash marker and the critical files do
+                    // not prove meta.db exists; a missing database
+                    // fails every bind-mount registration, so restore
+                    // it in place instead of reporting
+                    // .alreadyInstalled on a tree that cannot share
+                    // the workspace.
+                    if !FileManager.default.fileExists(atPath: metaDBURL.path) {
+                        NSLog("RootfsManager: 已安装但缺 meta.db，就地补回")
+                        try restoreMissingFiles()
+                        guard FileManager.default.fileExists(atPath: metaDBURL.path) else {
+                            throw RootfsError.ioError("补回后校验失败：meta.db 仍缺失")
+                        }
+                    }
+                    // (M-7) A surviving backup is a pending restore:
+                    // reset always deletes the tree, so a backup can
+                    // only outlive a boot when a previous restore
+                    // failed (kept for retry). Restore it here too —
+                    // without this, a failed restore could never be
+                    // retried: the next boot returns .alreadyInstalled
+                    // and never reinstalls.
+                    try restoreLatestUserRootBackup()
                     reportProgress(progress, 1.0)
                     return .alreadyInstalled
                 }
@@ -254,6 +294,8 @@ struct RootfsManager {
         guard criticalFilesPresent() else {
             throw RootfsError.ioError("解压后校验失败：关键文件（shell/动态链接器/libc/profile）缺失或截断")
         }
+        // (M-7) Fresh install after a reset: move the /root backup back.
+        try restoreLatestUserRootBackup()
         reportProgress(progress, 1.0)
         return .installed
     }
@@ -272,6 +314,97 @@ struct RootfsManager {
         try clearBrokenInstall()
     }
 
+    // MARK: - Guest /root backup (M-7)
+
+    /// Prefix for /root backups under iSH/ (`rootfs-backup-<stamp>`).
+    /// A reset with keepUserData copies data/root here first; the next
+    /// install/restore moves it back into data/root. Only the latest
+    /// backup is kept (older ones are pruned when a new one is made).
+    static let userRootBackupPrefix = "rootfs-backup-"
+
+    /// The latest `rootfs-backup-*` directory, if any. Names sort
+    /// chronologically (millisecond stamp), so the last one is newest.
+    static func latestUserRootBackup() -> URL? {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: ishDirURL, includingPropertiesForKeys: nil) else { return nil }
+        return items.filter { $0.lastPathComponent.hasPrefix(userRootBackupPrefix) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }.last
+    }
+
+    /// Delete every `rootfs-backup-*` except `keeping` (best effort).
+    /// Compared by lastPathComponent: URL equality is sensitive to a
+    /// trailing slash (isDirectory:true appends one), so comparing
+    /// whole URLs could prune the backup that must be kept.
+    static func pruneUserRootBackups(keeping: URL? = nil) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: ishDirURL, includingPropertiesForKeys: nil) else { return }
+        for item in items where item.lastPathComponent.hasPrefix(userRootBackupPrefix)
+            && item.lastPathComponent != keeping?.lastPathComponent {
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    /// Back up data/root before a reset. Returns the backup URL, or nil
+    /// when there is no /root to back up (nothing installed yet). A
+    /// failed copy removes the partial backup so an older good one
+    /// survives; on success older backups are pruned (latest only).
+    @discardableResult
+    static func backupUserRoot() throws -> URL? {
+        let fm = FileManager.default
+        let root = dataURL.appendingPathComponent("root", isDirectory: true)
+        guard fm.fileExists(atPath: root.path) else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd-HHmmssSSS"
+        let backup = ishDirURL
+            .appendingPathComponent("\(userRootBackupPrefix)\(f.string(from: Date()))", isDirectory: true)
+        do {
+            try fm.createDirectory(at: ishDirURL, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            try fm.copyItem(at: root, to: backup)
+        } catch {
+            try? fm.removeItem(at: backup)
+            throw RootfsError.ioError("备份 /root 失败：\(error.localizedDescription)")
+        }
+        pruneUserRootBackups(keeping: backup)
+        return backup
+    }
+
+    /// Move the latest /root backup back into data/root. Backup wins on
+    /// conflict; files already moved stay moved, so a failed restore
+    /// can be retried. The backup directory is deleted on success; on
+    /// failure it is kept and the error names it. No-op when no backup
+    /// exists.
+    static func restoreLatestUserRootBackup() throws {
+        let fm = FileManager.default
+        guard let backup = latestUserRootBackup() else { return }
+        let root = dataURL.appendingPathComponent("root", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let enumerator = fm.enumerator(atPath: backup.path) else {
+            throw RootfsError.ioError("恢复 /root 备份失败：无法枚举备份 \(backup.lastPathComponent)")
+        }
+        for case let rel as String in enumerator {
+            let src = backup.appendingPathComponent(rel)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: src.path, isDirectory: &isDir) else { continue }
+            // Directories are containers (created on demand below);
+            // symlinks move as files even when they point at dirs.
+            let isSymlink = (try? fm.attributesOfItem(atPath: src.path))?[.type] as? FileAttributeType == .typeSymbolicLink
+            guard !isDir.boolValue || isSymlink else { continue }
+            let dst = root.appendingPathComponent(rel)
+            do {
+                try fm.createDirectory(at: dst.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+                if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
+                try fm.moveItem(at: src, to: dst)
+            } catch {
+                throw RootfsError.ioError("恢复 /root 备份失败（\(rel)）：\(error.localizedDescription)。备份保留在 \(backup.lastPathComponent)，重试 boot 可再试")
+            }
+        }
+        try? fm.removeItem(at: backup)
+        NSLog("RootfsManager: /root 已从备份 %@ 恢复", backup.lastPathComponent)
+    }
+
     /// Remove the rootfs tree (best effort, never throws) so the
     /// next app launch reinstalls it from the bundled zip. Used when
     /// the kernel is already booted on a broken tree: the kernel
@@ -281,11 +414,16 @@ struct RootfsManager {
         try? clearBrokenInstall()
     }
 
-    /// (Build 40) Restores ONLY the critical guest files that are
-    /// missing (or truncated) from the bundled zip, in place, without
-    /// deleting anything. Safe to call while the kernel is booted: the
-    /// kernel reads guest files on demand through fakefs, so restoring
-    /// the missing files lets the next shell spawn succeed. The shipped
+    /// (Build 40) Restores the missing shipped files from the bundled
+    /// zip, in place, without deleting anything. Safe to call while the
+    /// kernel is booted: the kernel reads guest files on demand through
+    /// fakefs, so restoring the missing files lets the next shell spawn
+    /// succeed. (H-4) The restore is a full sweep, not just the five
+    /// critical files: a reset-while-booted deletes the whole tree,
+    /// and restoring only the critical set would leave a tree that
+    /// reports running while /bin/bash and every other shipped file
+    /// are still gone. Files already on disk (user files and user
+    /// modifications) are never touched. The shipped
     /// meta.db already records the correct modes (bin/sh is a symlink,
     /// busybox/ld-musl are 0755), so an existing one is left alone —
     /// replacing it under a running kernel would risk SQLite
@@ -342,6 +480,26 @@ struct RootfsManager {
             }
             try fm.moveItem(at: src, to: dst)
         }
+        // H-4: the five critical files are not the whole tree. Sweep
+        // the extracted data/ and move in every shipped file that is
+        // absent at the destination (a reset-while-booted deletes
+        // /bin/bash, /usr/bin/*, python3, node, git and the rest);
+        // files already on disk are never touched. The critical loop
+        // above already handled truncated binaries (they exist but
+        // are too small); this sweep only fills gaps.
+        let shippedData = tmp.appendingPathComponent("data", isDirectory: true)
+        if let enumerator = fm.enumerator(atPath: shippedData.path) {
+            for case let rel as String in enumerator {
+                let src = shippedData.appendingPathComponent(rel)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: src.path, isDirectory: &isDir), !isDir.boolValue else { continue }
+                let dst = dataURL.appendingPathComponent(rel)
+                guard !fm.fileExists(atPath: dst.path) else { continue }
+                try fm.createDirectory(at: dst.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+                try fm.moveItem(at: src, to: dst)
+            }
+        }
         guard criticalFilesPresent() else {
             throw RootfsError.ioError("补回后校验失败：关键文件仍缺失或截断")
         }
@@ -352,6 +510,19 @@ struct RootfsManager {
             }
             try fm.moveItem(at: src, to: metaDBURL)
             NSLog("RootfsManager: 已补回缺失的 meta.db")
+            // (M-8) The shipped meta.db only registers factory files;
+            // files added after install (apk packages, user writes to
+            // /root and /etc) exist on disk but have no paths+stats
+            // rows, so the guest cannot see them. Re-register the
+            // whole live data/ tree (same call ensureMetaDB uses).
+            let rc = metaDBURL.path.withCString { dbPath in
+                dataURL.path.withCString { dataPath in
+                    ish_fakefs_meta_register_subtree(dbPath, dataPath, "/")
+                }
+            }
+            guard rc == 0 else {
+                throw RootfsError.ioError("meta.db 补登记失败 (rc=\(rc))")
+            }
         }
         NSLog("RootfsManager: 关键文件已补回，内核无需重启")
     }

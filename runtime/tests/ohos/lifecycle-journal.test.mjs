@@ -102,6 +102,51 @@ test('a real partial append failure poisons later requests and leaves a nonempty
   assert.equal(again.records.at(-1).body.kind, 'prepared');
 });
 
+// M-1: failures proven to have written nothing to the log must not poison
+// it. Only a failure at or after the write phase (a partial write, a failed
+// sync) or confirmed corruption may poison; the next append must still work.
+test('a rejected before-record observer leaves the log intact and does not poison later appends', async t => {
+  let armed = false;
+  const f = await fixture(t, { onStage(stage) {
+    if (armed && stage === 'before-record') { armed = false; throw new Error('transient observer'); }
+  } });
+  await f.journal.append(body('prepared')); armed = true;
+  await assert.rejects(f.journal.append(body('dispatch')), /transient observer/);
+  assert.equal(f.journal.failed, false);
+  await f.journal.append(body('dispatch'));
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['header', 'prepared', 'dispatch']);
+});
+
+test('an oversized record is rejected without poisoning later appends', async t => {
+  const f = await fixture(t);
+  await f.journal.append(body('prepared'));
+  await assert.rejects(f.journal.append({ ...body('dispatch'), note: 'x'.repeat(2 * 1024 * 1024) }), /exceeds 1 MiB/);
+  assert.equal(f.journal.failed, false);
+  await f.journal.append(body('dispatch'));
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['header', 'prepared', 'dispatch']);
+});
+
+test('a transient result-file failure does not poison later appends', async t => {
+  let armed = false;
+  const f = await fixture(t, { fs: { ...fs, async open(path, ...args) {
+    const handle = await fs.open(path, ...args);
+    if (!String(path).includes('/results/')) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === 'write') return async (bytes, offset, length, position) => {
+        if (!armed) return target.write(bytes, offset, length, position);
+        armed = false;
+        throw Object.assign(new Error('transient result EIO'), { code: 'EIO' });
+      };
+      const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } } });
+  await f.journal.append(body('prepared')); armed = true;
+  await assert.rejects(f.journal.appendResult(body('returned'), { content: 'first' }), { code: 'EIO' });
+  assert.equal(f.journal.failed, false);
+  await f.journal.appendResult(body('outcome'), { content: 'second' });
+  assert.equal(f.journal.records.at(-1).body.kind, 'outcome');
+});
+
 test('closing seals admission before waiting; late append cannot race a closed fd', async t => {
   const reached = Promise.withResolvers(), release = Promise.withResolvers();
   const f = await fixture(t, { async onStage(stage) {

@@ -88,8 +88,14 @@ DIAGNOSTIC_EDITS = {
         # unwrap above has already run; ishSpawnFor returns undefined
         # when the bridge is not installed or the argv is not bash -c,
         # and the virtual shell below runs exactly as in 1.1.1.
+        # (H-1) policy is in scope here (the unwrapped ticket's policy,
+        # or undefined for a direct spawn); the adapter forwards
+        # policy.mode === 'read-only' so the server can refuse the exec.
+        # (M-12) the guest handle joins this.live like a virtual one
+        # (removed when done settles), so dispose() terminates it and
+        # hasActiveWork() sees the running bash instead of idle.
         ("    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];",
-         "    const ishHandle = ishSpawnFor(argv, spec, { temporaryRoot: this.temporaryRoot, onSpillFailure: this.onSpillFailure });\n    if (ishHandle) return ishHandle;\n    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];"),
+         "    const ishHandle = ishSpawnFor(argv, spec, { temporaryRoot: this.temporaryRoot, onSpillFailure: this.onSpillFailure, policy, concurrent: this.#concurrent });\n    if (ishHandle) { this.live.add(ishHandle); ishHandle.done.then(() => this.live.delete(ishHandle), () => this.live.delete(ishHandle)); return ishHandle; }\n    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];"),
         ("spawn(spec) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "spawn(spec) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
         ('无效或已使用的鸿蒙执行票据', '无效或已使用的 iOS 执行票据'),
         ('鸿蒙虚拟进程临时根的身份已改变，拒绝删除替换目录', 'iOS 虚拟进程临时根的身份已改变，拒绝删除替换目录'),

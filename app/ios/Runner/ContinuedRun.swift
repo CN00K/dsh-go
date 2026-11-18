@@ -29,6 +29,10 @@ final class ContinuedRun {
     trace(running ? "requested" : "idle")
     if running {
       spent = false
+      // A turn that starts while the app is already in the background never
+      // crosses willResignActive, so try once now. The system may still say
+      // no; that failure is reported by submit(), not silent.
+      if UIApplication.shared.applicationState == .background { submit() }
     } else {
       finish(success: true)
     }
@@ -48,9 +52,10 @@ final class ContinuedRun {
   }
 
   private func submit() {
-    guard #available(iOS 26.0, *), !spent, task == nil, submitted == nil,
-      UIApplication.shared.applicationState != .background
-    else { return }
+    // No foreground gate: the system is the arbiter. A background-started
+    // turn tries here (see update(running:)); if the system refuses, the
+    // request throws and the failure is reported below, fail-closed.
+    guard #available(iOS 26.0, *), !spent, task == nil, submitted == nil else { return }
     // Each request registers its own identifier, so a late launch can't be taken for a newer turn's.
     let identifier = "\(Bundle.main.bundleIdentifier ?? "dsh").continued.\(UUID().uuidString)"
     let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
@@ -73,7 +78,17 @@ final class ContinuedRun {
       trace("submitted")
     } catch {
       if submitted == identifier { submitted = nil }
-      trace("submit-failed-\((error as NSError).code)")
+      let code = (error as NSError).code
+      if UIApplication.shared.applicationState == .background {
+        // The turn started in the background and the system refused the only
+        // chance to keep it going. Say so through the status channel instead
+        // of leaving the switch on and the engine paused with no trace:
+        // onChange(false) re-emits status with continued == false.
+        trace("background-submit-failed-\(code)")
+        onChange?(false)
+      } else {
+        trace("submit-failed-\(code)")
+      }
       // The system said no. The engine pauses in the background, as it does without this.
     }
   }

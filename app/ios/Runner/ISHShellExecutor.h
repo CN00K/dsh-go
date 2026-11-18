@@ -147,6 +147,25 @@ typedef NS_ENUM(NSInteger, ISHShellExecutionError) {
                         outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                            completion:(void (^)(ISHShellExecutionResult *result))completion;
 
+/// Direct argv exec (route B, /ish/exec argv mode): argv runs WITHOUT
+/// a shell — argv[0] is the program, the rest are its arguments
+/// verbatim. A bare argv[0] (no '/') is resolved against the effective
+/// PATH (execvp semantics; the kernel does no PATH lookup); a path
+/// argv[0] is used as given. `env` overlays the fixed defaults
+/// (request wins; invalid shell names are ignored) and `cwd` becomes
+/// the child's working directory (no shell `cd`); both are nil for the
+/// command path, which keeps baking them into the shell string.
+/// Pipe-only (no PTY); streaming, timeout and sentinels are the same
+/// as executeCommand above.
+- (ISHShellExecution *)executeArgv:(NSArray<NSString *> *)argv
+                               env:(nullable NSDictionary<NSString *, NSString *> *)env
+                               cwd:(nullable NSString *)cwd
+                         stdinData:(nullable NSData *)stdinData
+                         fsContext:(uint64_t)fsContext
+                           timeout:(NSTimeInterval)timeout
+                     outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
+                        completion:(void (^)(ISHShellExecutionResult *result))completion;
+
 /// PTY variant (stage 5.3, ENV-02): run through /bin/sh -c <command>
 /// on a fresh fake PTY (its own ISHKernel session, own winsize)
 /// instead of host pipes. stdout/stderr are MERGED — a PTY has one
