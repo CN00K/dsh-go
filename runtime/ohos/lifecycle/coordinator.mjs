@@ -497,7 +497,10 @@ export class BoundaryCoordinator {
       // a poisoned journal forever with no self-stop (cf. #resume's fatal
       // branch, which likewise keeps its target). R4-N-2: if the record
       // already landed, a flush failure must not set the marker either.
-      if (!recorded && !fatalLifecycleError(error)) this.#pauseRetryPending = true;
+      // R5-N-1: the record may also have landed in another queued #pause()
+      // call (or in this call's #record, before #onStage threw) — the fold
+      // already set #lastPause, so a retry would append a duplicate pause.
+      if (!recorded && !fatalLifecycleError(error) && !(this.#lastPause && this.#lastManualPaused === manualPaused)) this.#pauseRetryPending = true;
       // N-3: the gate was built before the record attempt, so the boundary
       // is paused whether or not the pause record landed: stop the budget
       // clock too, or the pause would keep charging tool budgets.

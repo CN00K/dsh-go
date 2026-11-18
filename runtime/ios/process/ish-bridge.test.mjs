@@ -2665,6 +2665,68 @@ test('ishWorkerExec rejects malformed argv with ISH_INVALID_ARGV (R4-3)', async 
   }
 });
 
+// R5-1-1: a non-string cwd/env through the shared helper must fail as
+// ISH_INVALID_ARGV, not sail to the server where it is silently treated
+// as absent (wrong-directory execution / missing env vars). The Symbol
+// env case used to throw a bare TypeError from Object.entries.
+test('ishExec/ishWorkerExec reject non-string cwd/env with ISH_INVALID_ARGV (R5-1-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
+    await assert.rejects(ishExec({command: 'echo hi', cwd: 42, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', cwd: {}, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', cwd: ['/tmp'], serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: {A: 42}, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: {A: null}, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: 'xx', serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: 42, serviceFile}), invalid);
+    await assert.rejects(ishExec({command: 'echo hi', env: Symbol('x'), serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', cwd: 42, sessionId: 'sess-r5-1-1', serviceFile}), invalid);
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', env: {A: 42}, sessionId: 'sess-r5-1-1', serviceFile}), invalid);
+    assert.equal(requests, 0, 'all non-string cwd/env inputs must fail before any HTTP is sent');
+    // env: null stays allowed (absent) and still runs.
+    await ishWorkerExec({command: 'echo hi', env: null, sessionId: 'sess-r5-1-1', serviceFile});
+    assert.equal(requests, 1, 'env: null must not be rejected');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// R5-1-2: a well-formed argv through ishWorkerExec (command-only entry)
+// must fail as ISH_INVALID_ARGV, not be silently ignored while the
+// command runs as a shell string.
+test('ishWorkerExec rejects a well-formed argv with ISH_INVALID_ARGV (R5-1-2)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const invalid = (error) => error.code === 'ISH_INVALID_ARGV';
+    await assert.rejects(
+      ishWorkerExec({command: 'echo hi', argv: ['rg'], sessionId: 'sess-r5-1-2', serviceFile}), invalid);
+    assert.equal(requests, 0, 'argv must fail before any HTTP is sent');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
 test('spawnIshExec argv+tty fails closed without sending HTTP (N-4)', async () => {
   let requests = 0;
   const {server, port, close} = await startMockServer((_req, res) => {

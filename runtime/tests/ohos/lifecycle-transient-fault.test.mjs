@@ -244,3 +244,43 @@ test('a stale retry marker is cleared when the retry record lands even if its fl
   await f.c.observeHost({});
   assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
 });
+
+// R5-N-1: `recorded` is per-call, so a second queued #pause() whose #record
+// fails transiently would arm the retry marker even though the first call's
+// pause record already landed — the next refresh would append a duplicate
+// pause record. The folded durable state (#lastPause / #lastManualPaused)
+// must suppress the marker instead.
+test('a transient failure in a queued second pause does not retry when the first pause record already landed', async t => {
+  const f = setup(t);
+  // Fail only the second append attempt so the failure lands on B, not A.
+  const origAppend = f.journal.append.bind(f.journal);
+  let attempts = 0;
+  f.journal.append = async body => { if (++attempts === 2) throw transientIo(); return origAppend(body); };
+  const pA = f.c.pause();
+  const pB = f.c.pause();
+  await pA;
+  await assert.rejects(pB, { code: 'EIO' });
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  assert.equal(f.journal.appendCalls, 1);
+});
+
+// R5-N-2: the stale-marker test above retries via observeHost/#refreshNative,
+// which clears the marker before dispatching — so it cannot tell whether
+// the in-work clear (before flush(), coordinator :476) is load-bearing.
+// This test retries explicitly, mirroring probe P-explicit: a flush failure
+// on the explicit retry must not leave the marker behind.
+test('an explicit pause retry whose record lands but flush fails does not leave a stale retry marker', async t => {
+  const f = setup(t);
+  f.journal.failAppend(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), []);
+  f.journal.failFlush(1);
+  await assert.rejects(f.c.pause(), { code: 'EIO' });
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  await f.c.observeHost({});
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['pause']);
+  assert.equal(f.journal.appendCalls, 2);
+});
+

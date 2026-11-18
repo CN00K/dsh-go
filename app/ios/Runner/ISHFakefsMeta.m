@@ -37,21 +37,80 @@ static sqlite3 *ish_meta_open(const char *metaDBPath) {
     return db;
 }
 
-// Returns the inode for guestPath, or -1 if the path is not registered.
+// Returns the inode for guestPath, -1 if the path is not registered,
+// or -2 on a sqlite error (prepare/step failure). Callers must not
+// treat -2 as "missing": it means the lookup itself failed.
 static sqlite3_int64 ish_meta_lookup_inode(sqlite3 *db, const char *guestPath) {
     sqlite3_stmt *st = NULL;
     sqlite3_int64 inode = -1;
     if (sqlite3_prepare_v2(db, "SELECT inode FROM paths WHERE path = ?",
                            -1, &st, NULL) != SQLITE_OK) {
         NSLog(@"ISHFakefsMeta: prepare lookup failed: %s", sqlite3_errmsg(db));
-        return -1;
+        return -2;
     }
     sqlite3_bind_blob(st, 1, guestPath, (int)strlen(guestPath), SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
+    int step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
         inode = sqlite3_column_int64(st, 0);
+    } else if (step != SQLITE_DONE) {
+        NSLog(@"ISHFakefsMeta: lookup step failed for %s: %s",
+              guestPath, sqlite3_errmsg(db));
+        sqlite3_finalize(st);
+        return -2;
     }
     sqlite3_finalize(st);
     return inode;
+}
+
+// Returns 1 and fills *modeOut with the recorded st_mode when guestPath
+// has a paths row, 0 when it has none, -1 on a sqlite error. (R5-3-3)
+// The walker uses this single query for both existence and the recorded
+// type bits, so a host-side type change (symlink <-> regular file,
+// file <-> dir) is not silently skipped.
+static int ish_meta_lookup_mode(sqlite3 *db, const char *guestPath,
+                                uint32_t *modeOut) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT s.stat FROM stats s "
+                           "JOIN paths p ON p.inode = s.inode "
+                           "WHERE p.path = ?",
+                           -1, &st, NULL) != SQLITE_OK) {
+        NSLog(@"ISHFakefsMeta: prepare mode lookup failed: %s", sqlite3_errmsg(db));
+        return -1;
+    }
+    sqlite3_bind_blob(st, 1, guestPath, (int)strlen(guestPath), SQLITE_TRANSIENT);
+    int step = sqlite3_step(st);
+    int rc = -1;
+    if (step == SQLITE_ROW) {
+        const void *blob = sqlite3_column_blob(st, 0);
+        int nbytes = sqlite3_column_bytes(st, 0);
+        if (blob != NULL && nbytes >= 4) {
+            const unsigned char *b = (const unsigned char *)blob;
+            *modeOut = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                       ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+            rc = 1;
+        } else {
+            NSLog(@"ISHFakefsMeta: short stat blob for %s", guestPath);
+        }
+    } else if (step == SQLITE_DONE) {
+        rc = 0;
+    } else {
+        NSLog(@"ISHFakefsMeta: mode lookup step failed for %s: %s",
+              guestPath, sqlite3_errmsg(db));
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+// Same 1/0/-1 contract as ish_meta_lookup_mode, opening its own
+// connection like ish_fakefs_meta_path_exists.
+static int ish_meta_path_mode(const char *metaDBPath, const char *guestPath,
+                              uint32_t *modeOut) {
+    sqlite3 *db = ish_meta_open(metaDBPath);
+    if (!db) return -1;
+    int rc = ish_meta_lookup_mode(db, guestPath, modeOut);
+    sqlite3_close(db);
+    return rc;
 }
 
 int ish_fakefs_meta_register_path(const char *metaDBPath,
@@ -140,11 +199,17 @@ int ish_fakefs_meta_ensure_parents(const char *metaDBPath,
             // special-mode directory (e.g. /tmp 1777, /root 0700).
             // register_path itself is untouched — bind mounts still
             // rely on its UPDATE semantics (ISHKernel.m).
-            // path_exists returns 1 only for an existing row;
-            // anything else (0 = missing or lookup failure,
-            // -1 = open failure) falls through to register_path,
-            // which INSERTs or reports the error.
-            if (ish_fakefs_meta_path_exists(metaDBPath, buf) != 1) {
+            // (R5-3-2) path_exists returns 1 for an existing row,
+            // 0 for missing, -1 on a sqlite error. A -1 is a failed
+            // check, not a missing ancestor: fail instead of falling
+            // through to register_path, whose retry could UPDATE a
+            // factory row after a transient error (e.g. SQLITE_BUSY).
+            int exists = ish_fakefs_meta_path_exists(metaDBPath, buf);
+            if (exists < 0) {
+                *p = save;
+                return -1;
+            }
+            if (exists != 1) {
                 int rc = ish_fakefs_meta_register_path(metaDBPath, buf, 0040755);
                 if (rc != 0) {
                     *p = save;
@@ -212,7 +277,16 @@ static int ish_meta_register_tree(const char *metaDBPath,
         if (snprintf(guestPath, sizeof(guestPath), "%s", guestPrefix) >= (int)sizeof(guestPath)) return -1;
     } else {
         if (snprintf(hostPath, sizeof(hostPath), "%s/%s", hostRoot, rel) >= (int)sizeof(hostPath)) return -1;
-        if (snprintf(guestPath, sizeof(guestPath), "%s/%s", guestPrefix, rel) >= (int)sizeof(guestPath)) return -1;
+        // (R5-3-1) Pick the join format by the prefix's trailing slash:
+        // guestPrefix "/" + "bin" must be "/bin", not "//bin" (the
+        // kernel matches paths byte-exactly, so "//..." rows are dead
+        // rows the guest never sees). "/root" has no trailing slash
+        // and still joins as "/root/...".
+        if (guestPrefix[strlen(guestPrefix) - 1] == '/') {
+            if (snprintf(guestPath, sizeof(guestPath), "%s%s", guestPrefix, rel) >= (int)sizeof(guestPath)) return -1;
+        } else {
+            if (snprintf(guestPath, sizeof(guestPath), "%s/%s", guestPrefix, rel) >= (int)sizeof(guestPath)) return -1;
+        }
     }
     struct stat st;
     if (lstat(hostPath, &st) != 0) {
@@ -227,14 +301,27 @@ static int ish_meta_register_tree(const char *metaDBPath,
     // recursed into, so missing children are INSERTed below it.
     // register_path itself is untouched — bind mounts rely on its
     // UPDATE semantics (ISHKernel.m).
-    // path_exists returns 1 only when a paths row exists; anything
-    // else (0 = missing or lookup failure, -1 = open failure) falls
-    // through to register_path, which INSERTs or reports the error
-    // as before.
-    if (ish_fakefs_meta_path_exists(metaDBPath, guestPath) != 1) {
-        if (ish_fakefs_meta_register_path(metaDBPath, guestPath,
-                                          (uint32_t)st.st_mode) != 0) {
+    // (R5-3-1) The root node of a "/" walk is guest path "/" itself,
+    // which the kernel never looks up (it uses "" for the root, as in
+    // the shipped meta.db), so do not register it; still recurse below.
+    // (R5-3-2) A lookup error (-1) fails the walk instead of falling
+    // through to register_path: a transient error (e.g. SQLITE_BUSY)
+    // followed by a successful register_path retry would UPDATE a
+    // factory row. (R5-3-3) A row whose recorded type bits differ from
+    // the host lstat type is not skipped — it falls through to
+    // register_path, whose UPDATE corrects the type.
+    if (!(rel[0] == '\0' && strcmp(guestPath, "/") == 0)) {
+        uint32_t recordedMode = 0;
+        int exists = ish_meta_path_mode(metaDBPath, guestPath, &recordedMode);
+        if (exists < 0) {
             return -1;
+        }
+        if (exists == 0 ||
+            (recordedMode & S_IFMT) != (st.st_mode & S_IFMT)) {
+            if (ish_fakefs_meta_register_path(metaDBPath, guestPath,
+                                              (uint32_t)st.st_mode) != 0) {
+                return -1;
+            }
         }
     }
     if (!S_ISDIR(st.st_mode)) return 0;
@@ -275,7 +362,12 @@ int ish_fakefs_meta_path_exists(const char *metaDBPath,
     if (!metaDBPath || !guestPath || guestPath[0] != '/') return -1;
     sqlite3 *db = ish_meta_open(metaDBPath);
     if (!db) return -1;
+    // (R5-3-2) ish_meta_lookup_inode returns -2 on a sqlite error,
+    // -1 when there is no row: only the latter is "missing" (0).
+    // An error returns -1, matching the .h contract, so callers fail
+    // instead of treating a failed check as a missing path.
     sqlite3_int64 inode = ish_meta_lookup_inode(db, guestPath);
     sqlite3_close(db);
+    if (inode == -2) return -1;
     return inode >= 0 ? 1 : 0;
 }

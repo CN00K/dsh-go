@@ -524,6 +524,23 @@ function assertValidExecInput(opts) {
       new Error('ish argv must be an array of strings without NUL bytes'),
       {code: 'ISH_INVALID_ARGV'});
   }
+  // R5-1-1: type guards before the NUL checks — a non-string cwd or a
+  // non-string env value would otherwise sail through to the server,
+  // which treats them as absent (silent wrong-directory / missing-env
+  // execution). The guard also closes the native TypeError from
+  // Object.entries on a Symbol env. env: null stays allowed (absent).
+  if (opts.cwd !== undefined && typeof opts.cwd !== 'string') {
+    throw Object.assign(
+      new Error('ish cwd must be a string'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+  if (opts.env !== undefined && opts.env !== null
+    && (typeof opts.env !== 'object' || Array.isArray(opts.env)
+      || Object.values(opts.env).some((v) => typeof v !== 'string'))) {
+    throw Object.assign(
+      new Error('ish env must be an object mapping strings to strings'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
   if (typeof opts.cwd === 'string' && opts.cwd.includes('\0')) {
     throw Object.assign(
       new Error('ish cwd must not contain NUL bytes'),
@@ -1113,6 +1130,14 @@ export async function ishWorkerExec(opts) {
   // R3-N1: command is required (no argv mode here); NUL in command/env/cwd
   // fails before the op is queued, so no HTTP is sent (see assertValidExecInput).
   assertValidExecInput(opts);
+  // R5-1-2: the worker endpoint takes command only — a well-formed argv
+  // would otherwise be silently ignored while the command runs as a
+  // shell string, so reject it instead of dropping it.
+  if (opts.argv !== undefined) {
+    throw Object.assign(
+      new Error('ishWorkerExec takes command only, no argv mode'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
   const state = workerSessionState(sessionId);
   return enqueueWorkerOp(sessionId, async () => {
     const generation = state.generation;

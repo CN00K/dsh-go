@@ -354,9 +354,13 @@ test('N-2 caller: terminal-bash specialization attaches policy to the spawnTermi
 // the stock spawn must neither fetch the policy for the spec nor put
 // one in it.
 test('N-2 caller: terminal-controller specialization leaves the manual terminal unpolicied', () => {
-  const py = readFileSync(SPECIALIZE_PY, 'utf8');
-  assert.ok(!py.includes(`'${TERMINAL_CONTROLLER_FILE}': (`),
-    'DIAGNOSTIC_EDITS must carry no entry for the terminal controller (the manual terminal stays exempt)');
+  // No string match on the .py source: a double-quoted key is equally
+  // valid Python and diagnostics_for_ios would run it. Ask the real
+  // function instead — it raises KeyError exactly when
+  // DIAGNOSTIC_EDITS carries no entry for the controller, whatever
+  // the key's quote style.
+  assert.throws(() => specializeFile(TERMINAL_CONTROLLER_FILE), /KeyError/,
+    'diagnostics_for_ios must have no edit for the terminal controller (the manual terminal stays exempt)');
   const stock = readFileSync(join(PORT_ROOT, TERMINAL_CONTROLLER_FILE), 'utf8');
   assert.ok(stock.includes('const { subprocess, workingDirectory } = this.execution(agent);'),
     'stock spawn must destructure only subprocess and workingDirectory');
@@ -506,18 +510,25 @@ test('N-2 caller: no module resolves the duplicate controller copy lib/types/ind
   assert.deepEqual(mentions, ['//#region lib/types/index.js']);
   // No file outside node_modules may deep-import the duplicate; this
   // test file itself names the path, so it is excluded from the walk.
+  // The installed packages get a second pass: a future upstream
+  // package deep-importing the duplicate would land in node_modules,
+  // and only code files (.js/.mjs/.cjs) can resolve it. The
+  // controller package itself holds no such reference (its only
+  // mention is the bundler's //#region comment, without the
+  // terminal-controller/ prefix), so nothing is excluded there.
   const hits = [];
-  const walk = (dir) => {
+  const walk = (dir, skipNodeModules, pattern) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === '.git') continue;
+      if (entry.name === '.git' || (skipNodeModules && entry.name === 'node_modules')) continue;
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) walk(path);
+      if (entry.isDirectory()) walk(path, skipNodeModules, pattern);
       else if (entry.isFile() && path !== new URL(import.meta.url).pathname
-        && /\.(mjs|js|cjs|json|ya?ml|py|md)$/.test(entry.name)) {
+        && pattern.test(entry.name)) {
         if (readFileSync(path, 'utf8').includes('terminal-controller/lib/types/index.js')) hits.push(path);
       }
     }
   };
-  walk(PORT_ROOT);
-  assert.deepEqual(hits, [], 'no repo file may reference the duplicate controller copy');
+  walk(PORT_ROOT, true, /\.(mjs|js|cjs|json|ya?ml|py|md)$/);
+  walk(join(PORT_ROOT, 'node_modules'), false, /\.(mjs|js|cjs)$/);
+  assert.deepEqual(hits, [], 'no repo or installed-module file may reference the duplicate controller copy');
 });
