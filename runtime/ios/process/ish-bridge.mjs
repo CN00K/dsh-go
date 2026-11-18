@@ -409,6 +409,20 @@ function isStaleConnectionError(error) {
   if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') return true;
   return typeof error.code === 'string' && error.code.startsWith('HPE_');
 }
+
+/**
+ * True only when the TCP connect itself failed (ECONNREFUSED): no
+ * bytes were sent, so the request certainly never reached the service
+ * and a retry cannot execute the command twice. N-1 (round 2): this
+ * is the only transport error the exec retry loops treat as retryable.
+ * Response-phase disconnects (ECONNRESET / HPE_*) are still stale
+ * connections for cache invalidation (isStaleConnectionError above),
+ * but they must not trigger a retry — the guest command may already
+ * have run. Pure predicate on error.code; nothing sets or clears it.
+ */
+function isConnectFailedError(error) {
+  return !!error && error.code === 'ECONNREFUSED';
+}
 /**
  * True once a worker request has proven this service predates the
  * worker endpoints (HTTP 404 on /ish/worker/run). While set, the
@@ -534,6 +548,22 @@ export async function ishExec(opts) {
         {code: 'ISH_INVALID_ARGV'});
     }
   }
+  // N-4 (round 2): the server answers 400 for argv+command and for
+  // argv+tty, but without this the failure comes back as
+  // ISH_HTTP_ERROR and spawnIshExec reports it as
+  // ISH_BRIDGE_UNAVAILABLE ("bridge unavailable") — a client-side
+  // argument error misclassified as a dead service. Reject up front,
+  // before any HTTP is sent, so the caller sees ISH_INVALID_ARGV.
+  if (opts.argv !== undefined && opts.command !== undefined) {
+    throw Object.assign(
+      new Error('ish argv and command are mutually exclusive'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
+  if (opts.argv !== undefined && opts.tty) {
+    throw Object.assign(
+      new Error('ish argv cannot be combined with tty'),
+      {code: 'ISH_INVALID_ARGV'});
+  }
   const body = JSON.stringify({
     ...(opts.command ? {command: opts.command} : {}),
     ...(opts.argv ? {argv: opts.argv} : {}),
@@ -586,7 +616,20 @@ export async function ishExec(opts) {
     } catch (error) {
       lastError = error;
       if (error?.code === 'ISH_NOT_BOOTED') throw lastError;
-      const retryable = isStaleConnectionError(error)
+      // N-1 (round 2): retry a transport failure only when the connect
+      // itself failed (ECONNREFUSED) — the request certainly never
+      // reached the service, so the command cannot run twice. A
+      // response-phase disconnect (ECONNRESET / HPE_*) must NOT retry:
+      // the guest command may already have run (a no-output command's
+      // first NDJSON frame may not have arrived yet), and retrying
+      // would execute it a second time. Trade-off, stated plainly: a
+      // response-phase disconnect no longer auto-recovers; if the
+      // caller retries, the command may already have executed once.
+      // Closing this window fully needs a server-side idempotency key
+      // (Swift work, build round). HTTP errors stay retryable: the
+      // server answers every non-200 before running anything, so a
+      // retry there never re-executes a command.
+      const retryable = isConnectFailedError(error)
         || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
       if (retryable && attempt === 0 && !sawOutput) continue;
       throw lastError;
@@ -1129,7 +1172,12 @@ export async function ishWorkerExec(opts) {
             new Error(`ish worker busy: session ${sessionId} already has a run in flight`),
             {code: ISH_WORKER_BUSY});
         }
-        const retryable = isStaleConnectionError(error)
+        // N-1 (round 2): same rule as ishExec — only a failed connect
+        // (ECONNREFUSED) retries. A response-phase ECONNRESET / HPE_*
+        // must not retry: the worker command may already have run
+        // without streaming anything yet. HTTP errors stay retryable
+        // (the server answers non-200 before running anything).
+        const retryable = isConnectFailedError(error)
           || error?.code === 'ISH_HTTP_ERROR';
         if (retryable && attempt === 0 && !sawOutput) continue;
         throw lastError;
@@ -1204,10 +1252,18 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
  * Stop one session's worker (POST /ish/worker/stop): kills the worker's
  * whole process tree, so no background job survives its session.
  * Local state is cleared regardless of the outcome (a stop is teardown).
+ * N-2 (round 2): the whole stop runs through the per-session queue,
+ * serialised with runs — a slow stop's `finally` used to run after a
+ * concurrent new run had rebuilt the worker and updated the job table,
+ * and unconditionally marked the new worker's live jobs done. (A
+ * generation guard alone would not close this: a normal new run does
+ * not bump `generation` — only a workerDied result does — so the
+ * `finally` would still see an unchanged generation and clear anyway.)
  * @returns true when the request was answered.
  */
 export async function ishWorkerStop(sessionId, opts = {}) {
   const state = workerSessions.get(sessionId);
+  return enqueueWorkerOp(sessionId, async () => {
   try {
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1243,6 +1299,7 @@ export async function ishWorkerStop(sessionId, opts = {}) {
     }
   }
   return true;
+  });
 }
 
 /** Whether this service is known to predate the worker endpoints (HTTP 404). */
@@ -2051,6 +2108,10 @@ export class IshPtyTerminal {
     this._pid = nextSyntheticPid();
     this._cols = options.cols ?? 80;
     this._rows = options.rows ?? 24;
+    // N-2 (H-1 residual): a read-only terminal upgrade carries
+    // ?readOnly=1 — a GET upgrade has no body, so the flag rides the
+    // query and handlePTYUpgrade refuses before spawning the shell.
+    this._readOnly = options.readOnly === true;
     this._dataListeners = [];
     this._exitListeners = [];
     this._decoder = new StringDecoder('utf8');
@@ -2065,6 +2126,12 @@ export class IshPtyTerminal {
     // cannot grow it without bound; excess input is dropped.
     this._pendingFrames = [];
     this._pendingBytes = 0;
+    // N-3 (round 2): true once _open has flushed the queued frames.
+    // write() queues while this is false, so input arriving in the
+    // tick where the handshake completes cannot overtake the queued
+    // frames. Set by _open only, never cleared (the terminal is
+    // single-use; after _exit, write() returns early on _exited).
+    this._flushed = false;
     // Kernel session id, learned from the server's session hello
     // ({"type":"session","sessionId":"..."}) right after the upgrade.
     // Null until the hello arrives (older servers never send it).
@@ -2100,7 +2167,12 @@ export class IshPtyTerminal {
     // M-6: queue input that arrives before the handshake completes;
     // sendFrame would silently drop it. Flushed in order by _open
     // once `ready` resolves.
-    if (!this._ws?.handshakeDone) {
+    // N-3 (round 2): also queue while the flush itself has not run
+    // yet — handshakeDone is set in the socket 'data' handler, but
+    // _open's flush runs in a later microtask, and a write in between
+    // (e.g. from an onData listener answering a frame piggybacked on
+    // the 101 response) would otherwise overtake the queued frames.
+    if (!this._ws?.handshakeDone || !this._flushed) {
       if (this._pendingBytes + bytes.length <= PTY_PENDING_MAX_BYTES) {
         this._pendingFrames.push(bytes);
         this._pendingBytes += bytes.length;
@@ -2143,7 +2215,7 @@ export class IshPtyTerminal {
 
   async _open() {
     const ws = ishWebSocket({
-      path: '/ish/pty',
+      path: this._readOnly ? '/ish/pty?readOnly=1' : '/ish/pty',
       onBinary: (data) => {
         const text = this._decoder.write(data);
         if (text) this._emitData(text);
@@ -2193,6 +2265,9 @@ export class IshPtyTerminal {
     for (const bytes of this._pendingFrames) ws.sendBinary(bytes);
     this._pendingFrames = [];
     this._pendingBytes = 0;
+    // N-3 (round 2): mark the flush done only after the queued frames
+    // have been sent — write() queues while this is false (see above).
+    this._flushed = true;
     // Shell is up. Size it. No default cd: the shell starts in its
     // own default directory; the user cds where they want. (The old
     // code sent `cd -- '<session cwd>'` as the first input, which

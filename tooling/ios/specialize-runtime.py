@@ -82,8 +82,12 @@ DIAGNOSTIC_EDITS = {
         ("prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
         # dsh-go iSH guest: delegate PTY terminals to the guest. Replaces
         # the old string-only edit: the fallback keeps the iOS message.
+        # (N-2) the caller-attached policy travels with the terminal
+        # (spec.policy); only a read-only policy is refused server-side.
+        # Without one the terminal is the user's own keystrokes and is
+        # not policy-constrained.
         ("  async spawnTerminal() {\n    throw Object.assign(new Error('鸿蒙本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }",
-         "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec);\n    if (ish) return ish;\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }"),
+         "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec, spec?.policy);\n    if (ish) return ish;\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }"),
         # dsh-go iSH guest: delegate agent bash to the guest. The ticket
         # unwrap above has already run; ishSpawnFor returns undefined
         # when the bridge is not installed or the argv is not bash -c,

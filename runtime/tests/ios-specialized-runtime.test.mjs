@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -61,6 +61,15 @@ async function loadSpecializedRuntime() {
   const realProcessDir = join(PORT_ROOT, 'runtime/ohos/process');
   for (const entry of readdirSync(realProcessDir)) {
     if (entry === 'runtime.mjs') continue;
+    // Node resolves a symlinked file's relative imports against its
+    // real path, so a symlinked command-router.mjs would import the
+    // UNSPECIALIZED tree runtime.mjs (no ishSpawnFor) instead of this
+    // tree's specialized copy. Copy it as a real file, as the composed
+    // runtime tree does in production.
+    if (entry === 'command-router.mjs') {
+      copyFileSync(join(realProcessDir, entry), join(processDir, entry));
+      continue;
+    }
     symlinkSync(join(realProcessDir, entry), join(processDir, entry));
   }
   symlinkSync(join(PORT_ROOT, 'runtime/ios/process'), join(tmp, 'runtime/ios/process'));
@@ -82,8 +91,11 @@ function deferred() {
  */
 async function startHoldingServer() {
   let requests = 0;
+  const urls = [];
+  let lastBody = null;
   const waiters = [];
   const server = createServer((req, res) => {
+    urls.push(req.url);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', async () => {
@@ -96,6 +108,7 @@ async function startHoldingServer() {
       const gate = deferred();
       waiters.push(gate);
       const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      lastBody = parsed;
       await gate.promise;
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
       res.write(JSON.stringify({ stream: 'stdout', line: 'hi' }) + '\n');
@@ -104,11 +117,21 @@ async function startHoldingServer() {
       return parsed;
     });
   });
+  // A WS upgrade (GET /ish/pty) never reaches the 'request' handler:
+  // record its URL here and refuse it, so a terminal handshake fails
+  // fast instead of hanging.
+  server.on('upgrade', (req, socket) => {
+    urls.push(req.url);
+    socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+    socket.end();
+  });
   await new Promise((done) => server.listen(0, '127.0.0.1', done));
   const port = server.address().port;
   writeFileSync(canonicalServiceFile, JSON.stringify({ host: '127.0.0.1', port, token: TOKEN }));
   return {
     requests: () => requests,
+    urls: () => [...urls],
+    lastBody: () => lastBody,
     received: async () => {
       for (;;) {
         if (requests > 0) return;
@@ -137,6 +160,42 @@ async function fixture(t) {
     stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }, ...options,
   });
   return { runtime, server, spawn, work };
+}
+
+/**
+ * A CommandRouter over the specialized runtime, with a Linux backend
+ * that behaves as iOS's does (disabled): any spawn that reaches it
+ * settles as exit 127, and resolveExecutable throws. A test that
+ * reaches the mock loopback therefore proves the command was not
+ * claimed by the Linux slot.
+ */
+async function routerFixture(t) {
+  const { tmp } = await loadSpecializedRuntime();
+  const { CommandRouter } = await import(pathToFileURL(join(tmp, 'runtime/ohos/process/command-router.mjs')).href);
+  const work = join(fakeHome, 'workspace');
+  const temporaryRoot = join(fakeRoot, 'host-tmp');
+  mkdirSync(temporaryRoot, { recursive: true });
+  const disabledLinux = {
+    capabilities: Object.freeze({ confinement: Object.freeze(['read-only', 'workspace-write']), stdin: 'stream', pty: false }),
+    commands: [],
+    live: new Set(),
+    prepare: (argv) => [...argv],
+    spawn: () => ({ done: Promise.resolve({ exitCode: 127, signal: null }), started: Promise.resolve(), terminate: () => {}, waitForExit: async () => true, start: () => {} }),
+    resolveExecutable: async () => { throw Object.assign(new Error('gh 在 App 内 Linux 环境中运行；Linux 环境未开启'), { code: 'ERR_OHOS_LINUX_DISABLED' }); },
+    dispose: async () => {},
+  };
+  const router = new CommandRouter({ workspaceRoots: [work], temporaryRoot }, { linux: () => disabledLinux });
+  const server = await startHoldingServer();
+  t.after(async () => {
+    server.releaseAll();
+    await router.dispose().catch(() => {});
+    await server.close();
+  });
+  const spawn = (argv, options = {}) => router.spawn({
+    argv, cwd: work, graceMs: 200,
+    stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }, ...options,
+  });
+  return { router, server, spawn, work };
 }
 
 test('M-12: an iSH bash handle is in live while running and leaves it on settle', { timeout: 15000 }, async (t) => {
@@ -176,4 +235,53 @@ test('M-15: a logical cwd falls back to the virtual path and fails explicitly', 
   });
   assert.equal(server.requests(), 0, 'the declined spawn must never reach the guest');
   assert.equal(runtime.live.size, 0);
+});
+
+test('N-1: a direct gh spawn via CommandRouter reaches the guest, not the disabled Linux slot', { timeout: 15000 }, async (t) => {
+  const { server, spawn } = await routerFixture(t);
+  const handle = spawn(['gh', '--version']);
+  await server.received();
+  server.releaseAll();
+  const outcome = await handle.done;
+  assert.deepEqual(outcome, { exitCode: 0, signal: null });
+  assert.equal(server.requests(), 1, 'gh must reach the mock loopback exactly once');
+  assert.deepEqual(server.lastBody().argv, ['gh', '--version']);
+  assert.equal('command' in server.lastBody(), false, 'a CLI argv goes verbatim, with no shell command');
+});
+
+test('N-1: a direct python3 spawn via CommandRouter reaches the guest, not the disabled Linux slot', { timeout: 15000 }, async (t) => {
+  const { server, spawn } = await routerFixture(t);
+  const handle = spawn(['python3', '--version']);
+  await server.received();
+  server.releaseAll();
+  const outcome = await handle.done;
+  assert.deepEqual(outcome, { exitCode: 0, signal: null });
+  assert.equal(server.requests(), 1, 'python3 must reach the mock loopback exactly once');
+  assert.deepEqual(server.lastBody().argv, ['python3', '--version']);
+});
+
+test('N-1: resolveExecutable returns the bare guest CLI name instead of asking disabled Linux', { timeout: 15000 }, async (t) => {
+  const { router } = await routerFixture(t);
+  for (const name of ['gh', 'python3', 'pip', 'pip3']) {
+    assert.equal(await router.resolveExecutable(name), name, `${name} must resolve to its bare name`);
+  }
+  assert.equal(await router.resolveExecutable('rg'), '/dsh-go/ohos/bin/rg', 'rg keeps its virtual resolution');
+  assert.equal(await router.resolveExecutable('git'), '/dsh-go/ohos/bin/git', 'git keeps its virtual resolution');
+});
+
+test('N-2: a read-only policy marks the terminal upgrade readOnly; no policy leaves it unmarked', { timeout: 15000 }, async (t) => {
+  const { runtime, server } = await fixture(t);
+  const terminalSpec = (policy) => ({ argv: ['bash'], cols: 80, rows: 24, ...(policy ? { policy } : {}) });
+  // The mock server refuses the upgrade with 400, so each terminal
+  // exits at the handshake: done settles without a guest shell.
+  const readOnlyTerminal = await runtime.spawnTerminal(terminalSpec({ mode: 'read-only' }));
+  await readOnlyTerminal.done;
+  const plainTerminal = await runtime.spawnTerminal(terminalSpec());
+  await plainTerminal.done;
+  assert.ok(server.urls().includes('/ish/pty?readOnly=1'),
+    `read-only upgrade must carry the flag; saw ${JSON.stringify(server.urls())}`);
+  assert.ok(server.urls().includes('/ish/pty'),
+    `a terminal without a policy must upgrade plainly; saw ${JSON.stringify(server.urls())}`);
+  assert.ok(server.urls().filter((url) => url.includes('?')).every((url) => url === '/ish/pty?readOnly=1'),
+    `no other query form may appear; saw ${JSON.stringify(server.urls())}`);
 });

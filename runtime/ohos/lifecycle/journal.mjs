@@ -155,7 +155,14 @@ export async function openBoundaryJournal({ directory, lockExclusive, fs = nodeF
     const record = { ...base, hash: digest(JSON.stringify(base)) };
     const bytes = Buffer.from(JSON.stringify(record) + '\n');
     if (bytes.length > maximumRecordBytes) throw new RangeError('Boundary record exceeds 1 MiB');
-    if ((await file.stat()).size + bytes.length > 64 * 1024 * 1024) throw new RangeError('Boundary journal exceeds 64 MiB; explicit maintenance is required');
+    if ((await file.stat()).size + bytes.length > 64 * 1024 * 1024) {
+      // N-4: unlike a single oversized record, a full journal is persistent
+      // — no append can ever succeed again without explicit maintenance —
+      // so it poisons like confirmed damage instead of reporting healthy
+      // while every dispatch fails. The 1 MiB record limit above stays
+      // non-poisoning: the log itself is intact and the next append works.
+      throw Object.assign(new RangeError('Boundary journal exceeds 64 MiB; explicit maintenance is required'), { damagedTail: true });
+    }
     await onStage('before-record', record);
     try {
       await writeAll(file, bytes);
@@ -184,7 +191,17 @@ export async function openBoundaryJournal({ directory, lockExclusive, fs = nodeF
         await writeAll(handle, bytes);
         await handle.sync();
       } catch (error) {
-        if (created || error.code !== 'EEXIST') throw error;
+        if (created) {
+          // Our own create succeeded but the write or sync failed, so the
+          // half-written file is ours: remove it before rethrowing, or a
+          // retry with the same bytes (the normal outcome() retry) would
+          // hit EEXIST, read the remnant as corruption and poison the
+          // journal for a transient failure. The unlink is best-effort;
+          // the original write error is the one the caller must see.
+          await fs.unlink(path).catch(() => {});
+          throw error;
+        }
+        if (error.code !== 'EEXIST') throw error;
         handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
         const info = await handle.stat();
         if (!info.isFile() || (info.mode & 0o077) || info.size !== bytes.length

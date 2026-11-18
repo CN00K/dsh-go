@@ -246,6 +246,14 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
  * the shell starts in its own default directory, as in 1.0.x — the
  * controller's cwd is not honoured (known gap, see ENGINE_HOOK.md).
  *
+ * N-2 (H-1 residual): a terminal opened under a read-only policy
+ * carries it to the server (options.readOnly), so handlePTYUpgrade
+ * can refuse before spawning the shell — the same denial as exec.
+ * Only a spawnTerminal call that attached a policy is constrained;
+ * a manually opened terminal has no policy and is unaffected: the
+ * read-only policy constrains agent tools, and a terminal is the
+ * user's own keystrokes.
+ *
  * The shim returns a node-pty-shaped terminal (onData/onExit/write/
  * resize/kill), but the 1.1.1 terminal controller (BrowserTerminal)
  * consumes the virtual handle shape (done/output/terminate/
@@ -258,16 +266,17 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
  * shell runs and "idle" once it has exited, so retention never closes
  * a live terminal for inactivity.
  */
-export function ishSpawnTerminalFor(spec) {
+export function ishSpawnTerminalFor(spec, policy) {
   if (!ensureBridge()) return undefined;
   const argv = spec?.argv;
   if (!Array.isArray(argv) || !argv.length) return undefined;
   const name = basename(argv[0]);
   if (name !== 'bash' && name !== 'sh') return undefined;
-  const terminal = ishPtySpawn(argv[0], argv.slice(1), { cols: spec.cols, rows: spec.rows });
+  const readOnly = policy?.mode === 'read-only';
+  const terminal = ishPtySpawn(argv[0], argv.slice(1),
+    { cols: spec.cols, rows: spec.rows, ...(readOnly ? { readOnly: true } : {}) });
   return adaptIshPtyTerminal(terminal, spec);
 }
-
 function adaptIshPtyTerminal(terminal, spec) {
   const output = new PassThrough();
   const completion = Promise.withResolvers();

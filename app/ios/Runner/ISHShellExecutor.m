@@ -997,6 +997,21 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
         if (IS_ERR(dirFd) || !(dirFd->open_stat.mode & S_IFDIR)) {
             if (!IS_ERR(dirFd)) fd_close(dirFd);
             NSLog(@"ISHShellExecutor: cwd %@ is not a guest directory", cwd);
+            // N-6 (round 2): say why on stderr before the bare -1, so
+            // the bridge can tell "bad cwd" apart from other
+            // CreationFailed causes. Same delivery as a pipe chunk:
+            // append to the result buffer under outputLock, then
+            // stream it via outputHandler after releasing the lock
+            // (mirrors readPipeFd:into:...). Appended BEFORE failRecord
+            // so it lands in the result's stderrData too.
+            NSData *cwdError = [[NSString stringWithFormat:
+                @"ISH: cwd %@ is not a guest directory\n", cwd]
+                dataUsingEncoding:NSUTF8StringEncoding];
+            [record.outputLock lock];
+            [record.stderrData appendData:cwdError];
+            [record.outputLock unlock];
+            void (^cwdErrHandler)(BOOL, NSData *) = record.outputHandler;
+            if (cwdErrHandler) cwdErrHandler(YES, cwdError);
             [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe
                           stderrPipe:stderrPipe];
             lock(&pids_lock);
@@ -1038,7 +1053,23 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
     for (NSString *arg in argv) {
         const char *carg = arg.UTF8String;
         size_t len = strlen(carg) + 1;
-        if (argvPos + len >= sizeof(argvBuf)) break;
+        if (argvPos + len >= sizeof(argvBuf)) {
+            // N-4 (round 2): fail loudly instead of silently running
+            // with a truncated argv — a dropped trailing argument
+            // (e.g. rg's pattern, git's last file) could exit 0 having
+            // done less than requested. Same cleanup as a failed
+            // do_execve below: close the guest pipe ends, zombie-mark
+            // the never-exec'd task, fail with CreationFailed (-1).
+            NSLog(@"ISHShellExecutor: argv exceeds %zu bytes, failing instead of truncating", sizeof(argvBuf));
+            [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe
+                          stderrPipe:stderrPipe];
+            lock(&pids_lock);
+            current->exiting = true;
+            current->zombie = true;
+            unlock(&pids_lock);
+            [self failRecord:record withCode:ISHShellExecutionErrorCreationFailed];
+            return;
+        }
         memcpy(argvBuf + argvPos, carg, len);
         argvPos += len;
         argc++;
@@ -1046,12 +1077,18 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
     argvBuf[argvPos] = '\0';
     char envpBuf[kISHExecEnvpCapacity];
     size_t envpPos = 0;
+    // N-4 (round 2): EXEC_ENVP_APPEND sets this instead of silently
+    // dropping an over-capacity variable; checked after the #undef
+    // below, before do_execve.
+    BOOL envpOverflow = NO;
 #define EXEC_ENVP_APPEND(s) do { \
         const char *_s = (s); \
         size_t _len = strlen(_s) + 1; \
         if (envpPos + _len < sizeof(envpBuf) - 256) { \
             memcpy(envpBuf + envpPos, _s, _len); \
             envpPos += _len; \
+        } else { \
+            envpOverflow = YES; \
         } \
     } while (0)
     // ENV-12: no TERM here. An exec has no tty (pipes only); faking
@@ -1092,6 +1129,21 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
         EXEC_ENVP_APPEND(pair.UTF8String);
     }
 #undef EXEC_ENVP_APPEND
+    // N-4 (round 2): an over-capacity env is a failed start, not a
+    // silently dropped variable — same cleanup + CreationFailed as the
+    // argv overflow above. (Threshold is the macro's existing
+    // sizeof(envpBuf) - 256 reserve, i.e. 7936 bytes, not 8192.)
+    if (envpOverflow) {
+        NSLog(@"ISHShellExecutor: env exceeds %zu bytes, failing instead of dropping variables", sizeof(envpBuf));
+        [self closeGuestPipeEnds:stdinPipe stdoutPipe:stdoutPipe
+                      stderrPipe:stderrPipe];
+        lock(&pids_lock);
+        current->exiting = true;
+        current->zombie = true;
+        unlock(&pids_lock);
+        [self failRecord:record withCode:ISHShellExecutionErrorCreationFailed];
+        return;
+    }
     envpBuf[envpPos] = '\0';
     // B (argv mode): a bare argv[0] (no '/') is resolved against the
     // effective PATH before do_execve (execvp semantics — the kernel

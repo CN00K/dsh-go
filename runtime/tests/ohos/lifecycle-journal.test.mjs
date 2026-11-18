@@ -147,6 +147,63 @@ test('a transient result-file failure does not poison later appends', async t =>
   assert.equal(f.journal.records.at(-1).body.kind, 'outcome');
 });
 
+// N-1: the M-1 test above only retries with different bytes (a different
+// result file). A retry with the same bytes hits the same result file, so a
+// half-written remnant from the failed write must be removed first —
+// otherwise the retry reads the remnant as corruption and poisons the journal.
+test('a partial result-file write is removed so a same-bytes retry succeeds instead of poisoning', async t => {
+  let armed = false;
+  const f = await fixture(t, { fs: { ...fs, async open(path, ...args) {
+    const handle = await fs.open(path, ...args);
+    if (!String(path).includes('/results/')) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === 'write') return async (bytes, offset, length, position) => {
+        if (!armed) return target.write(bytes, offset, length, position);
+        armed = false;
+        await target.write(bytes, offset, Math.min(5, length), position);
+        throw Object.assign(new Error('partial result write then EIO'), { code: 'EIO' });
+      };
+      const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } } });
+  const result = { content: [{ type: 'text', text: 'same bytes' }] };
+  await f.journal.append(body('prepared')); armed = true;
+  await assert.rejects(f.journal.appendResult(body('returned'), result), { code: 'EIO' });
+  assert.equal(f.journal.failed, false);
+  const retry = await f.journal.appendResult(body('outcome'), result);
+  assert.equal(f.journal.failed, false);
+  assert.deepEqual(await f.journal.readResult(retry.body.result), result);
+  assert.deepEqual(await fs.readdir(join(f.directory, 'results')), [retry.body.result.sha256 + '.json']);
+  // The failed first attempt never wrote its 'returned' record (resultFile
+  // runs before the log append), so only the retry's 'outcome' follows.
+  assert.deepEqual(f.journal.records.map(row => row.body.kind), ['header', 'prepared', 'outcome']);
+});
+
+// N-4: a full journal is persistent, not transient — no append can ever
+// succeed again without explicit maintenance — so hitting the 64 MiB limit
+// poisons the journal and status reports blocked, instead of every append
+// failing while the boundary still looks healthy. The log is faked near
+// full through the file handle's stat (writing a real 64 MiB log per test
+// would be far too slow); a single oversized record still must not poison.
+test('a full 64 MiB journal poisons later appends instead of reporting healthy', async t => {
+  let armed = false;
+  const f = await fixture(t, { fs: { ...fs, async open(path, ...args) {
+    const handle = await fs.open(path, ...args);
+    if (!String(path).endsWith('boundary.jsonl')) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === 'stat' && armed) return async () => {
+        const info = await target.stat();
+        return Object.assign(Object.create(Object.getPrototypeOf(info)), info, { size: 64 * 1024 * 1024 - 10 });
+      };
+      const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } } });
+  await f.journal.append(body('prepared')); armed = true;
+  await assert.rejects(f.journal.append(body('dispatch')), /exceeds 64 MiB/);
+  assert.equal(f.journal.failed, true);
+  await assert.rejects(f.journal.append(body('dispatch')), { code: 'ERR_OHOS_LIFECYCLE_POISONED' });
+});
+
 test('closing seals admission before waiting; late append cannot race a closed fd', async t => {
   const reached = Promise.withResolvers(), release = Promise.withResolvers();
   const f = await fixture(t, { async onStage(stage) {

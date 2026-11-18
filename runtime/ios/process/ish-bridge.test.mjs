@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {createServer} from 'node:http';
+import {createServer as createNetServer} from 'node:net';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
@@ -2108,6 +2109,315 @@ test('spawnIshExec argv one-shots of one session serialize (B)', async () => {
   } finally {
     clearExecCwdState();
     clearWorkerState();
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Audit round 2 (2026-11-18): regression tests for N-1/N-2/N-3/N-4
+// ---------------------------------------------------------------------------
+
+// N-1: only a failed connect (ECONNREFUSED) retries — the request
+// certainly never reached the service, so the command cannot run
+// twice. Prime the cache with a dead port, then rewrite the file to
+// the live server: the first attempt fails ECONNREFUSED on the cached
+// port, the retry re-reads the file and succeeds.
+test('ishExec retries once when the connect itself fails (ECONNREFUSED) (N-1)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = join(fakeHome, 'ish-service-n1-refused.json');
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port: 1, token: TOKEN}));
+    assert.equal((await getServiceInfo({serviceFile})).port, 1);
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    const result = await ishExec({command: 'true', serviceFile, onLine: () => {}});
+    assert.equal(result.exitCode, 0);
+    assert.equal(requests, 1, 'the retry must reach the live server exactly once');
+  } finally {
+    await close();
+  }
+});
+
+// N-1: a response-phase disconnect before any output must NOT retry —
+// the guest command may already have run (a no-output command's first
+// NDJSON frame may not have arrived yet), and retrying would execute
+// it a second time.
+test('ishExec does not retry a response-phase disconnect before any output (N-1)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.destroy(); // no output line, then kill the connection
+  });
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishExec({command: 'rm -f /tmp/x', serviceFile: writeServiceFile(port), onLine: () => {}}),
+      (error) => error.code === 'ECONNRESET');
+    assert.equal(requests, 1, 'a response-phase disconnect must not retry the command');
+  } finally {
+    await close();
+  }
+});
+
+// N-1: a garbled response (llhttp HPE_* parse error) is a
+// response-phase failure too — the request may already have run.
+test('ishExec does not retry a garbled (HPE_*) response (N-1)', async () => {
+  let connections = 0;
+  const sockets = new Set();
+  const server = createNetServer((socket) => {
+    connections++;
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('GARBAGE-NOT-HTTP\r\n\r\n');
+    socket.end();
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const port = server.address().port;
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishExec({command: 'true', serviceFile: writeServiceFile(port), onLine: () => {}}),
+      (error) => typeof error.code === 'string' && error.code.startsWith('HPE_'));
+    assert.equal(connections, 1, 'a parse error must not retry the command');
+  } finally {
+    // The client socket lingers after the parse error; destroy the
+    // server side or server.close() below never resolves.
+    for (const s of sockets) s.destroy();
+    await new Promise((done) => server.close(done));
+  }
+});
+
+// N-1, worker path: same rules as ishExec.
+test('ishWorkerExec retries once when the connect itself fails (ECONNREFUSED) (N-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    requests++;
+    const parsed = JSON.parse(body.toString('utf8'));
+    mockWorkerRunResponse(res, {nonce: parsed.nonce});
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = join(fakeHome, 'ish-service-n1-worker-refused.json');
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port: 1, token: TOKEN}));
+    assert.equal((await getServiceInfo({serviceFile})).port, 1);
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    const result = await ishWorkerExec({
+      command: 'true', sessionId: 'sess-worker-n1-refused', serviceFile, onLine: () => {},
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(requests, 1, 'the retry must reach the live server exactly once');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('ishWorkerExec does not retry a response-phase disconnect before any output (N-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.destroy(); // no output line, then kill the connection
+  });
+  try {
+    invalidateServiceInfo();
+    await assert.rejects(
+      ishWorkerExec({command: 'true', sessionId: 'sess-worker-n1', serviceFile: writeServiceFile(port), onLine: () => {}}),
+      (error) => error.code === 'ECONNRESET');
+    assert.equal(requests, 1, 'a response-phase disconnect must not retry the worker command');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// N-2: a slow stop must not clear jobs a concurrent new run wrote.
+// Without the queue, the stop's finally runs after the new run
+// repopulated the job table and marks the new worker's live jobs done.
+test('ishWorkerStop queued with a run does not clear the new worker jobs (N-2)', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-stop-n2';
+  let stopAt = 0;
+  let runAt = 0;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (req.url === '/ish/worker/stop') {
+      stopAt = Date.now();
+      // Slow stop: the new run is issued while this POST is in flight.
+      setTimeout(() => {
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({stopped: true}));
+      }, 300);
+      return;
+    }
+    assert.equal(req.url, '/ish/worker/run');
+    runAt = Date.now();
+    mockWorkerRunResponse(res, {
+      nonce: parsed.nonce,
+      jobsText: '[1]+  1234 Running                 sleep 600 &',
+      jobPids: [1234],
+    });
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    // Establish a worker with a live job first, so the stop has state
+    // to clear (a stop called before any run captures no state at all).
+    await ishWorkerExec({command: 'sleep 600 &', sessionId, serviceFile, onLine: () => {}});
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => [j.pid, j.state]), [[1234, 'running']]);
+    const stopP = ishWorkerStop(sessionId, {serviceFile});
+    const runP = ishWorkerExec({command: 'sleep 600 &', sessionId, cwd: '/home/workspace', serviceFile, onLine: () => {}});
+    const [stopped, run] = await Promise.all([stopP, runP]);
+    assert.equal(stopped, true);
+    assert.equal(run.exitCode, 0);
+    // The run was serialised behind the stop: its request arrived
+    // only after the stop answered.
+    assert.ok(runAt - stopAt >= 250,
+      `new run arrived ${runAt - stopAt}ms after the stop (must wait for it)`);
+    // And the stop's finally must not have cleared the new worker's jobs.
+    assert.deepEqual(getWorkerJobs(sessionId).map((j) => [j.pid, j.state]), [[1234, 'running']]);
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// N-3: a write in the tick where the handshake completes must queue
+// behind the frames written before the handshake — the server's
+// binary frame piggybacked on the 101 response is fed (and the
+// listener's write runs) before _open's flush continuation runs.
+test('IshPtyTerminal write in the handshake-completion tick queues behind pending frames (N-3)', async () => {
+  const server = createServer();
+  const sockets = new Set();
+  const received = [];
+  server.on('upgrade', (req, socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    if (!bearerOk(req)) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      return;
+    }
+    const key = req.headers['sec-websocket-key'];
+    const accept = createHash('sha1').update(key + WS_GUID).digest('base64');
+    const frame = Buffer.from('hello-from-server', 'utf8');
+    socket.write(Buffer.concat([
+      Buffer.from('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+        + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      Buffer.from([0x82, frame.length]),
+      frame,
+    ]));
+    let buffer = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      for (;;) {
+        if (buffer.length < 2) return;
+        const b1 = buffer[1];
+        let length = b1 & 0x7f;
+        let headerLen = 2;
+        if (length === 126) {
+          if (buffer.length < 4) return;
+          length = (buffer[2] << 8) | buffer[3];
+          headerLen = 4;
+        }
+        const masked = (b1 & 0x80) !== 0;
+        if (masked) headerLen += 4;
+        if (buffer.length < headerLen + length) return;
+        const opcode = buffer[0] & 0x0f;
+        let payload = Buffer.from(buffer.subarray(headerLen, headerLen + length));
+        if (masked) {
+          const mask = buffer.subarray(headerLen - 4, headerLen);
+          for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+        }
+        buffer = buffer.subarray(headerLen + length);
+        if (opcode === 0x2) received.push(payload.toString('utf8'));
+        // Text frames are control frames (the initial resize); ignore.
+      }
+    });
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const port = server.address().port;
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const term = ishPtySpawn(ISH_PTY_COMMAND, ['-i'], {
+      cols: 80, rows: 24, cwd: join(fakeHome, 'workspace'), env: {},
+    });
+    let readyDone = false;
+    term.ready.then(() => { readyDone = true; });
+    let wroteLateInWindow = false;
+    term.onData((data) => {
+      if (data === 'hello-from-server') {
+        // Runs synchronously inside the handshake 'data' handler:
+        // handshakeDone is already true, _open's flush has not run.
+        wroteLateInWindow = !readyDone;
+        term.write('late\n');
+      }
+    });
+    term.write('early\n'); // before the handshake completes: queued
+    await term.ready;
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(wroteLateInWindow, true,
+      'the late write must land inside the handshake-completion window (else the test proves nothing)');
+    assert.deepEqual(received, ['early\n', 'late\n'],
+      `queued input must flush before the in-window write: ${JSON.stringify(received)}`);
+    term.kill('SIGTERM');
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise((done) => server.close(done));
+  }
+});
+
+// N-4: argv+command and argv+tty are rejected up front, before any
+// HTTP is sent — the server answers 400 for both, but without this
+// the failure surfaces as ISH_BRIDGE_UNAVAILABLE (bridge down)
+// instead of a client-side argument error.
+test('ishExec rejects argv+command and argv+tty before sending HTTP (N-4)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    await assert.rejects(
+      ishExec({command: 'echo hi', argv: ['rg', 'x'], serviceFile}),
+      (error) => error.code === 'ISH_INVALID_ARGV');
+    await assert.rejects(
+      ishExec({argv: ['rg', 'x'], tty: true, serviceFile}),
+      (error) => error.code === 'ISH_INVALID_ARGV');
+    assert.equal(requests, 0, 'both rejected combinations must fail before any HTTP is sent');
+  } finally {
+    await close();
+  }
+});
+
+test('spawnIshExec argv+tty fails closed without sending HTTP (N-4)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(['rg', 'x'], {cwd: join(fakeHome, 'workspace'), env: {}, tty: true});
+    const outcome = await new Promise((done) => child.once('exit', (code) => done(code)));
+    assert.equal(outcome, 1);
+    assert.equal(requests, 0, 'argv+tty must fail before any HTTP is sent');
+  } finally {
     await close();
   }
 });

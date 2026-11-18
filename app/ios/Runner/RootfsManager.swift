@@ -401,6 +401,24 @@ struct RootfsManager {
                 throw RootfsError.ioError("恢复 /root 备份失败（\(rel)）：\(error.localizedDescription)。备份保留在 \(backup.lastPathComponent)，重试 boot 可再试")
             }
         }
+        // (N-2, round 2) Files back on disk are still invisible to the
+        // guest until they are registered in meta.db (fakefs lookup
+        // needs a paths row): register the restored data/root subtree
+        // under "/root", mirroring the M-8 call in restoreMissingFiles
+        // and ensureMetaDB. Runs BEFORE the backup is deleted: on
+        // failure the error propagates, the backup is kept, and the
+        // next boot retries (same failure semantics as a failed move
+        // above). Caveat (T-4): on the already-booted branch the
+        // kernel holds the old meta.db connection, so the rows only
+        // become visible after a cold restart.
+        let rc = metaDBURL.path.withCString { dbPath in
+            root.path.withCString { rootPath in
+                ish_fakefs_meta_register_subtree(dbPath, rootPath, "/root")
+            }
+        }
+        guard rc == 0 else {
+            throw RootfsError.ioError("恢复 /root 备份后登记 meta.db 失败 (rc=\(rc))。备份保留在 \(backup.lastPathComponent)，重试 boot 可再试")
+        }
         try? fm.removeItem(at: backup)
         NSLog("RootfsManager: /root 已从备份 %@ 恢复", backup.lastPathComponent)
     }
@@ -488,13 +506,47 @@ struct RootfsManager {
         // above already handled truncated binaries (they exist but
         // are too small); this sweep only fills gaps.
         let shippedData = tmp.appendingPathComponent("data", isDirectory: true)
+        // (N-8, round 2) Uncompressed sizes from the zip central
+        // directory, keyed by the prefix-stripped name extract() uses
+        // (e.g. "data/bin/bash"): an existing shipped file is only
+        // trusted when its size matches. No content hash — size only.
+        let shippedSizes = try zipUncompSizes(zipData: zipData)
         if let enumerator = fm.enumerator(atPath: shippedData.path) {
             for case let rel as String in enumerator {
                 let src = shippedData.appendingPathComponent(rel)
                 var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: src.path, isDirectory: &isDir), !isDir.boolValue else { continue }
+                guard fm.fileExists(atPath: src.path, isDirectory: &isDir) else { continue }
                 let dst = dataURL.appendingPathComponent(rel)
-                guard !fm.fileExists(atPath: dst.path) else { continue }
+                // (N-3, round 2) Empty factory directories are shipped
+                // too (47 in the current zip, including /tmp): create
+                // the missing ones instead of skipping every directory.
+                // Symlinks to directories still move as files below.
+                let isSymlink = (try? fm.attributesOfItem(atPath: src.path))?[.type] as? FileAttributeType == .typeSymbolicLink
+                if isDir.boolValue && !isSymlink {
+                    if !fm.fileExists(atPath: dst.path) {
+                        try fm.createDirectory(at: dst, withIntermediateDirectories: true)
+                    }
+                    continue
+                }
+                var dstIsDir: ObjCBool = false
+                if fm.fileExists(atPath: dst.path, isDirectory: &dstIsDir) {
+                    // (N-8) Skip an existing file only when its size
+                    // matches the zip; a mismatch is rebuilt below
+                    // (remove + move from tmp). Symlinks and
+                    // directories keep the old skip: a symlink's size
+                    // is its link-target length, not comparable here,
+                    // and a directory shadowing a file name is not a
+                    // truncated file. Files not in the zip (user files)
+                    // are never enumerated here, so never touched.
+                    if isSymlink || dstIsDir.boolValue { continue }
+                    if let expected = shippedSizes["data/" + rel],
+                       let attrs = try? fm.attributesOfItem(atPath: dst.path),
+                       let size = attrs[.size] as? UInt64,
+                       size == UInt64(expected) {
+                        continue
+                    }
+                    try fm.removeItem(at: dst)
+                }
                 try fm.createDirectory(at: dst.deletingLastPathComponent(),
                                        withIntermediateDirectories: true)
                 try fm.moveItem(at: src, to: dst)
@@ -709,6 +761,64 @@ struct RootfsManager {
                 reportProgress(progress, fraction)
             }
         }
+    }
+
+    /// Uncompressed sizes from the zip central directory, keyed by the
+    /// prefix-stripped entry name extract() uses (e.g. "data/bin/bash").
+    /// (N-8, round 2) Lets the restore sweep compare an existing file's
+    /// size against the zip without decompressing anything. Parsing
+    /// mirrors extract()'s EOCD / central-directory walk.
+    private static func zipUncompSizes(zipData data: Data) throws -> [String: UInt32] {
+        let sig: [UInt8] = [0x50, 0x4B, 0x05, 0x06]
+        let searchStart = data.count > 65557 ? data.count - 65557 : 0
+        var eocd: Int? = nil
+        if data.count >= 22 {
+            for i in stride(from: data.count - 22, through: searchStart, by: -1) {
+                if data[i] == sig[0] && data[i + 1] == sig[1] &&
+                   data[i + 2] == sig[2] && data[i + 3] == sig[3] {
+                    eocd = i
+                    break
+                }
+            }
+        }
+        guard let eocdOff = eocd else { throw RootfsError.corruptZip("找不到 EOCD 记录") }
+        func u16(_ o: Int) -> UInt16 { UInt16(data[o]) | (UInt16(data[o + 1]) << 8) }
+        func u32(_ o: Int) -> UInt32 {
+            UInt32(data[o]) | (UInt32(data[o + 1]) << 8) |
+            (UInt32(data[o + 2]) << 16) | (UInt32(data[o + 3]) << 24)
+        }
+        let totalEntries = Int(u16(eocdOff + 10))
+        let cdOffset = Int(u32(eocdOff + 16))
+        guard totalEntries > 0, cdOffset + 46 <= data.count else {
+            throw RootfsError.corruptZip("中央目录为空或越界")
+        }
+        var sizes: [String: UInt32] = [:]
+        var p = cdOffset
+        for _ in 0..<totalEntries {
+            guard p + 46 <= data.count,
+                  data[p] == 0x50 && data[p + 1] == 0x4B &&
+                  data[p + 2] == 0x01 && data[p + 3] == 0x02 else {
+                throw RootfsError.corruptZip("中央目录损坏 @\(p)")
+            }
+            let uncompSize = u32(p + 24)
+            let nameLen = Int(u16(p + 28))
+            let extraLen = Int(u16(p + 30))
+            let commentLen = Int(u16(p + 32))
+            guard p + 46 + nameLen <= data.count else { throw RootfsError.corruptZip("文件名越界") }
+            let nameData = data.subdata(in: (p + 46)..<(p + 46 + nameLen))
+            guard let name = String(data: nameData, encoding: .utf8) else {
+                throw RootfsError.corruptZip("文件名非 UTF-8")
+            }
+            sizes[name] = uncompSize
+            p += 46 + nameLen + extraLen + commentLen
+        }
+        let prefix = commonPrefix(of: Array(sizes.keys))
+        guard !prefix.isEmpty else { return sizes }
+        var stripped: [String: UInt32] = [:]
+        for (name, size) in sizes {
+            stripped[String(name.dropFirst(prefix.count))] = size
+        }
+        return stripped
     }
 
     private static func commonPrefix(of names: [String]) -> String {

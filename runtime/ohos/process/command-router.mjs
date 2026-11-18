@@ -5,6 +5,14 @@ import { pythonCommandName } from './python-backend.mjs';
 const error = (code, message) => Object.assign(new Error(message), { code });
 const isNode = command => ['node', '/bin/node', '/usr/bin/node', '/dsh-go/ohos/bin/node', process.execPath].includes(command);
 const virtualCommands = new Set(['bash', 'sh', 'rg', 'git', 'node']);
+// Guest CLI commands with no virtual implementation (B): like
+// virtualCommands they must not be claimed by the Linux backend —
+// the iOS specialization routes them to the guest as a direct argv
+// exec instead. Keep in sync with GUEST_CLI_COMMANDS in
+// runtime/ios/process/ish-adapter.mjs (minus rg/git/node, which are
+// already in virtualCommands). Do not add 'sh': a direct ['sh', ...]
+// argv stays virtual, as in 1.1.1.
+const guestCliCommands = new Set(['gh', 'python3', 'pip', 'pip3']);
 const accepts = (backend, policy) => Array.isArray(backend?.capabilities?.confinement)
   && backend.capabilities.confinement.includes(policy.mode) && typeof backend.prepare === 'function';
 
@@ -16,7 +24,7 @@ export class CommandRouter {
   constructor(config, { linux, nativePython } = {}) {
     this.nativePython = nativePython;
     this.virtual = new VirtualSubprocessRuntime(config, { selectExternal: (argv, policy) => {
-      if (virtualCommands.has(basename(argv[0]))) return;
+      if (virtualCommands.has(basename(argv[0])) || guestCliCommands.has(basename(argv[0]))) return;
       return this.select(argv, policy);
     }, linux: () => this.linux });
     this.pluginNode = new VirtualSubprocessRuntime({ ...config, temporaryRoot: this.virtual.temporaryRoot }, { concurrent: true });
@@ -59,6 +67,10 @@ export class CommandRouter {
   async resolveExecutable(command, env, signal) {
     if (isNode(command)) return this.virtual.resolveExecutable('node', env, signal);
     if (virtualCommands.has(basename(command))) return this.virtual.resolveExecutable(command, env, signal);
+    // N-1: gh/python3/pip/pip3 run in the guest, not in Linux — the
+    // guest is the only thing that knows whether they exist, so do not
+    // let the (disabled on iOS) Linux backend declare them unavailable.
+    if (guestCliCommands.has(basename(command))) return basename(command);
     const backend = this.select([command]);
     if (!backend) return this.virtual.resolveExecutable(command, env, signal);
     signal?.throwIfAborted();

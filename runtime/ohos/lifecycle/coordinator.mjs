@@ -9,12 +9,18 @@ import { setImmediate as nextIoTurn } from 'node:timers/promises';
 export const lifecycleSymbol = Symbol.for('dsh.go.ohos.lifecycle');
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const fail = (code, message, cause) => Object.assign(new Error(message, { cause }), { code });
-// Only a failed durable identity check or confirmed journal damage poisons
-// the shared boundary. A transient checkpoint, session-read or append
-// failure fails only this call so the scheduler can retry it; poisoning
-// here would lock every later dispatch until the engine restarts.
+// Only a failed durable identity check, a missing durable checkpoint
+// listener, or confirmed journal damage poisons the shared boundary. A
+// transient checkpoint throw, session-read or append failure fails only
+// this call so the scheduler can retry it; poisoning here would lock every
+// later dispatch until the engine restarts.
 const fatalLifecycleError = error => ['ERR_OHOS_LIFECYCLE_IDENTITY', 'ERR_OHOS_LIFECYCLE_SEQUENCE',
   'ERR_OHOS_LIFECYCLE_CORRUPT', 'ERR_OHOS_LIFECYCLE_POISONED'].includes(error?.code);
+// A flushSession that throws is transient; one that returns non-true means
+// no durable session flush listener is registered at all — a persistent
+// configuration failure no retry can fix — so it poisons like an identity
+// failure. Only prepared()/committed() can produce this code.
+const missingCheckpoint = error => error?.code === 'ERR_OHOS_LIFECYCLE_NO_CHECKPOINT';
 const keyOf = value => JSON.stringify([value.sessionId, value.callSeq]);
 const knownString = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\0');
 const resultFor = (identity, result) => ({
@@ -231,8 +237,10 @@ export class BoundaryCoordinator {
     }
   }
   async prepared(meta) {
-    // Admission failures are local to this call/session. Only a failed durable
-    // checkpoint or identity check poisons the shared persistence boundary.
+    // Admission failures are local to this call/session. Only a missing
+    // durable checkpoint listener (flushSession returns non-true) or an
+    // identity check failure poisons the shared persistence boundary; a
+    // transient checkpoint throw fails only this call so it can be retried.
     await this.gate(meta.session.id, meta.signal);
     try {
       if (await this.flushSession(meta.session) !== true) throw fail('ERR_OHOS_LIFECYCLE_NO_CHECKPOINT', 'A durable session flush listener is required');
@@ -247,7 +255,7 @@ export class BoundaryCoordinator {
       this.#updateNativePolling();
       await this.#record({ kind: 'prepared', bootId: this.bootId, identity });
     } catch (error) {
-      if (error?.code !== 'ERR_OHOS_LIFECYCLE_CANCELLED' && !meta.signal?.aborted && fatalLifecycleError(error)) this.#fault ??= error;
+      if (error?.code !== 'ERR_OHOS_LIFECYCLE_CANCELLED' && !meta.signal?.aborted && (fatalLifecycleError(error) || missingCheckpoint(error))) this.#fault ??= error;
       throw error;
     }
   }
@@ -291,7 +299,7 @@ export class BoundaryCoordinator {
       await this.#record({ kind: 'committed', bootId: this.bootId, identity: row.identity,
         sessionResultSeq: matches[0].seq, sessionResultHash: hash(matches[0].data) });
       this.#finishCall(keyOf(row.identity));
-    } catch (error) { if (fatalLifecycleError(error)) this.#fault ??= error; throw error; }
+    } catch (error) { if (fatalLifecycleError(error) || missingCheckpoint(error)) this.#fault ??= error; throw error; }
   }
   #finishCall(key) {
     const pending = this.#pending.get(key);
@@ -445,7 +453,19 @@ export class BoundaryCoordinator {
       await this.#journal.flush();
       return { ...this.status(), acknowledgedControlVersion: version };
     });
-    this.#controlTail = work.catch(error => { if (fatalLifecycleError(error)) this.#fault ??= error; });
+    this.#controlTail = work.catch(error => {
+      // A failed control must not stay observable: observeHost awaits
+      // #hostControl, so a stale rejected promise would rethrow the old
+      // error on every later call. Clear it only if no newer control has
+      // replaced it since this work started.
+      if (this.#hostControl === work) this.#hostControl = undefined;
+      if (fatalLifecycleError(error)) this.#fault ??= error;
+      // N-3: the gate was built before the record attempt, so the boundary
+      // is paused whether or not the pause record landed: stop the budget
+      // clock too, or the pause would keep charging tool budgets.
+      // pause() is idempotent, so the next successful #pause() is unaffected.
+      this.clock.pause();
+    });
     return work;
   }
   #resume() {
@@ -473,6 +493,9 @@ export class BoundaryCoordinator {
       return this.status();
     });
     this.#controlTail = work.catch(error => {
+      // As in #pause: a failed control must not stay observable, or
+      // observeHost would keep rethrowing this stale error.
+      if (this.#hostControl === work) this.#hostControl = undefined;
       if (transportFailed) {
         // The gate stays closed, but reset the admission target so the
         // next native refresh retries this resume instead of leaving
@@ -483,7 +506,14 @@ export class BoundaryCoordinator {
         this.#admissionTarget = false;
         return;
       }
-      if (fatalLifecycleError(error)) this.#fault ??= error;
+      if (fatalLifecycleError(error)) { this.#fault ??= error; return; }
+      // N-2: a non-fatal failure after transport revalidation (e.g. a
+      // transient journal append EIO in #record) needs the same reset:
+      // the target was set true before #resume() ran, so without it
+      // #refreshNative would keep skipping the retry and the gate would
+      // stay closed with no way back except an explicit resume(). A fatal
+      // failure keeps the target: #fault is set, so retrying is pointless.
+      this.#admissionTarget = false;
     });
     return work;
   }

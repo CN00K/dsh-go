@@ -593,7 +593,10 @@ private final class HTTPConnection {
       sendJSON(status: 401, reason: "Unauthorized", object: ["error": "unauthorized"])
       return
     }
-    switch (request.method, request.path) {
+    // /ish/pty carries readOnly in the query (?readOnly=1, N-2): route
+    // on the path without the query so the upgrade still matches.
+    let routePath = request.path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.path
+    switch (request.method, routePath) {
     case ("GET", "/ish/status"):
       handleStatus()
     case ("POST", "/ish/exec"):
@@ -750,6 +753,26 @@ extension HTTPConnection {
       command = c
     } else {
       command = nil
+    }
+    // N-5 (round 2): an embedded NUL would be silently cut by the
+    // executor's strlen/UTF8String packing (argv/env/cwd), so reject
+    // it here with the same 400 shape as the argv checks above. JSON
+    // \u0000 survives JSONSerialization as an embedded NUL in
+    // NSString, so contains("\0") catches it. Only parsed values are
+    // checked: a malformed env/cwd still falls through to the
+    // existing nil handling below.
+    if let argv, argv.contains(where: { $0.contains("\0") }) {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "argv must not contain NUL"])
+      return
+    }
+    if let env = json["env"] as? [String: String],
+       env.contains(where: { $0.key.contains("\0") || $0.value.contains("\0") }) {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "env must not contain NUL"])
+      return
+    }
+    if let cwd = json["cwd"] as? String, cwd.contains("\0") {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "cwd must not contain NUL"])
+      return
     }
     var stdinData: Data?
     if let b64 = json["stdinData"] as? String {
@@ -1748,6 +1771,15 @@ extension HTTPConnection {
 // MARK: - /ish/pty (WebSocket upgrade + interactive terminal)
 
 extension HTTPConnection {
+  /// True when the upgrade URL carries ?readOnly=1 as one exact query
+  /// item (readOnly=10 or readOnly=true do not count). A GET upgrade
+  /// has no body, so the flag rides the query — see ish-bridge.mjs.
+  static func isReadOnlyUpgrade(_ request: HTTPRequest) -> Bool {
+    let parts = request.path.split(separator: "?", maxSplits: 1)
+    guard parts.count == 2 else { return false }
+    return parts[1].split(separator: "&").contains(where: { $0 == "readOnly=1" })
+  }
+
   func handlePTYUpgrade(_ request: HTTPRequest) {
     guard let service else { close(); return }
     guard request.headers["upgrade"]?.lowercased() == "websocket",
@@ -1761,6 +1793,19 @@ extension HTTPConnection {
     guard ISHKernel.shared.isBooted else {
       sendJSON(status: 503, reason: "Service Unavailable",
                object: ["error": "ish_not_booted"])
+      return
+    }
+    // N-2 (H-1 residual): a terminal opened under a read-only policy
+    // must never reach the guest shell — same denial as /ish/exec and
+    // /ish/worker/run, before the 101 or any session is created. A
+    // plain HTTP 403 (not the exec NDJSON denial: a refused upgrade
+    // has no stream to write to, and the bridge fails the handshake).
+    // Only a spawnTerminal call that carried a read-only policy sends
+    // the flag; a manually opened terminal has no policy and is
+    // unaffected.
+    if Self.isReadOnlyUpgrade(request) {
+      sendJSON(status: 403, reason: "Forbidden",
+               object: ["error": "EACCES: OHOS_SANDBOX_DENIED: 当前调用是 read-only，不能修改文件"])
       return
     }
     let accept = Self.webSocketAccept(for: key)
