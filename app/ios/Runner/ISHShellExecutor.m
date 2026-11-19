@@ -628,9 +628,14 @@ static void ish_executor_close_fd(int fd) {
                                     rows:(int)rows
                            outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                               completion:(void (^)(ISHShellExecutionResult *result))completion {
+    // B (argv mode): the tty-without-env overload went away when the
+    // full variant gained env:/cwd: — route through it with nil (the
+    // nil path keeps the pre-B defaults; build 51).
     return [self startExecutionWithArgv:@[@"/bin/bash", @"-c", command ?: @""]
                               stdinData:stdinData
                               fsContext:fsContext
+                                    env:nil
+                                    cwd:nil
                                 timeout:timeout
                                   isTty:YES
                                    cols:cols
@@ -658,6 +663,7 @@ static void ish_executor_close_fd(int fd) {
                                 outputHandler:(nullable void (^)(BOOL isStderr, NSData *chunk))outputHandler
                                    completion:(void (^)(ISHShellExecutionResult *result))completion {
     return [self startExecutionWithArgv:argv stdinData:stdinData fsContext:fsContext
+                                      env:nil cwd:nil
                                 timeout:timeout isTty:NO cols:0 rows:0
                           outputHandler:outputHandler completion:completion];
 }
@@ -1106,7 +1112,11 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
     // below, so the resolved program and the child's PATH agree.
     NSString *effectivePath = env[@"PATH"] ?: @"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     if (env[@"HOME"] == nil) EXEC_ENVP_APPEND("HOME=/root");
-    EXEC_ENVP_APPEND([[NSString stringWithFormat:@"PATH=%@", effectivePath] UTF8String]);
+    // NOTE: do NOT inline the stringWithFormat here — its comma sits
+    // inside ObjC brackets (not parens), so the preprocessor would
+    // split the macro argument in two (build 51).
+    NSString *pathEntry = [NSString stringWithFormat:@"PATH=%@", effectivePath];
+    EXEC_ENVP_APPEND(pathEntry.UTF8String);
     if (env[@"LANG"] == nil) EXEC_ENVP_APPEND("LANG=C.UTF-8");
     if (env[@"ENV"] == nil) EXEC_ENVP_APPEND("ENV=/etc/profile");
     // Shared custom environment (set once by the channel layer on
