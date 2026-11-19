@@ -755,7 +755,7 @@ extension HTTPConnection {
       command = nil
     }
     // N-5 (round 2): an embedded NUL would be silently cut by the
-    // executor's strlen/UTF8String packing (argv/env/cwd), so reject
+    // executor's strlen/UTF8String packing (argv/env/cwd/command), so reject
     // it here with the same 400 shape as the argv checks above. JSON
     // \u0000 survives JSONSerialization as an embedded NUL in
     // NSString, so contains("\0") catches it. Only parsed values are
@@ -772,6 +772,13 @@ extension HTTPConnection {
     }
     if let cwd = json["cwd"] as? String, cwd.contains("\0") {
       sendJSON(status: 400, reason: "Bad Request", object: ["error": "cwd must not contain NUL"])
+      return
+    }
+    // N-5 follow-up: the command string itself takes the same path —
+    // buildShellCommand splices it verbatim and the executor packs it
+    // with strlen, so a NUL would silently truncate it like argv/env/cwd.
+    if let command, command.contains("\0") {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "command must not contain NUL"])
       return
     }
     var stdinData: Data?
@@ -1264,6 +1271,13 @@ extension HTTPConnection {
                object: ["error": "command, sessionId and nonce are required"])
       return
     }
+    // N-5 follow-up (same truncation as /ish/exec): the worker command
+    // is spliced verbatim by buildWorkerCommand and packed with strlen.
+    if command.contains("\0") {
+      sendJSON(status: 400, reason: "Bad Request",
+               object: ["error": "command must not contain NUL"])
+      return
+    }
     var fsContext: UInt64 = 0
     if let n = json["fsContext"] as? NSNumber { fsContext = n.uint64Value }
     var timeoutMs = 600_000
@@ -1271,6 +1285,17 @@ extension HTTPConnection {
     timeoutMs = max(1_000, min(timeoutMs, 900_000))
     let env = json["env"] as? [String: String]
     let cwd = json["cwd"] as? String
+    // N-5 follow-up (same truncation as /ish/exec): env/cwd are spliced
+    // verbatim by buildWorkerCommand and packed with strlen, so a NUL
+    // would silently truncate them like command.
+    if let env, env.contains(where: { $0.key.contains("\0") || $0.value.contains("\0") }) {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "env must not contain NUL"])
+      return
+    }
+    if let cwd, cwd.contains("\0") {
+      sendJSON(status: 400, reason: "Bad Request", object: ["error": "cwd must not contain NUL"])
+      return
+    }
     guard ISHKernel.shared.isBooted else {
       sendJSON(status: 503, reason: "Service Unavailable", object: ["error": "ish_not_booted"])
       return

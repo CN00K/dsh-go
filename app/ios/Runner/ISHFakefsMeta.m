@@ -125,6 +125,17 @@ int ish_fakefs_meta_register_path(const char *metaDBPath,
     ish_meta_make_stat_blob(mode, statBlob);
     int rc = -1;
     sqlite3_int64 inode = ish_meta_lookup_inode(db, guestPath);
+    if (inode == -2) {
+        // (R5-3-2 residual) The lookup itself failed: fail instead of
+        // falling through to the INSERT branch, where a retry that
+        // succeeds would INSERT a fresh stats row and REPLACE the
+        // factory row for this path. (R5-3-2 fixed the same collapse
+        // in path_exists; this is the remaining copy inside
+        // register_path itself. Bind-mount UPDATE semantics are
+        // unchanged: inode >= 0 still updates in place.)
+        sqlite3_close(db);
+        return -1;
+    }
     if (inode >= 0) {
         // Path exists: update its stat mode in place.
         sqlite3_stmt *st = NULL;
@@ -139,6 +150,32 @@ int ish_fakefs_meta_register_path(const char *metaDBPath,
             NSLog(@"ISHFakefsMeta: prepare UPDATE failed: %s", sqlite3_errmsg(db));
         }
         sqlite3_finalize(st);
+        // Orphan paths row: the paths row exists but its stats row is
+        // missing, so the UPDATE above matched 0 rows while step still
+        // returned DONE. Re-create the stats row under the same inode
+        // instead of reporting success with nothing registered — the
+        // walker (which JOINs stats) treats this path as missing and
+        // calls here expecting a repair. No-op for every healthy row:
+        // a matched UPDATE changes exactly 1 row, even when the new
+        // mode equals the old one.
+        if (rc == 0 && sqlite3_changes(db) == 0) {
+            sqlite3_stmt *ins = NULL;
+            if (sqlite3_prepare_v2(db, "INSERT INTO stats (inode, stat) VALUES (?, ?)",
+                                   -1, &ins, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(ins, 1, inode);
+                sqlite3_bind_blob(ins, 2, statBlob, 16, SQLITE_TRANSIENT);
+                if (sqlite3_step(ins) == SQLITE_DONE) rc = 0;
+                else {
+                    NSLog(@"ISHFakefsMeta: INSERT orphan stats failed for %s: %s",
+                          guestPath, sqlite3_errmsg(db));
+                    rc = -1;
+                }
+            } else {
+                NSLog(@"ISHFakefsMeta: prepare INSERT orphan stats failed: %s", sqlite3_errmsg(db));
+                rc = -1;
+            }
+            sqlite3_finalize(ins);
+        }
     } else {
         // New path: INSERT stat, then INSERT path with the new rowid.
         sqlite3_stmt *st = NULL;

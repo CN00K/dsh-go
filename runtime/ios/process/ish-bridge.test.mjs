@@ -2781,6 +2781,67 @@ test('ishExec/ishWorkerExec reject a throwing or flipping env getter with ISH_IN
   }
 });
 
+// R6-1-1 (residual): an env getter that passes validation must not be
+// re-read when the request body is built — the body must carry the
+// validated snapshot, and the getter must be enumerated exactly once.
+test('ishWorkerExec sends the validated env snapshot without re-reading opts.env (R6-1-1)', async () => {
+  clearWorkerState();
+  let requests = 0;
+  let sentEnv;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    requests++;
+    sentEnv = JSON.parse(body.toString('utf8')).env;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    let reads = 0;
+    const flippingEnv = {};
+    Object.defineProperty(flippingEnv, 'A', {
+      enumerable: true,
+      get() { reads++; return reads === 1 ? 'first' : 'second'; },
+    });
+    await ishWorkerExec({command: 'echo hi', env: flippingEnv, sessionId: 'sess-r6-1-1b', serviceFile});
+    assert.equal(requests, 1);
+    assert.deepEqual(sentEnv, {A: 'first'}, 'body must carry the validated value, not a later read');
+    assert.equal(reads, 1, 'env must be enumerated exactly once');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// R6-1-1 follow-up: ishExec had the same re-read shape as ishWorkerExec
+// (env validated, then the body built from opts.env) — same fix, same test.
+test('ishExec sends the validated env snapshot without re-reading opts.env (R6-1-1 follow-up)', async () => {
+  let requests = 0;
+  let sentEnv;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    requests++;
+    sentEnv = JSON.parse(body.toString('utf8')).env;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    let reads = 0;
+    const flippingEnv = {};
+    Object.defineProperty(flippingEnv, 'A', {
+      enumerable: true,
+      get() { reads++; return reads === 1 ? 'first' : 'second'; },
+    });
+    await ishExec({command: 'echo hi', env: flippingEnv, serviceFile});
+    assert.equal(requests, 1);
+    assert.deepEqual(sentEnv, {A: 'first'}, 'body must carry the validated value, not a later read');
+    assert.equal(reads, 1, 'env must be enumerated exactly once');
+  } finally {
+    await close();
+  }
+});
+
 // R7-1-1: a throwing env getter must fail through spawnIshExec as
 // ISH_INVALID_ARGV (exit 1, stderr names the code), not as
 // "ish bridge unavailable". R6-1-1 only fixed ishExec/ishWorkerExec,

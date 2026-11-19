@@ -58,10 +58,9 @@ that fixture and the locked DSH dependencies. `bridge.test.mjs` verifies the
 pinned catalog SHA256, exact JSON serialization, and all thirteen fixed schemas.
 The iOS-only source tree does not require Kotlin/JRE or Android catalog inputs.
 
-`check-catalog.py` separately compiles the unchanged Android catalog inputs
-(`PhoneToolCatalog.kt` and `Json.kt` from `app/android`, plus
-`export-catalog.kt`) with `kotlinc`/`java` and compares the resulting JSON bytes
-with `runtime/ios/phone/catalog.json`.
+`check-catalog.py` separately
+compiles the unchanged Android catalog inputs with Kotlin/JRE and verifies the
+static JSON bytes; it does not assert that iOS has Android's capabilities.
 
 Port note: that script cannot run in this iOS-only tree — there is no
 `app/android` and no Kotlin/JRE toolchain here, so the Android inputs it needs

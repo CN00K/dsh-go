@@ -336,6 +336,28 @@ import Foundation
     finish(result, error("ish_workspace_missing", message))
   }
 
+  /// Restore a pending /root backup, if any (M-7). Returns false when
+  /// the restore failed, after failing the boot: the backup is kept
+  /// and the next boot retries. The shipped tree is intact on this
+  /// path, so the boot fails WITHOUT clearing it. Both booted-branch
+  /// paths use this — the intact-tree early return used to skip it,
+  /// so a backup left behind by a failed restore could never be
+  /// retried.
+  private func restorePendingUserRootBackup(result: @escaping FlutterResult) -> Bool {
+    do {
+      try RootfsManager.restoreLatestUserRootBackup()
+      return true
+    } catch {
+      let message = error.localizedDescription
+      NSLog("ISHRuntime: /root 备份恢复失败：%@", message)
+      DispatchQueue.main.async { [weak self] in
+        self?.setPhase("error", error: ["code": "ish_rootfs_io", "message": message])
+      }
+      finish(result, error("ish_rootfs_io", message))
+      return false
+    }
+  }
+
   private func performBoot(result: @escaping FlutterResult) {
     // (Retired 2026-11-15: the didResetWhileBooted refusal is gone.
     // Reset is now synchronous and self-healing; the next boot just
@@ -349,7 +371,8 @@ import Foundation
       // device test 18:42: "重开也没有用"). The kernel reads guest
       // files on demand, so restore the missing files in place and
       // keep running: the next shell spawn then succeeds, no restart
-      // needed. Only if the restore itself fails do we fall back to
+      // needed. Only if the restore itself fails — or meta.db itself
+      // was replaced (T-4, cold restart below) — do we fall back to
       // the restart error.
       // (H-3) The critical files alone are not enough: a missing
       // meta.db makes every bind-mount registration fail
@@ -372,6 +395,13 @@ import Foundation
         // exist" (build 43 device test 23:03).
         // (Build 45) Fail loudly if the directory still cannot be
         // created, instead of letting the gateway fail cryptically.
+        // (M-7, second gap) This early return used to skip the pending
+        // /root backup restore: a backup left behind by a failed
+        // restore could then never be retried, because the next boot
+        // also lands here and reports running. Restore it first, with
+        // the same failure semantics as the restore path below (fail
+        // the boot, keep the backup for a retry).
+        guard restorePendingUserRootBackup(result: result) else { return }
         guard ensureHostWorkspace() else {
           failWorkspaceMissing(result: result)
           return
@@ -381,9 +411,13 @@ import Foundation
         finish(result, nil)
         return
       }
-      NSLog("ISHRuntime: 内核已启动但缺关键文件，正在原地补回（无需重启 App）")
+      NSLog("ISHRuntime: 内核已启动但缺关键文件，正在原地补回")
+      // (T-4) Whether meta.db itself was replaced: the root mount
+      // still holds the deleted old inode, so a replaced database
+      // needs a cold restart below. A file-only restore needs none.
+      let metaDBRestored: Bool
       do {
-        try RootfsManager.restoreMissingFiles()
+        metaDBRestored = try RootfsManager.restoreMissingFiles()
       } catch let restoreError {
         NSLog("ISHRuntime: 原地补回失败：%@，回退到重启提示", restoreError.localizedDescription)
         kernel.stopGuest()
@@ -398,18 +432,30 @@ import Foundation
       // (M-7) The kernel is still booted after a reset-while-booted
       // (_isBooted is never cleared), so this branch — not
       // ensureInstalled — is the next boot after a reset. Restore the
-      // /root backup here too. On failure the shipped tree is intact,
-      // so fail the boot WITHOUT clearing it: the backup is kept and
-      // a boot retry re-attempts the restore.
-      do {
-        try RootfsManager.restoreLatestUserRootBackup()
-      } catch {
-        let message = error.localizedDescription
-        NSLog("ISHRuntime: /root 备份恢复失败：%@", message)
+      // /root backup here too (see restorePendingUserRootBackup: on
+      // failure the shipped tree is intact, so the boot fails WITHOUT
+      // clearing it — the backup is kept and a boot retry re-attempts
+      // the restore).
+      guard restorePendingUserRootBackup(result: result) else { return }
+      // (T-4) meta.db was replaced under the running kernel: the root
+      // mount's sqlite connection still points at the deleted old
+      // inode (fake_db_init opens once per mount; there is no
+      // in-process re-open — bootWithRootPath: no-ops once _isBooted
+      // and stopGuest only kills pid >= 2). Stop the guest so nothing
+      // keeps writing the stale database, and fail the boot asking
+      // for an App restart: the relaunch tears the kernel down and
+      // re-mounts on the new database. The restored tree is kept (NOT
+      // cleared like the restore-failure path above), so the next
+      // launch boots on it instead of reinstalling.
+      if metaDBRestored {
+        kernel.stopGuest()
+        let message = "Linux 沙箱数据库已恢复，需重启 App 完成冷重启"
+        NSLog("ISHRuntime: meta.db 已补回，需重启 App 冷重启 guest")
         DispatchQueue.main.async { [weak self] in
-          self?.setPhase("error", error: ["code": "ish_rootfs_io", "message": message])
+          self?.setPhase("error", error: ["code": "ish_restart_app_meta_db", "message": message])
+          self?.log("boot 失败：\(message)")
         }
-        finish(result, error("ish_rootfs_io", message))
+        finish(result, error("ish_restart_app_meta_db", message))
         return
       }
       // (Build 42) Same as above: restart the loopback service, which

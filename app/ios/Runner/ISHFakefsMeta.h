@@ -31,7 +31,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Register one guest path in meta.db (creating parent entries is the
 /// caller's job — see ish_fakefs_meta_ensure_parents). If the path
-/// already exists, its stat mode is updated; otherwise a new stats row
+/// already exists, its stat mode is updated — or, when its stats row
+/// is missing (orphan paths row), the stats row is re-created under
+/// the same inode; otherwise a new stats row
 /// (inode = last_insert_rowid) and paths row are inserted.
 /// `guestPath` must be absolute (leading "/"), already normalized.
 /// `mode` is the full st_mode value (type bits + perms), e.g. 0o040755

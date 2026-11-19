@@ -223,6 +223,9 @@ struct RootfsManager {
                     // the workspace.
                     if !FileManager.default.fileExists(atPath: metaDBURL.path) {
                         NSLog("RootfsManager: 已安装但缺 meta.db，就地补回")
+                        // (T-4) The kernel is not booted on this path
+                        // (ensureInstalled runs before boot), so a
+                        // replaced meta.db needs no cold restart.
                         try restoreMissingFiles()
                         guard FileManager.default.fileExists(atPath: metaDBURL.path) else {
                             throw RootfsError.ioError("补回后校验失败：meta.db 仍缺失")
@@ -487,13 +490,22 @@ struct RootfsManager {
     /// until a cold reinstall; an absent database leaves the kernel
     /// with no metadata to be inconsistent with.
     ///
+    /// (T-4) Replacing meta.db under a booted kernel desyncs the
+    /// kernel: fake_db_init() opens the sqlite connection once per
+    /// mount and holds it until unmount, so the root mount keeps
+    /// reading/writing the deleted old inode after the file is
+    /// replaced. Returns true when meta.db itself was restored, so
+    /// the caller (ISHRuntime's booted branch) can cold-restart the
+    /// guest; a file-only restore needs no restart.
+    ///
     /// This is the recovery for a tree that was deleted while booted
     /// (e.g. the user pressed Reset while the kernel was up): the old
     /// build-39 path deleted the tree and asked for an app restart,
     /// but tapping the app icon does not kill the process, so the
     /// kernel stayed booted, the files stayed gone, and the restart
     /// error fired forever. Restoring in place needs no restart.
-    static func restoreMissingFiles() throws {
+    @discardableResult
+    static func restoreMissingFiles() throws -> Bool {
         let fm = FileManager.default
         // Which critical files actually need restoring?
         var missing: [String] = []
@@ -509,7 +521,7 @@ struct RootfsManager {
             if needsRestore { missing.append(rel) }
         }
         let metaMissing = !fm.fileExists(atPath: metaDBURL.path)
-        guard !missing.isEmpty || metaMissing else { return }
+        guard !missing.isEmpty || metaMissing else { return false }
         NSLog("RootfsManager: 内核运行中，补回缺失的关键文件：%@", missing.joined(separator: ", "))
         let zip = try resolveZipURL(nil)
         let zipData = try Data(contentsOf: zip)
@@ -647,7 +659,14 @@ struct RootfsManager {
                 throw RootfsError.ioError("meta.db 补登记失败 (rc=\(rc))")
             }
         }
-        NSLog("RootfsManager: 关键文件已补回，内核无需重启")
+        // (T-4) A file-only restore needs no restart; a replaced
+        // meta.db does (the caller cold-restarts — see the return).
+        if metaMissing {
+            NSLog("RootfsManager: 关键文件已补回，meta.db 已替换（运行中内核仍持旧连接，调用方需冷重启）")
+        } else {
+            NSLog("RootfsManager: 关键文件已补回，内核无需重启")
+        }
+        return metaMissing
     }
 
     // MARK: - Private

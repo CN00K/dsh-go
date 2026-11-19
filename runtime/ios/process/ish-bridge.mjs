@@ -569,6 +569,10 @@ function assertValidExecInput(opts) {
       new Error('ish env keys and values must not contain NUL bytes'),
       {code: 'ISH_INVALID_ARGV'});
   }
+  // R6-1-1 (residual): hand the validated snapshot back so callers
+  // build the request body from it instead of re-reading opts.env —
+  // a second read could throw or flip under a stateful getter.
+  return envEntries;
 }
 
 /**
@@ -633,12 +637,16 @@ export async function ishExec(opts) {
   }
   // R3-N1: without argv command is required; NUL in command/argv/env/cwd
   // fails here, before any HTTP is sent (see assertValidExecInput).
-  assertValidExecInput(opts);
+  // R6-1-1 (residual): hand the validated snapshot back so callers
+  // build the request body from it instead of re-reading opts.env —
+  // a second read could throw or flip under a stateful getter.
+  // (Same fix applied to ishExec: it had the identical re-read shape.)
+  const validatedEnv = assertValidExecInput(opts);
   const body = JSON.stringify({
     ...(opts.command ? {command: opts.command} : {}),
     ...(opts.argv ? {argv: opts.argv} : {}),
     ...(opts.cwd ? {cwd: opts.cwd} : {}),
-    ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
+    ...(validatedEnv && validatedEnv.length > 0 ? {env: Object.fromEntries(validatedEnv)} : {}),
     ...(opts.stdinData && opts.stdinData.length > 0
       ? {stdinData: Buffer.from(opts.stdinData).toString('base64')} : {}),
     ...(opts.cwdNonce ? {cwdNonce: opts.cwdNonce} : {}),
@@ -1147,7 +1155,10 @@ export async function ishWorkerExec(opts) {
   }
   // R3-N1: command is required (no argv mode here); NUL in command/env/cwd
   // fails before the op is queued, so no HTTP is sent (see assertValidExecInput).
-  assertValidExecInput(opts);
+  // R6-1-1 (residual): reuse the validated env snapshot for the body
+  // below — do not re-read opts.env, which would enumerate a stateful
+  // getter a second time.
+  const validatedEnv = assertValidExecInput(opts);
   // R5-1-2: the worker endpoint takes command only — a well-formed argv
   // would otherwise be silently ignored while the command runs as a
   // shell string, so reject it instead of dropping it.
@@ -1165,7 +1176,7 @@ export async function ishWorkerExec(opts) {
       command: opts.command,
       sessionId,
       ...(opts.cwd && (!state.knownAlive || opts.cwd !== state.cwd) ? {cwd: opts.cwd} : {}),
-      ...(opts.env && Object.keys(opts.env).length > 0 ? {env: opts.env} : {}),
+      ...(validatedEnv && validatedEnv.length > 0 ? {env: Object.fromEntries(validatedEnv)} : {}),
       nonce,
       ...(opts.readOnly ? {readOnly: true} : {}),
       timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,

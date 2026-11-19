@@ -10,7 +10,7 @@ final class ContinuedRun {
   var onChange: ((Bool) -> Void)?
 
   private var wanted = false
-  /// The system or the user ended it: not again until the next turn.
+  /// The system ended it (expired): not again until the app returns to the foreground.
   private var spent = false
   private var submitted: String?
   private var task: BGTask?
@@ -44,6 +44,10 @@ final class ContinuedRun {
   @objc private func becameActive() {
     // Returning through Control Center or from another app ends the card. A
     // still-running turn can request a fresh task on the next departure.
+    // (L-12) An expiry is transient: clear `spent` here so the next
+    // departure can submit again. The system may still refuse the new
+    // request, so the fail-closed behaviour is unchanged.
+    spent = false
     finish(success: true)
   }
 

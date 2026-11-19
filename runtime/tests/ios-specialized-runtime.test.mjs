@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -222,6 +222,35 @@ async function routerFixture(t) {
   });
   return { router, server, spawn, work };
 }
+
+// (R7-4-2) Probe for the dynamic-import failure path only: the
+// execFileSync step succeeds, but the specialized output cannot be
+// imported, so loadSpecializedRuntime must still remove the temp
+// tree mirror it just built. A probe-only `python3` shim on PATH
+// writes un-importable output and exits 0; the real specialize
+// script never runs. The SyntaxError assertion pins the failure to
+// the import (not the exec step).
+test('R7-4-2: a failed dynamic import still removes the loadSpecializedRuntime temp tree', { timeout: 15000 }, async () => {
+  const treePrefix = 'ios-specialized-tree-';
+  const before = readdirSync(tmpdir()).filter((name) => name.startsWith(treePrefix)).sort();
+  const shimDir = mkdtempSync(join(tmpdir(), 'ios-specialized-import-probe-'));
+  const shim = join(shimDir, 'python3');
+  // Args: -c <script> <specialize.py> <runtime.mjs> <outPath>; the
+  // output path is $5.
+  writeFileSync(shim, '#!/bin/sh\nprintf \'this is not valid javascript {{{\\n\' > "$5"\n');
+  chmodSync(shim, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${oldPath}`;
+  try {
+    await assert.rejects(loadSpecializedRuntime(), SyntaxError,
+      'the broken specialized output must fail at the dynamic import');
+  } finally {
+    process.env.PATH = oldPath;
+    rmSync(shimDir, { recursive: true, force: true });
+  }
+  const after = readdirSync(tmpdir()).filter((name) => name.startsWith(treePrefix)).sort();
+  assert.deepEqual(after, before, 'a failed import must leave no new temp tree behind');
+});
 
 test('M-12: an iSH bash handle is in live while running and leaves it on settle', { timeout: 15000 }, async (t) => {
   const { runtime, server, spawn } = await fixture(t);
