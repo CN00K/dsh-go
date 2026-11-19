@@ -347,8 +347,12 @@ import Foundation
     do {
       try RootfsManager.restoreLatestUserRootBackup()
       return true
-    } catch {
-      let message = error.localizedDescription
+    } catch let caught {
+      // NOTE: the binding must NOT be named `error` — a bare `catch`
+      // binds the caught error as `error`, which would shadow this
+      // file's `error(_:_:)` helper and break the call below
+      // (build 50: "cannot call value of non-function type 'any Error'").
+      let message = caught.localizedDescription
       NSLog("ISHRuntime: /root 备份恢复失败：%@", message)
       DispatchQueue.main.async { [weak self] in
         self?.setPhase("error", error: ["code": "ish_rootfs_io", "message": message])
