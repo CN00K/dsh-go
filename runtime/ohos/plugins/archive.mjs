@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { open, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { copyFile, lstat, open, mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
@@ -49,7 +49,7 @@ function entryPath(header) {
   if (parts.some(part => part === '' || part === '.' || part === '..')) throw invalid('插件归档路径无效。');
   if (parts.includes('node_modules')) throw unsupported('插件归档内置 node_modules，无法核对锁定依赖；请发布不含内置依赖的纯 JS 包。');
   if (parts.some(part => part.endsWith('.node') || part.endsWith('.wasm') || part === 'binding.gyp')) {
-    throw unsupported('插件包含原生 addon、binding.gyp 或 WebAssembly；鸿蒙本机仅支持纯 JS 包。');
+    throw unsupported('插件包含原生 addon、binding.gyp 或 WebAssembly；本机仅支持纯 JS 包。');
   }
   return relative;
 }
@@ -76,7 +76,7 @@ async function rejectBinary(file, size) {
         offset + 24 + optionalBytes + sections * 40 <= size;
     }
   }
-  if (binary) throw unsupported('插件文件包含 ELF、Mach-O、PE 或 WebAssembly 二进制；鸿蒙本机仅支持纯 JS 包。');
+  if (binary) throw unsupported('插件文件包含 ELF、Mach-O、PE 或 WebAssembly 二进制；本机仅支持纯 JS 包。');
 }
 
 /** Extract one locked package into a newly owned directory; never publish or execute it. */
@@ -160,9 +160,9 @@ export async function extractPackage({ archivePath, integrity, stagingRoot, name
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || manifest.name !== name || manifest.version !== version) {
       throw invalid('插件 package.json 的名称或版本与锁定版本不符。');
     }
-    if (manifest.gypfile === true) throw unsupported('插件需要 node-gyp 原生构建，鸿蒙本机仅支持纯 JS 包。');
+    if (manifest.gypfile === true) throw unsupported('插件需要 node-gyp 原生构建，本机仅支持纯 JS 包。');
     if (['preinstall', 'install', 'postinstall'].some(key => Object.hasOwn(manifest.scripts ?? {}, key))) {
-      throw unsupported('插件需要安装生命周期脚本；鸿蒙本机不会运行这些脚本，请使用预构建的纯 JS 包。');
+      throw unsupported('插件需要安装生命周期脚本；本机不会运行这些脚本，请使用预构建的纯 JS 包。');
     }
     return { directory, manifest };
   } catch (error) {
@@ -178,4 +178,56 @@ export async function extractPackage({ archivePath, integrity, stagingRoot, name
     signal?.removeEventListener('abort', abort);
     await file.close();
   }
+}
+
+/** Validate a local plugin directory and copy it into a newly owned directory.
+ *  Mirrors the tarball checks (no links or special files, no bundled
+ *  node_modules, no .node/.wasm/binding.gyp, no binary files, manifest
+ *  name/version, no gypfile, no lifecycle scripts); never executes anything.
+ *  The caller owns `destination` (created here) and cleans it up on failure. */
+export async function copyLocalPackage({ source, destination, signal }) {
+  signal?.throwIfAborted();
+  const root = await lstat(source);
+  if (root.isSymbolicLink() || !root.isDirectory()) throw invalid('本地插件路径不是真实目录。');
+  await mkdir(destination, { recursive: true, mode: 0o700 });
+  let entries = 0, expanded = 0; // Local count for the size limit; syncTree owns budget accounting.
+  async function copyTree(dir, relative) {
+    for (const name of await readdir(dir)) {
+      signal?.throwIfAborted();
+      if (++entries > ARCHIVE_LIMITS.entries) throw limit();
+      if (name === 'node_modules') throw unsupported('插件目录内置 node_modules，无法核对锁定依赖；请发布不含内置依赖的纯 JS 包。');
+      if (name.endsWith('.node') || name.endsWith('.wasm') || name === 'binding.gyp')
+        throw unsupported('插件包含原生 addon、binding.gyp 或 WebAssembly；本机仅支持纯 JS 包。');
+      const from = join(dir, name);
+      const to = join(destination, relative, name);
+      const info = await lstat(from);
+      if (info.isSymbolicLink()) throw unsupported('插件目录不支持链接条目。');
+      if (info.isDirectory()) {
+        await mkdir(to, { mode: 0o700 });
+        await copyTree(from, join(relative, name));
+        continue;
+      }
+      if (!info.isFile()) throw unsupported('插件目录不支持链接、设备或管道条目。');
+      if (info.size > ARCHIVE_LIMITS.fileBytes) throw limit();
+      expanded += info.size;
+      if (expanded > ARCHIVE_LIMITS.expandedBytes) throw limit();
+      const file = await open(from, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { await rejectBinary(file, info.size); } finally { await file.close(); }
+      await copyFile(from, to, constants.COPYFILE_EXCL);
+      const copied = await open(to, constants.O_WRONLY | constants.O_NOFOLLOW);
+      try { await copied.chmod(0o600); } finally { await copied.close(); }
+    }
+  }
+  await copyTree(source, '');
+  const manifestText = await readFile(join(destination, 'package.json'), 'utf8')
+    .catch(() => { throw invalid('本地插件缺少可读的 package.json。'); });
+  const manifest = JSON.parse(manifestText.replace(/^\uFEFF/, ''));
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) ||
+      typeof manifest.name !== 'string' || manifest.name === '' ||
+      typeof manifest.version !== 'string' || manifest.version === '')
+    throw invalid('本地插件 package.json 的名称或版本无效。');
+  if (manifest.gypfile === true) throw unsupported('插件需要 node-gyp 原生构建，本机仅支持纯 JS 包。');
+  if (['preinstall', 'install', 'postinstall'].some(key => Object.hasOwn(manifest.scripts ?? {}, key)))
+    throw unsupported('插件需要安装生命周期脚本；本机不会运行这些脚本，请使用预构建的纯 JS 包。');
+  return manifest;
 }

@@ -46,10 +46,10 @@ export function registerPhoneTools(ctx, queue) {
           result = rejected('missing_call_identity', '手机操作需要真实会话和工具调用身份。');
         } else if (definition.name === 'mcp__phone__open') {
           if (Boolean(args.app?.trim()) === Boolean(args.url?.trim())) result = rejected('invalid_args', 'open需要app或url，二选一。');
-          else if (args.background === true) result = rejected('unsupported', '鸿蒙不支持后台屏；请让DSH保持前台，使用background:false。');
+          else if (args.background === true) result = rejected('unsupported', '本机不支持后台屏；请让DSH保持前台，使用background:false。');
         } else if (definition.name === 'mcp__phone__clipboard') {
           if (args.set !== undefined && args.get === true) result = rejected('invalid_args', 'clipboard的set和get一次只能用一个。');
-          else if (args.get === true) result = rejected('unsupported', '鸿蒙手机回调只支持写剪贴板；请让用户直接粘贴需要的内容。');
+          else if (args.get === true) result = rejected('unsupported', '本机回调只支持写剪贴板；请让用户直接粘贴需要的内容。');
           else if (args.set === undefined) result = rejected('invalid_args', 'clipboard需要set写入文字。');
         } else if (definition.name === 'mcp__phone__notify' && (!args.title.trim() || !args.text.trim())) {
           result = rejected('invalid_args', 'notify需要非空title和text。');

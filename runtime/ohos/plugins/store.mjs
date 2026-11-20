@@ -156,7 +156,7 @@ function ownedTarget(dir, path, target) {
   const root = join(dir, '.plugin-manager', 'ohos', 'generations') + sep;
   const absolute = resolve(dirname(path), target);
   if (!absolute.startsWith(root) || !generationName.test(absolute.slice(root.length).split(sep)[0])) {
-    throw failure('已有插件目录不属于鸿蒙安装器，不能覆盖或删除');
+    throw failure('已有插件目录不属于本机安装器，不能覆盖或删除');
   }
   return absolute;
 }
@@ -164,7 +164,7 @@ function ownedTarget(dir, path, target) {
 function currentLink(dir, path) {
   const info = stat(path);
   if (!info) return null;
-  if (!info.isSymbolicLink()) throw failure('已有插件不是鸿蒙管理的版本链接，不能覆盖或删除');
+  if (!info.isSymbolicLink()) throw failure('已有插件不是本机管理的版本链接，不能覆盖或删除');
   const target = readlinkSync(path);
   ownedTarget(dir, path, target);
   return target;
@@ -334,7 +334,7 @@ export function beginTransaction(dir) {
     publish(name, destination) {
       if (record.links.some(item => item.name === name)) throw failure('同一次安装尝试不能重复发布同名插件');
       const targetPath = linkPath(dir, name);
-      if (stat(targetPath)) throw failure('已有插件目录不属于鸿蒙安装器，不能覆盖或删除');
+      if (stat(targetPath)) throw failure('已有插件目录不属于本机安装器，不能覆盖或删除');
       const packages = readPackages(dir, root);
       const target = destination === null ? null : relative(join(root, 'generations'), destination);
       if (target !== null) {

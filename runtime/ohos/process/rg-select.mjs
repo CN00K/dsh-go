@@ -97,7 +97,7 @@ export async function selectRgFiles(ctx, options, globs, roots) {
   const contexts = new Map(), result = [], diagnostics = [];
   const diagnostic = error => diagnostics.push(rgDiagnostic(error));
   let visited = 0;
-  const checkpoint = () => { if (++visited > ctx.limits.maxGlobOperations) throw new SelectionLimitError(`遍历检查超过鸿蒙本机上限（${ctx.limits.maxGlobOperations}）；结果不完整`); };
+  const checkpoint = () => { if (++visited > ctx.limits.maxGlobOperations) throw new SelectionLimitError(`遍历检查超过本机上限（${ctx.limits.maxGlobOperations}）；结果不完整`); };
   async function readRules(base, name) {
     const path = join(base, name);
     if (!await ctx.fs.exists(path)) return [];
@@ -161,7 +161,7 @@ export async function selectRgFiles(ctx, options, globs, roots) {
       const shown = display === '.' ? entry.name : display === './' ? './' + entry.name : display.replace(/\/$/, '') + '/' + entry.name;
       if (entry.isDirectory) await walk(absolute, shown);
       else if (entry.isFile) {
-        if (result.length >= ctx.limits.maxArrayElements) throw new SelectionLimitError(`候选文件数超过鸿蒙本机上限（${ctx.limits.maxArrayElements}）；结果不完整`);
+        if (result.length >= ctx.limits.maxArrayElements) throw new SelectionLimitError(`候选文件数超过本机上限（${ctx.limits.maxArrayElements}）；结果不完整`);
         result.push(shown);
       }
     }

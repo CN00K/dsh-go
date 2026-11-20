@@ -181,7 +181,7 @@ test('未知命令返回127与中文替代路径；不加载Python/SQLite/WASM',
   for (const command of ['apt-get', 'python', 'sqlite3']) {
     const direct = await run([command, '--help']);
     assert.equal(direct.exitCode, 127);
-    assert.match(direct.stderr, /这个命令在鸿蒙本机不可用，可以连接电脑执行/);
+    assert.match(direct.stderr, /这个命令在本机不可用，可以连接电脑执行/);
     const shell = await run(['bash', '-c', `${command} --help`]);
     assert.equal(shell.exitCode, 127);
   }
@@ -253,7 +253,7 @@ test('rg非JSON新语义和未实现的files复杂glob仍明确拒绝', async ()
   ]) {
     const result = await run(['rg', ...args]);
     assert.equal(result.exitCode, 2);
-    assert.match(result.stderr, /鸿蒙本机尚不支持.*可以连接电脑执行/);
+    assert.match(result.stderr, /本机尚不支持.*可以连接电脑执行/);
     assert.equal(result.stdout, '');
   }
 });

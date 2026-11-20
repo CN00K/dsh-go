@@ -29,6 +29,39 @@ export function secureUrl(value) {
   return url;
 }
 
+/** A local plugin directory on this device, or null. Registry names are not paths;
+ *  the engine only ever passes absolute paths (its parser rejects relative ones). */
+export function localDirectoryPath(spec) {
+  if (typeof spec !== 'string') return null;
+  const path = spec.trim().replace(/^(?:file|link):/, '');
+  return path.startsWith('/') ? path : null;
+}
+
+const maxRedirects = 5;
+
+/** Follow HTTP redirects manually so every hop stays HTTPS without credentials,
+ *  query or fragment. A registry or CDN edge may 302; refusing every 3xx blocks
+ *  installs on networks where the registry redirects. */
+export async function fetchFollowingRedirects(fetchImpl, url, { signal, headers } = {}) {
+  let current = url;
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    const response = await fetchImpl(current, { signal, redirect: 'manual', ...(headers ? { headers } : {}) });
+    if (response.status < 300 || response.status >= 400) return response;
+    if (hop === maxRedirects) {
+      await response.body?.cancel();
+      throw registryError('Registry redirect limit exceeded');
+    }
+    const location = response.headers?.get?.('location');
+    await response.body?.cancel();
+    if (!location) throw registryError('Registry redirect is unsupported');
+    try { current = secureUrl(new URL(location, current).href).href; }
+    catch (error) {
+      if (error.code?.startsWith('ERR_OHOS_PLUGIN_')) throw error;
+      throw registryError('Registry redirect is unsupported');
+    }
+  }
+}
+
 async function readJson(response, signal) {
   const reader = response.body?.getReader();
   if (!reader) throw registryError('Registry returned an empty body');
@@ -68,16 +101,13 @@ export function createRegistry({ registry = 'https://registry.npmjs.org', fetchI
       const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
       let response;
       try {
-        response = await fetchImpl(`${base}/${encodeURIComponent(name)}`, {
-          signal: requestSignal, redirect: 'manual', headers: { accept: 'application/json' },
+        response = await fetchFollowingRedirects(fetchImpl, `${base}/${encodeURIComponent(name)}`, {
+          signal: requestSignal, headers: { accept: 'application/json' },
         });
       } catch (error) {
         requestSignal.throwIfAborted();
+        if (error.code?.startsWith('ERR_OHOS_PLUGIN_')) throw error;
         throw registryError('Registry network request failed', 'ERR_PNPM_META_FETCH_FAIL');
-      }
-      if (response.status >= 300 && response.status < 400) {
-        await response.body?.cancel();
-        throw registryError('Registry redirect is unsupported');
       }
       if (!response.ok) {
         await response.body?.cancel();

@@ -79,10 +79,15 @@ export class VirtualSubprocessRuntime {
   }
 
   prepare(argv, policy, signal) {
-    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭');
+    if (this.closed) throw new Error('虚拟进程服务已关闭');
     signal?.throwIfAborted();
     validateArgv(argv);
-    if (policy.mode !== 'read-only' && policy.mode !== 'workspace-write') throw new Error('非法的受限运行模式');
+    // danger-full-access is a valid ticket mode too: the iOS guest provider
+    // (runtime/ios/guest/provider.mjs) accepts it and runs it as
+    // workspace-write inside the guest, so accepting it here widens nothing —
+    // it only records the approval that was granted. Rejecting it here broke
+    // agent bash the moment a session was given full permissions.
+    if (policy.mode !== 'read-only' && policy.mode !== 'workspace-write' && policy.mode !== 'danger-full-access') throw new Error('非法的受限运行模式');
     const grant = isLogicalWorkspacePath(policy.workspaceRoot) ? processWorkspaceGrant(policy.workspaceRoot) : undefined;
     const workspaceRoot = grant?.mountPoint ?? realpathSync(policy.workspaceRoot);
     if (!grant && !this.roots.some(root => isInside(root, workspaceRoot))) throw Object.assign(new Error('EACCES: OHOS_SANDBOX_DENIED: 会话工作区未由宿主授权'), { code: 'EACCES' });
@@ -107,11 +112,11 @@ export class VirtualSubprocessRuntime {
   }
 
   async spawnTerminal() {
-    throw Object.assign(new Error('鸿蒙本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });
+    throw Object.assign(new Error('本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });
   }
 
   spawn(spec) {
-    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭');
+    if (this.closed) throw new Error('虚拟进程服务已关闭');
     if (!Number.isFinite(spec.graceMs) || spec.graceMs <= 0 || spec.graceMs > MAX_TIMER_DELAY_MS) throw new Error(`subprocess graceMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`);
     if (spec.signal?.aborted) {
       let reason = 'aborted';
@@ -123,7 +128,7 @@ export class VirtualSubprocessRuntime {
     let policy, grant;
     if (argv[0] === confinedProgram) {
       const prepared = argv.length === 2 && this.prepared.get(argv[1]);
-      if (!prepared) throw Object.assign(new Error('无效或已使用的鸿蒙执行票据'), { code: 'ERR_OHOS_INVALID_CONFINEMENT' });
+      if (!prepared) throw Object.assign(new Error('无效或已使用的执行票据'), { code: 'ERR_OHOS_INVALID_CONFINEMENT' });
       this.prepared.delete(argv[1]);
       prepared.signal?.removeEventListener('abort', prepared.cancel);
       argv = prepared.argv;
@@ -417,7 +422,7 @@ export class VirtualSubprocessRuntime {
       });
       if (!current) return;
       if (!current.isDirectory() || current.dev !== owner.dev || current.ino !== owner.ino) {
-        throw Object.assign(new Error('鸿蒙虚拟进程临时根的身份已改变，拒绝删除替换目录'), { code: 'ERR_OHOS_TEMP_ROOT_REPLACED' });
+        throw Object.assign(new Error('虚拟进程临时根的身份已改变，拒绝删除替换目录'), { code: 'ERR_OHOS_TEMP_ROOT_REPLACED' });
       }
       await rm(owner.path, { recursive: true });
     })();

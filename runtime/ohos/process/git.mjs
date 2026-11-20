@@ -6,7 +6,7 @@ import { readIndex, stageTree } from './git-index.mjs';
 import { changes, formatChanges, objectBytes, treeEntries, quoteGitPath } from './git-diff.mjs';
 import { normalizeAutoCrlf } from './git-eol.mjs';
 
-const unavailable = '这个命令在鸿蒙本机不可用，可以连接电脑执行';
+const unavailable = '这个命令在本机不可用，可以连接电脑执行';
 const missing = error => error?.code === 'ENOENT' || error?.code === 'ENOTDIR';
 const abort = ctx => ctx.signal?.throwIfAborted();
 const unsupported = message => { throw Object.assign(new Error(`${message}；${unavailable}`), { exitCode: 127 }); };

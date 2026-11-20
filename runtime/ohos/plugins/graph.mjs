@@ -4,7 +4,7 @@ import { parseRegistrySpec, registryError, secureUrl } from './registry.mjs';
 const semver = createRequire(new URL('../../../package.json', import.meta.url))('semver');
 const maxNodes = 512;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-function fields(manifest, name) {
+export function fields(manifest, name) {
   const value = manifest[name] ?? {};
   if (!object(value)) throw registryError(`${manifest.name}: invalid ${name}`);
   return value;
@@ -36,7 +36,7 @@ function integrityOf(manifest) {
   if (!supported) throw registryError(`${manifest.name}: unsupported integrity`);
   return value;
 }
-function hostEdge(name, range, hostPackages) {
+export function hostEdge(name, range, hostPackages) {
   if (typeof range !== 'string' || !semver.validRange(range))
     throw registryError(`${name}: unsupported host dependency range`);
   const host = hostPackages.get(name);

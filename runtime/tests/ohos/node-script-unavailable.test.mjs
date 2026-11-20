@@ -18,7 +18,7 @@ test('without inherited preload the real runtime rejects Node and never runs its
     const handle = runtime.spawn({ argv, cwd: work, graceMs: 200,
       stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 4096 } } });
     assert.equal((await handle.done).exitCode, 127); assert.equal(await handle.waitForExit(), true);
-    assert.match(handle.collected.stderr.readFrom(0).text, /ERR_OHOS_NODE_PRELOAD_REQUIRED|这个命令在鸿蒙本机不可用/);
+    assert.match(handle.collected.stderr.readFrom(0).text, /ERR_OHOS_NODE_PRELOAD_REQUIRED|这个命令在本机不可用/);
   }
   assert.equal(await stat(join(work, 'must-not-exist')).then(() => true, () => false), false);
   assert.match(await readFile(join(work, 'script.mjs'), 'utf8'), /must-not-exist/);

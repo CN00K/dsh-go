@@ -22,7 +22,7 @@ const load = name => import(pathToFileURL(require.resolve('@deepseek-ai/' + name
 const [{ Context }, { SystemPrompt }, { ToolRuntime }] = await Promise.all([
   load('cordis'), load('dsh-system-prompt'), load('dsh-tools'),
 ]);
-const notice = ' 鸿蒙本机不读取全局 gitignore 或 core.excludesFile；外部排除和反向放行规则均不参与，结果可能与桌面不同。';
+const notice = ' 本机不读取全局 gitignore 或 core.excludesFile；外部排除和反向放行规则均不参与，结果可能与桌面不同。';
 
 async function registered(modulePath) {
   const provider = await import(pathToFileURL(modulePath));

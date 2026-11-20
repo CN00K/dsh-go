@@ -21,8 +21,8 @@ test('Android携带旧环境变量且没有显式预载时两个鸿蒙服务拒�
   const original = [Request, Response, Headers, FormData, process.cwd];
   Object.defineProperty(process, 'platform', { ...platform, value: 'android' });
   try {
-    assert.throws(() => new OhSubprocessRuntime(new Context()), /只能由鸿蒙/);
-    assert.throws(() => new OhSandboxProvider(new Context()), /只能由鸿蒙/);
+    assert.throws(() => new OhSubprocessRuntime(new Context()), /只能由本机/);
+    assert.throws(() => new OhSandboxProvider(new Context()), /只能由本机/);
     assert.deepEqual([Request, Response, Headers, FormData, process.cwd], original);
   } finally { Object.defineProperty(process, 'platform', platform); }
 });

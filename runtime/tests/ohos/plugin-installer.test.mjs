@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { installPluginResolution } from '../../ohos/plugins/resolution.mjs';
 installPluginResolution();
 import { beginTransaction } from '../../ohos/plugins/store.mjs';
+import { createRegistry } from '../../ohos/plugins/registry.mjs';
 import { runProfileOperation } from '../../ohos/plugins/installer.mjs';
 
 const prefix = resolve(process.env.DSH_PREFIX);
@@ -162,4 +163,95 @@ test('tampered download and cancellation mid-download restore the entire attempt
     assert.deepEqual(await readdir(join(dir, '.plugin-manager/ohos/generations')), []);
     tx.finish(false);
   }
+});
+
+test('registry metadata follows an HTTPS redirect; an endless redirect fails', async () => {
+  const packument = { name: 'root', versions: { '1.0.0': { name: 'root', version: '1.0.0' } }, 'dist-tags': { latest: '1.0.0' } };
+  let calls = 0;
+  const once = async url => {
+    calls += 1;
+    if (url === 'https://registry.example/root')
+      return new Response('', { status: 302, headers: { location: 'https://registry.example/mirror/root' } });
+    return new Response(JSON.stringify(packument));
+  };
+  const registry = createRegistry({ registry: 'https://registry.example', fetchImpl: once, timeoutMs: 1000 });
+  assert.deepEqual(await registry.view('root', ['name', 'version']), { name: 'root', version: '1.0.0' });
+  assert.equal(calls, 2);
+  calls = 0;
+  const loop = async () => new Response('', { status: 302, headers: { location: 'https://registry.example/root' } });
+  const looping = createRegistry({ registry: 'https://registry.example', fetchImpl: async url => { calls += 1; return loop(); }, timeoutMs: 1000 });
+  await assert.rejects(() => looping.view('root', ['name']), /redirect limit exceeded/);
+  assert.equal(calls, 6);
+});
+
+test('tarball download follows an HTTPS redirect to a mirror path', async t => {
+  const dir = await fixture(t);
+  const base = packages({ root: { '1.0.0': { files: { 'index.js': 'module.exports = 1;' } } } });
+  let redirected = false;
+  const fetchImpl = async (url, options) => {
+    if (url === 'https://tar.example/mirror/root-1.0.0.tgz') return base('https://tar.example/root-1.0.0.tgz', options);
+    if (!redirected && url === 'https://tar.example/root-1.0.0.tgz') {
+      redirected = true;
+      return new Response('', { status: 302, headers: { location: 'https://tar.example/mirror/root-1.0.0.tgz' } });
+    }
+    return base(url, options);
+  };
+  const tx = beginTransaction(dir);
+  const result = await runProfileOperation({ dir }, ['add', 'root'], opts(fetchImpl));
+  assert.equal(result.exitCode, 0, result.output);
+  assert.equal(redirected, true);
+  tx.finish(true);
+  assert.equal(await readFile(join(await selected(dir), 'index.js'), 'utf8'), 'module.exports = 1;');
+});
+
+async function localBundle(t, manifest, files) {
+  const bundle = await mkdtemp(join(tmpdir(), 'ohos-local-bundle-'));
+  t.after(async () => { await rm(bundle, { recursive: true, force: true }); });
+  await writeFile(join(bundle, 'package.json'), JSON.stringify(manifest));
+  for (const [name, text] of Object.entries(files)) {
+    await mkdir(join(bundle, name, '..'), { recursive: true });
+    await writeFile(join(bundle, name), text);
+  }
+  return bundle;
+}
+
+test('installs a local pure-JS bundle with its registry dependency', async t => {
+  const dir = await fixture(t);
+  const bundle = await localBundle(t,
+    { name: '@local/dsh-preset-pj', version: '0.1.0', main: 'lib/index.js',
+      dependencies: { helper: '1' },
+      dsh: { bundle: { patch: './cordis.patch.yml' } } },
+    { 'lib/index.js': 'module.exports = 42;', 'cordis.patch.yml': 'services: {}\n' });
+  const fetchImpl = packages({ helper: { '1.0.0': { files: { 'index.js': 'module.exports = 7;' } } } });
+  const tx = beginTransaction(dir);
+  const result = await runProfileOperation({ dir }, ['add', bundle], opts(fetchImpl));
+  assert.equal(result.exitCode, 0, result.output);
+  assert.match(result.output, /from local path/);
+  assert.equal(JSON.parse(await readFile(join(dir, 'package.json'))).dependencies['@local/dsh-preset-pj'], '0.1.0');
+  tx.finish(true);
+  const target = await selected(dir, '@local/dsh-preset-pj');
+  assert.equal(await readFile(join(target, 'lib/index.js'), 'utf8'), 'module.exports = 42;');
+  const genRoot = join(target, '../../../..');
+  const lock = JSON.parse(await readFile(join(genRoot, 'lock.json')));
+  assert.equal(lock.schema, 1);
+  assert.equal(lock.root, '@local/dsh-preset-pj@0.1.0');
+  assert.equal(lock.nodes.length, 2);
+  assert.equal(lock.nodes[0].local, true);
+  const helper = lock.nodes.find(node => node.name === 'helper');
+  assert.equal(helper.version, '1.0.0');
+  assert.equal(await readFile(join(genRoot, helper.directory, 'index.js'), 'utf8'), 'module.exports = 7;');
+});
+
+test('local install refuses lifecycle scripts without publishing', async t => {
+  const dir = await fixture(t);
+  const bundle = await localBundle(t,
+    { name: 'with-script', version: '1.0.0', scripts: { install: 'echo hi' } },
+    { 'index.js': 'module.exports = 1;' });
+  const tx = beginTransaction(dir);
+  const result = await runProfileOperation({ dir }, ['add', bundle], opts(packages({})));
+  assert.equal(result.exitCode, 1);
+  assert.match(result.output, /生命周期脚本/);
+  assert.deepEqual(JSON.parse(await readFile(join(dir, 'package.json'))).dependencies, {});
+  assert.deepEqual(await readdir(join(dir, '.plugin-manager/ohos/generations')), []);
+  tx.finish(false);
 });

@@ -1,6 +1,6 @@
 import { isUtf8 } from 'node:buffer';
 import { isRgFilesystemError, rgDiagnostic, selectRgFiles, validateRgGlobs } from './rg-select.mjs';
-const unsupported = detail => ({ stdout: '', stderr: `rg: 鸿蒙本机尚不支持${detail}，可以连接电脑执行\n`, exitCode: 2 });
+const unsupported = detail => ({ stdout: '', stderr: `rg: 本机尚不支持${detail}，可以连接电脑执行\n`, exitCode: 2 });
 const flags = new Set(['--files', '--json', '--no-ignore', '--hidden', '--case-sensitive', '--ignore-case', '-i', '-s', '-n', '--line-number', '-F', '--fixed-strings', '--text', '-a']);
 // UTF-8 字节预算：先检查，再展开为 RE2JS 的 number[]；不降低原 JSON 输出预算。
 const maxJsonLineBytes = 4 * 1024 * 1024;

@@ -1,6 +1,8 @@
+import { statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { createRegistry, parseRegistrySpec } from './registry.mjs';
+import { createRegistry, localDirectoryPath, parseRegistrySpec } from './registry.mjs';
 import { runProfileOperation } from './installer.mjs';
 import { beginTransaction, recoverProfile, transactionFor } from './store.mjs';
 import { installPluginResolution } from './resolution.mjs';
@@ -15,7 +17,10 @@ export function createPluginBackend({ fetchImpl = globalThis.fetch } = {}) {
     restore(dir) { transactionFor(dir).rollbackAttempt(); },
     registry() { return 'https://registry.npmjs.org/'; },
     accepts(spec) {
-      try { parseRegistrySpec(spec); return true; } catch { return false; }
+      try { parseRegistrySpec(spec); return true; } catch { /* fall through to local */ }
+      const path = localDirectoryPath(spec);
+      if (path === null || !isAbsolute(path)) return false;
+      try { return statSync(path).isDirectory(); } catch { return false; }
     },
     async view(dir, spec, options) {
       try {

@@ -339,8 +339,8 @@
           "before": "eb73911bd27c3730bf5d70b9cf7193fff5cb301984f981b6e91edff33c2a8592"
         },
         "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
-          "after": "7caff988b77c08a3da2b31f1d0c05dd2ad372af58c0bdd1a8d5a43a461da1c10",
-          "before": "373ed95b0a5ee0aabdd5a0fb5c15c2b4163bbee41edf67c436dafaa8fb7e79e0"
+          "before": "74ba4a86057158d6c0e4fb6b0f762f462e03ca9fd145a6da24ec41daaf39bee1",
+          "after": "779c9958c0a2c5680124122201ce5b76707682e7fd557a330161158d021f47de"
         }
       }
     },
@@ -375,8 +375,8 @@
     "ohos-plugin-remove-rollback.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
-          "after": "c48a0946ae9639be69b66fa079393def779e78cd6b4299b6c53fb5bf53a43164",
-          "before": "7caff988b77c08a3da2b31f1d0c05dd2ad372af58c0bdd1a8d5a43a461da1c10"
+          "before": "779c9958c0a2c5680124122201ce5b76707682e7fd557a330161158d021f47de",
+          "after": "20566c2420a37ac9612cd84ab02685d129adf83b5816e410081a504d9a896eef"
         }
       }
     },
@@ -1781,8 +1781,8 @@
     "zzzzzzzzzzz-ohos-search-ignore-description.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js": {
-          "after": "42ab78974030a7287b73d02700a914225fb3cfad0fc7dc8d62b35d66864ea3ee",
-          "before": "d73a434a74ee2a74aa2f0662350cd95c8211bf852ea17a24bc378a0bf871746e"
+          "before": "d73a434a74ee2a74aa2f0662350cd95c8211bf852ea17a24bc378a0bf871746e",
+          "after": "fb54f5b02a2cf9e6e854991c9da25dad72509503ef8fe70a897b3b40af467974"
         }
       }
     },
@@ -1865,8 +1865,8 @@
           "before": "f9a79fd5194bb4d6321e6d2d5b5eb72f99c683452e1defbb75fad52f76aed667"
         },
         "node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js": {
-          "after": "ffdac06d530134e35a4ea2182f09ace344fcf48e2fa0e312419f69e3e73db255",
-          "before": "42ab78974030a7287b73d02700a914225fb3cfad0fc7dc8d62b35d66864ea3ee"
+          "before": "fb54f5b02a2cf9e6e854991c9da25dad72509503ef8fe70a897b3b40af467974",
+          "after": "90cbd72ba0e1f7ed61a8379b5e0e9ddadaaaf509a7bb4d553ccfaaf1ede420d4"
         },
         "node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js": {
           "after": "541f5c565369f4a7cf9e6df8bfc380341e0727e4dde8ddf5333d6caf2719d830",
@@ -1877,12 +1877,12 @@
     "zzzzzzzzzzzzz-ohos-plugin-install-refusal.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
-          "after": "05d053691fec7658d22e2f59a1cc6ccc0cb71b9c4803e48f523e10cd119a5fcb",
-          "before": "b3aae8aed987887d9c43c1f9c0ddd0c70e69d084fc35780589dd2d59fdfafe76"
+          "before": "b3aae8aed987887d9c43c1f9c0ddd0c70e69d084fc35780589dd2d59fdfafe76",
+          "after": "6ad36621c592d5a817adccadf661aa1f0507d23bbb4d33da75fc4336f90354d2"
         },
         "node_modules/@deepseek-ai/dsh-plugin-manager/lib/types/operations.js": {
-          "after": "7cad04583f2f3b68375acf06b6e9cfb5ff746fb5177a4f69c4e5269fdd355650",
-          "before": "c7d72b35b81443a16f6a57f91087ba2f88812d0e5db7b9cdf131d852adcff9c8"
+          "before": "c7d72b35b81443a16f6a57f91087ba2f88812d0e5db7b9cdf131d852adcff9c8",
+          "after": "005b5e07edd52d085236361a5fa424e0fb491793ea164951f2d2c385d2741606"
         }
       }
     },
@@ -1921,16 +1921,16 @@
     "zzzzzzzzzzzzzz-ohos-plugin-packages.diff": {
       "0.2.2-rc.1": {
         "node_modules/@deepseek-ai/dsh-app-boot/lib/index.js": {
-          "after": "eb73911bd27c3730bf5d70b9cf7193fff5cb301984f981b6e91edff33c2a8592",
-          "before": "0efe3b6c4be30e101982c0740b55d3e035fb754e32ad366a197a9b7ec5be6cdb"
+          "before": "0efe3b6c4be30e101982c0740b55d3e035fb754e32ad366a197a9b7ec5be6cdb",
+          "after": "eb73911bd27c3730bf5d70b9cf7193fff5cb301984f981b6e91edff33c2a8592"
         },
         "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
-          "after": "373ed95b0a5ee0aabdd5a0fb5c15c2b4163bbee41edf67c436dafaa8fb7e79e0",
-          "before": "05d053691fec7658d22e2f59a1cc6ccc0cb71b9c4803e48f523e10cd119a5fcb"
+          "before": "6ad36621c592d5a817adccadf661aa1f0507d23bbb4d33da75fc4336f90354d2",
+          "after": "74ba4a86057158d6c0e4fb6b0f762f462e03ca9fd145a6da24ec41daaf39bee1"
         },
         "node_modules/@deepseek-ai/dsh/lib/profile-boot-e2mS45fC.js": {
-          "after": "5554f9d72f9095c627980344cdaddd064a0db9a429483110b1985043bffdf3f3",
-          "before": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c"
+          "before": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+          "after": "5554f9d72f9095c627980344cdaddd064a0db9a429483110b1985043bffdf3f3"
         }
       }
     },
