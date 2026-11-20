@@ -99,8 +99,13 @@ EDITS = {'runtime/ohos/process/index.mjs': (('  get temporaryRoot() { return thi
                                       'const filesystem = executionFilesystem(roots, policy, '
                                       'workerData.iosGuestTemporaryRoot ? [{ mountPoint: "/tmp", root: '
                                       'workerData.iosGuestTemporaryRoot }] : []);')),
- 'runtime/ohos/process/runtime.mjs': (('    if (policy.mode !== \'read-only\' && policy.mode !== \'workspace-write\') throw new Error(\'非法的受限运行模式\');',
-                                        '    if (policy.mode !== \'read-only\' && policy.mode !== \'workspace-write\' && !(policy.mode === \'danger-full-access\' && this.#guest)) throw new Error(\'非法的受限运行模式\');'),
+ 'runtime/ohos/process/runtime.mjs': (# 2026-11-21: the old pair 0 that rewrote prepare()'s policy check
+                                       # (danger-full-access only when this.#guest) is removed on purpose.
+                                       # The base prepare() now accepts danger-full-access outright
+                                       # (2026-11-20 agent-bash fix, verified by probe); re-adding a
+                                       # #guest-gated rewrite here would both fail its anchor and
+                                       # narrow that fix back. Restore only if the base check is
+                                       # ever tightened again, and re-check the phone path first.
                                        ('  #createOwnedGitServer;',
                                        '  #createOwnedGitServer;\n'
                                        '  #guest;\n'

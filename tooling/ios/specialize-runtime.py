@@ -63,30 +63,30 @@ ISH_BRIDGE_PRELOAD = (
 # Keep platform diagnostics local to the iOS output; each exact edit must match once.
 DIAGNOSTIC_EDITS = {
     'runtime/ohos/process/rg.mjs': (
-        ('rg: 鸿蒙本机尚不支持', 'rg: iOS 本机尚不支持'),
+        ('rg: 本机尚不支持', 'rg: iOS 本机尚不支持'),
     ),
     'runtime/ohos/process/commands.mjs': (
-        ('这个命令在鸿蒙本机不可用，可以连接电脑执行', '这个命令在 iOS 本机不可用，可以连接电脑执行'),
+        ('这个命令在本机不可用，可以连接电脑执行', '这个命令在 iOS 本机不可用，可以连接电脑执行'),
     ),
     'runtime/ohos/process/git.mjs': (
-        ('这个命令在鸿蒙本机不可用，可以连接电脑执行', '这个命令在 iOS 本机不可用，可以连接电脑执行'),
+        ('这个命令在本机不可用，可以连接电脑执行', '这个命令在 iOS 本机不可用，可以连接电脑执行'),
         ('(OHOS subset)', '(iOS subset)'),
     ),
     'runtime/ohos/process/rg-select.mjs': (
-        ('遍历检查超过鸿蒙本机上限', '遍历检查超过 iOS 本机上限'),
-        ('候选文件数超过鸿蒙本机上限', '候选文件数超过 iOS 本机上限'),
+        ('遍历检查超过本机上限', '遍历检查超过 iOS 本机上限'),
+        ('候选文件数超过本机上限', '候选文件数超过 iOS 本机上限'),
     ),
     'runtime/ohos/process/runtime.mjs': (
         ("import { randomUUID } from 'node:crypto';", "import { randomUUID } from 'node:crypto';\nimport { workerEnvironment } from '../../ios/process/worker-env.mjs';\nimport { ishSpawnFor, ishSpawnTerminalFor } from '../../ios/process/ish-adapter.mjs';"),
         ("          const workerEnv = { ...env };", "          const workerEnv = workerEnvironment(env);"),
-        ("prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
+        ("prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('虚拟进程服务已关闭')", "prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
         # dsh-go iSH guest: delegate PTY terminals to the guest. Replaces
         # the old string-only edit: the fallback keeps the iOS message.
         # (N-2) the caller-attached policy travels with the terminal
         # (spec.policy); only a read-only policy is refused server-side.
         # Without one the terminal is the user's own keystrokes and is
         # not policy-constrained.
-        ("  async spawnTerminal() {\n    throw Object.assign(new Error('鸿蒙本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }",
+        ("  async spawnTerminal() {\n    throw Object.assign(new Error('本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }",
          "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec, spec?.policy);\n    if (ish) return ish;\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }"),
         # dsh-go iSH guest: delegate agent bash to the guest. The ticket
         # unwrap above has already run; ishSpawnFor returns undefined
@@ -100,9 +100,9 @@ DIAGNOSTIC_EDITS = {
         # hasActiveWork() sees the running bash instead of idle.
         ("    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];",
          "    const ishHandle = ishSpawnFor(argv, spec, { temporaryRoot: this.temporaryRoot, onSpillFailure: this.onSpillFailure, policy, concurrent: this.#concurrent });\n    if (ishHandle) { this.live.add(ishHandle); ishHandle.done.then(() => this.live.delete(ishHandle), () => this.live.delete(ishHandle)); return ishHandle; }\n    const lane = this.#concurrent ? { queue: [] } : this.lanes[commandName(argv[0]) === 'rg' ? 'search' : 'execution'];"),
-        ("spawn(spec) {\n    if (this.closed) throw new Error('鸿蒙虚拟进程服务已关闭')", "spawn(spec) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
-        ('无效或已使用的鸿蒙执行票据', '无效或已使用的 iOS 执行票据'),
-        ('鸿蒙虚拟进程临时根的身份已改变，拒绝删除替换目录', 'iOS 虚拟进程临时根的身份已改变，拒绝删除替换目录'),
+        ("spawn(spec) {\n    if (this.closed) throw new Error('虚拟进程服务已关闭')", "spawn(spec) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
+        ('无效或已使用的执行票据', '无效或已使用的 iOS 执行票据'),
+        ('虚拟进程临时根的身份已改变，拒绝删除替换目录', 'iOS 虚拟进程临时根的身份已改变，拒绝删除替换目录'),
     ),
     # (N-2) the agent terminal caller attaches the policy it resolves
     # to the spawnTerminal spec, so the iOS loopback can refuse a
@@ -122,11 +122,11 @@ DIAGNOSTIC_EDITS = {
         ('OS child processes are unavailable on OpenHarmony; use the virtual runtime or a remote service.', 'OS child processes are unavailable on iOS; use the virtual runtime or a remote service.'),
     ),
     'runtime/ohos/process/index.mjs': (
-        ('鸿蒙虚拟进程后端只能由鸿蒙 profile 或仿真显式启用', 'iOS 虚拟进程后端只能由 iOS profile 或仿真显式启用'),
-        ('鸿蒙虚拟进程无法保留完整输出', 'iOS 虚拟进程无法保留完整输出'),
+        ('虚拟进程后端只能由本机 profile 或仿真显式启用', 'iOS 虚拟进程后端只能由 iOS profile 或仿真显式启用'),
+        ('虚拟进程无法保留完整输出', 'iOS 虚拟进程无法保留完整输出'),
     ),
     'runtime/ohos/process/sandbox.mjs': (
-        ('鸿蒙沙箱后端只能由鸿蒙 profile 或仿真显式启用', 'iOS 沙箱后端只能由 iOS profile 或仿真显式启用'),
+        ('沙箱后端只能由本机 profile 或仿真显式启用', 'iOS 沙箱后端只能由 iOS profile 或仿真显式启用'),
     ),
     'runtime/ohos/publication/index.mjs': (
         ('OpenHarmony publication requires Node', 'iOS publication requires Node'),
@@ -154,7 +154,7 @@ DIAGNOSTIC_EDITS = {
     ),
     'node_modules/@deepseek-ai/dsh-tool-fs-search/lib/index.js': (
         ('鸿蒙搜索需要提供受限执行票据的 subprocess 后端', 'iOS 搜索需要提供受限执行票据的 subprocess 后端'),
-        ('鸿蒙本机不读取全局 gitignore 或 core.excludesFile', 'iOS 本机不读取全局 gitignore 或 core.excludesFile'),
+        ('本机不读取全局 gitignore 或 core.excludesFile', 'iOS 本机不读取全局 gitignore 或 core.excludesFile'),
     ),
     'node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js': (
         ('OpenHarmony publication preload is required', 'iOS publication preload is required'),
@@ -173,10 +173,10 @@ DIAGNOSTIC_EDITS = {
         ('鸿蒙本机不提供 Sherpa 语音模型', 'iOS 本机不提供 Sherpa 语音模型'),
     ),
     'node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js': (
-        ('鸿蒙本机不支持安装、更新或卸载插件包', 'iOS 本机不支持安装、更新或卸载插件包'),
+        ('本机不支持安装、更新或卸载插件包', 'iOS 本机不支持安装、更新或卸载插件包'),
     ),
     'node_modules/@deepseek-ai/dsh-plugin-manager/lib/types/operations.js': (
-        ('鸿蒙本机不支持安装、更新或卸载插件包', 'iOS 本机不支持安装、更新或卸载插件包'),
+        ('本机不支持安装、更新或卸载插件包', 'iOS 本机不支持安装、更新或卸载插件包'),
     ),
     'runtime/ohos/process/git-index.mjs': (
         ('OHOS Git currently supports index version 2 and 3', 'iOS Git currently supports index version 2 and 3'),
