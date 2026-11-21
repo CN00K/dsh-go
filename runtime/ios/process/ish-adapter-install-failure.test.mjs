@@ -39,7 +39,10 @@ test('T-2: a throwing bridge install falls back to the virtual shell (once logge
     // A second call retries the install (partial state is not kept) and
     // still falls back instead of throwing.
     assert.equal(ishSpawnFor(['bash', '-c', 'echo hi'], spec(), options), undefined);
-    assert.equal(ishSpawnTerminalFor({ argv: ['bash'], cols: 80, rows: 24 }), undefined);
+    // The terminal entry no longer returns a silent undefined: the
+    // bridge failure is a visible declined result carrying the cause.
+    assert.deepEqual(ishSpawnTerminalFor({ argv: ['bash'], cols: 80, rows: 24 }),
+      { declined: 'bridge', detail: 'injected ish-bridge install failure' });
   } finally {
     console.error = originalError;
   }

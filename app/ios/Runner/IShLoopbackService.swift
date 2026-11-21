@@ -151,6 +151,22 @@ final class IShLoopbackService {
   private var startCalled = false
   private var startCount = 0
 
+  // #2 (wave 5): self-restart after a listener failure. `stopping`
+  // is set by stop() and cleared by an explicit start() — a restart
+  // scheduled before a stop must not fire after it. `restartAttempts`
+  // counts restarts since the last .ready (or explicit start); a
+  // restart firing does NOT reset it, so the 3-attempt cap holds
+  // across the backoff sequence. Who sets what: stop() sets
+  // stopping=true and restartAttempts=0; start() sets stopping=false
+  // and restartAttempts=0; the .failed handler increments
+  // restartAttempts when it schedules; .ready resets it to 0. If
+  // stopping is never cleared, no restart ever fires — which is
+  // exactly the stopped state; the next explicit start() clears it.
+  private var stopping = false
+  private var listenerRestartAttempts = 0
+  /// Backoff between listener restarts: 1s, 2s, 4s (max 3 restarts).
+  private static let listenerRestartDelays: [TimeInterval] = [1, 2, 4]
+
   /// Live PTY sessions by kernel session id (nil when none).
   /// Guarded by `queue`.
   private var ptySessions: [String: PTYSession] = [:]
@@ -229,6 +245,19 @@ final class IShLoopbackService {
   func start() {
     queue.async { [weak self] in
       guard let self else { return }
+      // Explicit start (ISHRuntime boot / reset recovery): re-arm
+      // restarts — a previous stop() must not suppress a fresh boot.
+      self.stopping = false
+      self.listenerRestartAttempts = 0
+      self.startOnQueue()
+    }
+  }
+
+  /// The start body; must run on `queue`. Split out so the .failed
+  /// self-restart can re-enter it without clearing `stopping` (a
+  /// stop() that lands between the schedule and the fire must still
+  /// suppress the restart — the fire checks `stopping` first).
+  private func startOnQueue() {
       if self.running { return }
       self.startCalled = true
       self.startCount += 1
@@ -257,6 +286,8 @@ final class IShLoopbackService {
             self.running = self.boundPort > 0
             if self.running {
               self.listenerState = "ready"
+              // A good bind clears the restart budget (see .failed).
+              self.listenerRestartAttempts = 0
               self.writeServiceFile(port: self.boundPort, token: token)
               NSLog("ish-loopback: listening on 127.0.0.1:\(self.boundPort)")
             } else {
@@ -268,10 +299,36 @@ final class IShLoopbackService {
         case .failed(let error):
           NSLog("ish-loopback: listener failed: \(error)")
           self.queue.async { [weak self] in
-            self?.running = false
-            self?.boundPort = 0
-            self?.listenerState = "failed"
-            self?.lastErrorText = "\(error)"
+            guard let self else { return }
+            self.running = false
+            self.boundPort = 0
+            self.listenerState = "failed"
+            self.lastErrorText = "\(error)"
+            // The failed listener is dead; drop it so the restart (or
+            // the next explicit start) builds a fresh one.
+            self.listener = nil
+            // #2 (wave 5): restart the listener with backoff. JS
+            // cannot restart it — it only reads ish-service.json —
+            // so a dead listener stayed dead until the next App-level
+            // start. No restart after an explicit stop(), and at most
+            // 3 attempts (1s/2s/4s); then it stays failed and the
+            // failure page reports it via diagnostics/startCount.
+            // This is listener-only: it never fires for a worker run
+            // timeout (Q1 wall clock / sweeper own that path).
+            if !self.stopping, self.listenerRestartAttempts < Self.listenerRestartDelays.count {
+              let delay = Self.listenerRestartDelays[self.listenerRestartAttempts]
+              self.listenerRestartAttempts += 1
+              let attempt = self.listenerRestartAttempts
+              NSLog("ish-loopback: restarting listener in \(delay)s (attempt \(attempt)/\(Self.listenerRestartDelays.count))")
+              self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                // stop() may have landed while waiting: respect it.
+                if self.stopping { return }
+                self.startOnQueue()
+              }
+            } else if !self.stopping {
+              NSLog("ish-loopback: listener restart attempts exhausted, giving up")
+            }
           }
         case .cancelled:
           self.queue.async { [weak self] in
@@ -296,7 +353,6 @@ final class IShLoopbackService {
         self?.accept(connection)
       }
       listener.start(queue: self.queue)
-    }
   }
 
   /// Stop listening, close all PTY sessions (kills their shells),
@@ -306,6 +362,11 @@ final class IShLoopbackService {
   func stop() {
     queue.async { [weak self] in
       guard let self else { return }
+      // #2 (wave 5): suppress any pending listener restart — an
+      // explicit stop means stopped, not "restart me". The pending
+      // asyncAfter fire checks this flag before re-entering start.
+      self.stopping = true
+      self.listenerRestartAttempts = 0
       for session in self.ptySessions.values {
         session.close(reason: "service stopped")
       }
@@ -1318,7 +1379,10 @@ extension HTTPConnection {
     // blocking worker creation: close() must be able to cancel a run
     // that is still starting, or a command aborted mid-start would run
     // to completion on the worker and block the session.
-    let session = WorkerSession(connection: self, nonce: nonce, sessionId: sessionId)
+    // Q1: the wall clock is armed in init (WorkerSession), so the window
+    // while worker creation blocks (up to 15 s) is covered too.
+    let session = WorkerSession(connection: self, nonce: nonce, sessionId: sessionId,
+                                timeout: TimeInterval(timeoutMs) / 1000.0)
     workerSession = session
     let shellCommand = Self.buildWorkerCommand(command: command, cwd: cwd, env: env, nonce: nonce)
     let baseEnvText = Self.buildBaseEnvExports(env: env)
@@ -1357,8 +1421,7 @@ extension HTTPConnection {
           return
         }
       }
-      session.attachWorker(worker!, commandText: shellCommand,
-                           timeout: TimeInterval(timeoutMs) / 1000.0)
+      session.attachWorker(worker!, commandText: shellCommand)
     }
   }
 
@@ -1434,6 +1497,11 @@ private final class WorkerSession {
   private var sawJobsEnd = false
   /// The worker died mid-run (its shell exited: `exit`, `exec`, kill).
   private var workerDied = false
+  /// The run was escalated to a worker kill because the foreground kill
+  /// could not finish it (no child to kill, or no END marker after the
+  /// grace): the guest task itself may be unkillable and leak until the
+  /// App restarts. Reported in the terminal frame (Q1).
+  private var rebuiltAfterUnkillableRun = false
   /// Wait-decoded exit code of the dead worker shell, if known.
   private var workerExitCode: Int?
   /// Inside a `jobs -l` block (lines are protocol, not output).
@@ -1445,10 +1513,15 @@ private final class WorkerSession {
   /// arming) is ignored.
   private var watchdogToken = 0
 
-  init(connection: HTTPConnection, nonce: String, sessionId: String) {
+  init(connection: HTTPConnection, nonce: String, sessionId: String, timeout: TimeInterval) {
     self.connection = connection
     self.nonce = nonce
     self.sessionId = sessionId
+    self.wallClockTimeout = timeout
+    // Q1: arm the wall clock here, not in attachWorker — worker creation
+    // can block up to 15 s with no timer running otherwise. GCD, so this
+    // fires even if the JS event loop (or the guest) is stuck.
+    queue.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.wallClockFired() }
   }
 
   deinit {
@@ -1462,13 +1535,12 @@ private final class WorkerSession {
   /// Called once, from any queue. If the client already disconnected,
   /// the command is never written (a cancelled command must not run
   /// and block the worker).
-  func attachWorker(_ worker: ISHWorkerShell, commandText: String, timeout: TimeInterval) {
+  func attachWorker(_ worker: ISHWorkerShell, commandText: String) {
     queue.async { [weak self] in
       guard let self, !self.finished, !self.cancelled else { return }
       self.worker = worker
       self.startedAt = Date()
       self.lastOutputAt = Date()
-      self.wallClockTimeout = timeout
       self.connection?.sendChunkedHeaders()
       // Death: the shell exited mid-run (`exit`, `exec`, eviction,
       // guest stop). Complete with the shell's exit code when known.
@@ -1479,7 +1551,6 @@ private final class WorkerSession {
         self?.queue.async { [weak self] in self?.onChunk(isStderr: isStderr, chunk: chunk) }
       }
       self.armWatchdog()
-      self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.wallClockFired() }
     }
   }
 
@@ -1620,7 +1691,16 @@ private final class WorkerSession {
     timedOut = true
     NSLog("ish-loopback: worker run hit the %.0fs wall clock; killing foreground command",
           wallClockTimeout)
-    if let worker { killCurrentCommandOrEscalate(worker: worker) }
+    guard let worker else {
+      // Q1: the worker never attached (still starting when the clock
+      // fired) — there is no foreground command to kill, so complete
+      // directly and release the slot instead of waiting for a worker
+      // that may never arrive. workerDied forces the bridge to rebuild
+      // the worker (and resend the cwd) on the next run.
+      completeRun(exitCode: -3, timedOut: true, cancelled: cancelled, workerDied: true)
+      return
+    }
+    killCurrentCommandOrEscalate(worker: worker)
   }
 
   private func armWatchdog() {
@@ -1666,6 +1746,10 @@ private final class WorkerSession {
 
   private func escalateToWorkerKill(worker: ISHWorkerShell) {
     guard !finished else { return }
+    // Q1: the foreground kill could not finish this run — remember it so
+    // the terminal frame says the worker was rebuilt after an
+    // unkillable run (the guest task itself may have leaked).
+    rebuiltAfterUnkillableRun = true
     NSLog("ish-loopback: worker run stuck, killing worker session %@", worker.sessionId)
     ISHShellExecutor.shared().stopWorker(forSession: worker.sessionId)
     // Backstop: if the death notice does not complete the run within
@@ -1701,6 +1785,12 @@ private final class WorkerSession {
     }
     if workerDied {
       frame["workerDied"] = true
+    }
+    if workerDied && rebuiltAfterUnkillableRun {
+      // Q1: the foreground kill could not finish this run (e.g. a guest
+      // task hung where signals cannot reach it) — the worker was
+      // rebuilt, but the guest task itself may have leaked.
+      frame["errorCode"] = "ISH_WORKER_REBUILT_AFTER_UNKILLABLE_RUN"
     }
     if let cwd = markerCwd {
       // The bridge already learns the cwd from the marker frame; this

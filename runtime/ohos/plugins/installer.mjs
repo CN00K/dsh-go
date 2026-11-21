@@ -104,7 +104,7 @@ export async function runProfileOperation(context, args, options) {
     if (!['add', 'remove'].includes(action) || typeof spec !== 'string' ||
         flags.some(flag => flag !== '--save-exact' && !/^--(?:config\.)?registry=/.test(flag)))
       throw registryError('Unsupported OHOS package operation');
-    const localPath = localDirectoryPath(spec);
+    const localPath = localDirectoryPath(spec, context.dir);
     let parsed = null;
     if (localPath !== null) {
       if (action === 'remove') throw registryError('Removal requires a package name');

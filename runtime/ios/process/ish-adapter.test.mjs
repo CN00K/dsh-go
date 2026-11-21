@@ -14,7 +14,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { ishSpawnFor } from './ish-adapter.mjs';
+import { ishSpawnFor, ishSpawnTerminalFor, ishFallbackTerminalFor } from './ish-adapter.mjs';
 import { ISH_RUNNER_COMMAND, invalidateServiceInfo } from './ish-bridge.mjs';
 
 const TOKEN = 'test-token-123';
@@ -57,6 +57,12 @@ async function startMockServer(handler) {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => handler(req, res, Buffer.concat(chunks)));
+  });
+  // A WS upgrade (GET /ish/pty) never reaches the 'request' handler:
+  // refuse it fast so a PTY handshake fails instead of hanging.
+  server.on('upgrade', (req, socket) => {
+    socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+    socket.end();
   });
   await new Promise((done) => server.listen(0, '127.0.0.1', done));
   const port = server.address().port;
@@ -241,4 +247,98 @@ test('B: ishSpawnFor forwards readOnly on the argv path and the denial flows', a
   } finally {
     await close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// #3: PTY declines are visible, and the line-buffered fallback terminal
+// runs on the session worker when the bridge cannot be installed.
+// ---------------------------------------------------------------------------
+
+/** Mock /ish/worker/run: echo the command as stdout, then the worker protocol lines. */
+function replyWorkerRun(res, body) {
+  const parsed = JSON.parse(body.toString('utf8'));
+  const nonce = parsed.nonce;
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+  res.write(JSON.stringify({ stream: 'stdout', line: `out:${parsed.command}` }) + '\n');
+  res.write(JSON.stringify({ stream: 'stderr', line: `__DSH_JOBS_BEGIN__${nonce}` }) + '\n');
+  res.write(JSON.stringify({ stream: 'stderr', line: `__DSH_JOBS_END__${nonce}` }) + '\n');
+  res.write(JSON.stringify({ stream: 'stderr', line: `__DSH_JOBPIDS_BEGIN__${nonce}` }) + '\n');
+  res.write(JSON.stringify({ stream: 'stderr', line: `__DSH_JOBPIDS_END__${nonce}` }) + '\n');
+  res.write(JSON.stringify({ stream: 'stderr', line: `__DSH_END__${nonce}:0:/home/workspace` }) + '\n');
+  res.write(JSON.stringify({ exitCode: 0, durationMs: 5 }) + '\n');
+  res.end();
+}
+
+test('#3: ishSpawnTerminalFor returns {handle} for bash and {declined, detail} otherwise', async () => {
+  const { server, port, close } = await startMockServer((req, res) => {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not_found' }));
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({ host: '127.0.0.1', port, token: TOKEN }));
+    invalidateServiceInfo();
+    const ok = ishSpawnTerminalFor({ argv: ['bash'], cols: 80, rows: 24 });
+    assert.ok(ok.handle, 'bash must resolve to a handle');
+    assert.ok(ok.handle.done instanceof Promise, 'done must be a real promise, never undefined');
+    await ok.handle.terminate();
+    await ok.handle.done;
+    assert.deepEqual(ishSpawnTerminalFor({ argv: ['node'] }),
+      { declined: 'argv', detail: 'terminal argv[0] is node, not bash/sh' });
+    assert.deepEqual(ishSpawnTerminalFor({}),
+      { declined: 'argv', detail: 'terminal argv is missing or empty' });
+  } finally {
+    await close();
+  }
+});
+
+test('#3 fallback: a line-buffered terminal runs buffered lines on the worker session', async () => {
+  let runs = 0;
+  const seenCommands = [];
+  const { server, port, close } = await startMockServer((req, res, body) => {
+    if (req.url !== '/ish/worker/run') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not_found' }));
+      return;
+    }
+    runs++;
+    seenCommands.push(JSON.parse(body.toString('utf8')).command);
+    replyWorkerRun(res, body);
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({ host: '127.0.0.1', port, token: TOKEN }));
+    invalidateServiceInfo();
+    const terminal = ishFallbackTerminalFor({ argv: ['bash'], cols: 80, rows: 24, cwd: WORKSPACE_CWD });
+    assert.ok(terminal.done instanceof Promise, 'done must be a real promise, never undefined');
+    const stdout = collect(terminal.output);
+    // Partial input is buffered until the newline completes the line.
+    await terminal.write('ec');
+    await terminal.write('ho hi\n');
+    await terminal.write('echo second\n');
+    for (let i = 0; i < 200 && !stdout().includes('out:echo second'); i++) await new Promise(done => setTimeout(done, 5));
+    assert.deepEqual(seenCommands, ['echo hi', 'echo second']);
+    assert.equal(runs, 2, 'each completed line runs exactly once');
+    assert.ok(stdout().includes('echo hi\n'), `the submitted line is echoed; saw ${JSON.stringify(stdout())}`);
+    assert.ok(stdout().includes('out:echo hi\n'), `worker output streams; saw ${JSON.stringify(stdout())}`);
+    assert.ok(stdout().includes('out:echo second\n'));
+    // resize is a no-op and does not throw.
+    await terminal.resize(100, 40);
+    await terminal.terminate();
+    assert.deepEqual(await terminal.done, { exitCode: null, signal: 'SIGTERM' });
+    await assert.rejects(terminal.write('echo late\n'), /terminal process has exited/);
+  } finally {
+    await close();
+  }
+});
+
+test('#3 fallback: a dead loopback ends the terminal with the reason on its output', async () => {
+  invalidateServiceInfo();
+  writeFileSync(canonicalServiceFile, JSON.stringify({ host: '127.0.0.1', port: 1, token: TOKEN }));
+  invalidateServiceInfo();
+  const terminal = ishFallbackTerminalFor({ argv: ['bash'], cols: 80, rows: 24, cwd: WORKSPACE_CWD });
+  const stdout = collect(terminal.output);
+  await terminal.write('echo hi\n');
+  assert.deepEqual(await terminal.done, { exitCode: 1, signal: null });
+  assert.match(stdout(), /ish: /);
 });

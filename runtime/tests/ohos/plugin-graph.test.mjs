@@ -68,7 +68,9 @@ test('optional overrides ordinary dependency; explicit platform exclusion record
   const { client } = fixture({ root: { '1.0.0': pkg('root', '1.0.0', {
     dependencies: { dep: '1' }, optionalDependencies: { dep: '2', linux: '1' },
   }) }, dep: { '2.0.0': pkg('dep', '2.0.0') },
-  linux: { '1.0.0': pkg('linux', '1.0.0', { os: ['linux'], scripts: { install: 'native' } }) } });
+  // guest 平台是 linux：os:['linux'] 不再是排除条件，改用 darwin
+  // 保留“显式平台排除仍被记录”的原意图。
+  linux: { '1.0.0': pkg('linux', '1.0.0', { os: ['darwin'], scripts: { install: 'native' } }) } });
   const graph = await resolveGraph({ spec: 'root', registryClient: client });
   assert.equal(graph.nodes[0].dependencies.dep.id, 'dep@2.0.0');
   assert.match(graph.nodes[0].omitted.linux, /platform/);

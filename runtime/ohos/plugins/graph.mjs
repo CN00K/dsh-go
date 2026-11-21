@@ -10,7 +10,7 @@ export function fields(manifest, name) {
   return value;
 }
 function compatiblePlatform(manifest) {
-  for (const [field, current] of [['os', 'openharmony'], ['cpu', 'arm64']]) {
+  for (const [field, current] of [['os', 'linux'], ['cpu', 'arm64']]) {
     if (manifest[field] === undefined) continue;
     const values = manifest[field];
     if (!Array.isArray(values) || values.some(v => typeof v !== 'string'))

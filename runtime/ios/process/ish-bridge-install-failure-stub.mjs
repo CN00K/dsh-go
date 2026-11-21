@@ -8,6 +8,15 @@ export function installIshBridge() {
 export function spawnIshExec() {
   throw new Error('ish-bridge stub: spawnIshExec must not run');
 }
+export function ishWorkerExec() {
+  throw new Error('ish-bridge stub: ishWorkerExec must not run');
+}
+export function nextSyntheticPid() {
+  throw new Error('ish-bridge stub: nextSyntheticPid must not run');
+}
+export function toGuest() {
+  throw new Error('ish-bridge stub: toGuest must not run');
+}
 export function ishPtySpawn() {
   throw new Error('ish-bridge stub: ishPtySpawn must not run');
 }

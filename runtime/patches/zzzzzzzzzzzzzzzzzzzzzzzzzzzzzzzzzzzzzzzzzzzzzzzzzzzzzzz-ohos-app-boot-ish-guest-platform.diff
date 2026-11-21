@@ -1,0 +1,34 @@
+# DSH 0.2.2-rc.1: bundle platform checks in app-boot judge against the iSH guest (linux) when the bridge is installed. (#5)
+--- a/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js
+@@ -1439,6 +1439,12 @@
+ function ohosPluginResolution() {
+ 	return process.platform === "openharmony" ? globalThis[Symbol.for("dsh.go.ohos.plugin-resolution")] : void 0;
+ }
++// dsh-go: same probe as plugin-manager's isIshHost (kept local: the two
++// packages must not import each other's internals). Bundles activate in
++// the iSH guest, whose platform is linux.
++function isIshHost() {
++	return globalThis[Symbol.for("dsh.ish.pty")] !== void 0;
++}
+ function linkedProfileRoots(profile, profilesDir) {
+ 	const modules = join(profile.dir, "node_modules");
+ 	const links = symlinksUnder(modules);
+@@ -1811,7 +1817,7 @@
+ 		const bundleManifest = readProfileManifest(binName, packageDir);
+ 		const bundle = bundleManifest.dsh?.bundle;
+ 		if (bundle === void 0) throw new Error(`${binName}: profile bundle ${JSON.stringify(packageName)} declares no dsh.bundle in its package.json`);
+-		assertBundlePlatform(bundle.platforms, process.platform);
++		assertBundlePlatform(bundle.platforms, isIshHost() ? "linux" : process.platform);
+ 		const issue = evaluatePluginCompatibility(bundleManifest, exemptions);
+ 		if (issue !== void 0 && !issue.exempted) throw new Error(pluginCompatibilityWarning(issue));
+ 		const patchPaths = bundlePatchPaths(packageDir, bundle);
+@@ -2008,7 +2014,7 @@
+ 	const previous = after.manifest.dsh?.profile?.bundles ?? [];
+ 	const bundles = previous.filter((name) => !(beforeNames.has(name) || afterNames.has(name)) || bundleNames.has(name));
+ 	for (const dependency of after.dependencies) if (dependency.bundle && !disabled.has(dependency.name) && !bundles.includes(dependency.name)) {
+-		assertBundlePlatform(bundleManifest(options, dependency.name)?.dsh?.bundle?.platforms, process.platform);
++		assertBundlePlatform(bundleManifest(options, dependency.name)?.dsh?.bundle?.platforms, isIshHost() ? "linux" : process.platform);
+ 		bundles.push(dependency.name);
+ 	}
+ 	return {

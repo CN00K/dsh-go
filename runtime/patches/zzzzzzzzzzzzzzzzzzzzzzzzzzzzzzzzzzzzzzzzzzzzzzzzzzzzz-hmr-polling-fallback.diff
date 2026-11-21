@@ -1,0 +1,113 @@
+# DSH 0.2.2-rc.1: Q2 polling fallback for dsh-hmr (dsh-go): probe whether fs.watch delivers events and fall back to 500ms chokidar polling where inotify is silent.
+--- a/node_modules/@deepseek-ai/dsh-hmr/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-hmr/lib/index.js
+@@ -5,7 +5,7 @@
+ import { realpath, stat } from "node:fs/promises";
+ import { watch } from "chokidar";
+ import { Inject, Service } from "@deepseek-ai/cordis";
+-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
++import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, watch as fsWatch } from "node:fs";
+ import { PROFILE_PATCH_FILENAME, readProfileManifest, readProfilePatches, recomposeProfile } from "@deepseek-ai/dsh-app-boot";
+ import { codeFrameColumns } from "@babel/code-frame";
+ import { isUtf8 } from "node:buffer";
+@@ -36,6 +36,66 @@
+ 	}
+ }
+ /**
++* Probe whether fs.watch delivers events under baseDir. chokidar uses inotify
++* on Linux; where inotify is unavailable (iSH guest kernel) it fails silently
++* (ready still fires, no events), so watchers never reload. The probe watches
++* a fresh temp dir, writes a file, and waits 1500ms for an event.
++* @param baseDir - Directory whose watch backend is probed.
++* @param watchImpl - fs.watch implementation; tests pass a fake,
++* production callers use the default (the real fs.watch).
++* @returns Whether polling is needed (true only if no event arrived
++* within 1500ms; errors and other probe failures mean "no polling").
++* Never throws:
++* probe failure means "no polling", so normal environments keep working.
++*/
++const pollingProbeCache = /* @__PURE__ */ new Map();
++async function detectPollingNeeded(baseDir, watchImpl = fsWatch) {
++	const cached = pollingProbeCache.get(baseDir);
++	if (cached !== void 0) return cached;
++	const probed = (async () => {
++		let dir;
++		let watcher;
++		try {
++			dir = mkdtempSync(join(baseDir, ".dsh-hmr-poll-probe-"));
++			watcher = watchImpl(dir);
++			// Only a silent timeout means polling is needed: an error is a
++			// probe failure, and a failed probe means "no polling", so normal
++			// environments keep their existing behaviour.
++			const outcome = await new Promise((resolve) => {
++				let timer;
++				const done = (value) => {
++					clearTimeout(timer);
++					resolve(value);
++				};
++				// Creating a file reports "rename"; modifying one "change".
++				watcher.once("change", () => done("event"));
++				watcher.once("rename", () => done("event"));
++				watcher.once("error", () => done("error"));
++				timer = setTimeout(() => done("timeout"), 1500);
++				writeFileSync(join(dir, "probe.txt"), "probe");
++			});
++			return outcome === "timeout";
++		} catch {
++			return false;
++		} finally {
++			watcher?.close();
++			if (dir !== void 0) {
++				try {
++					rmSync(dir, { recursive: true, force: true });
++				} catch { /* Probe cleanup is best-effort. */ }
++			}
++		}
++	})();
++	pollingProbeCache.set(baseDir, probed);
++	return probed;
++}
++let pollingFallbackWarned = false;
++function warnPollingFallbackOnce(logger, dir) {
++	if (pollingFallbackWarned) return;
++	pollingFallbackWarned = true;
++	logger.warn("[dsh-hmr] fs.watch delivers no events under %s; falling back to 500ms polling (inotify unavailable)", dir);
++}
++/**
+ * Watch one patch path and its parent chain without subscribing to sibling files or directories.
+ * Missing parents are observed as they appear; refresh callbacks run serially.
+ * @param ctx Context that owns watcher disposal and receives refresh failures.
+@@ -52,9 +112,14 @@
+ 	registrations.set(ctx, paths);
+ 	if (paths.has(target.filename)) throw new Error(`config path already registered: ${filename}`);
+ 	const { cwd: _cwd, ignored: _ignored, ...watchOptions } = options;
++	// Q2 (dsh-go): where fs.watch delivers no events (inotify unavailable),
++	// chokidar fails silently; fall back to 500ms polling for this watcher.
++	const polling = await detectPollingNeeded(target.root);
++	if (polling) warnPollingFallbackOnce(ctx.logger, target.root);
+ 	const watcher = watch(target.root, {
+ 		awaitWriteFinish: true,
+ 		...watchOptions,
++		...(polling ? { usePolling: true, interval: 500, binaryInterval: 500 } : {}),
+ 		depth: target.depth,
+ 		ignoreInitial: false,
+ 		ignored: (path) => {
+@@ -880,8 +945,12 @@
+ 			const watchBaseDir = realpathSync(this.baseDir);
+ 			if (mainJob) this.externals = await loadDependencies(mainJob);
+ 			else this.externals = /* @__PURE__ */ new Set();
++			// Q2 (dsh-go): see watchConfig above; poll when fs.watch is silent.
++			const polling = await detectPollingNeeded(watchBaseDir);
++			if (polling) warnPollingFallbackOnce(this.ctx.logger, watchBaseDir);
+ 			this.watcher = watch(root, {
+ 				...this.config,
++				...(polling ? { usePolling: true, interval: 500, binaryInterval: 500 } : {}),
+ 				cwd: watchBaseDir,
+ 				ignored: (path) => match(relative(watchBaseDir, path)),
+ 				ignoreInitial: true
+@@ -1467,4 +1536,4 @@
+ 	return manifests;
+ }
+ //#endregion
+-export { Hmr as default };
++export { Hmr as default, detectPollingNeeded };

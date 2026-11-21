@@ -23,11 +23,12 @@
 // runtime rejects the spawn explicitly instead of running it in the
 // guest default directory. See ENGINE_HOOK.md.
 import { basename } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { OutputCollector } from '@deepseek-ai/dsh-subprocess-local/output';
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess';
 import { isLogicalWorkspacePath } from '../../ohos/process/files/process-authority.mjs';
-import { ISH_RUNNER_COMMAND, spawnIshExec, ishPtySpawn, installIshBridge } from './ish-bridge.mjs';
+import { ISH_RUNNER_COMMAND, spawnIshExec, ishPtySpawn, ishWorkerExec, installIshBridge, nextSyntheticPid, toGuest } from './ish-bridge.mjs';
 
 const ISH_PTY_SYMBOL = Symbol.for('dsh.ish.pty');
 
@@ -39,19 +40,21 @@ const ISH_PTY_SYMBOL = Symbol.for('dsh.ish.pty');
 // first use, in the calling thread; the guard keeps each thread to a
 // single install. (T-2) installIshBridge is documented as never
 // throwing, but nothing in its body guarantees that: if it does throw,
-// catch it here, log it once, and report "not installed" so the caller
-// falls back to the virtual implementation instead of seeing an
-// exception escape spawn.
+// catch it here, log it once, and keep the message in
+// bridgeInstallDetail so the caller can report why the bridge is
+// unavailable instead of silently falling back.
 let bridgeInstallFailed = false;
+let bridgeInstallDetail = null;
 const bridgeInstalled = () => globalThis[ISH_PTY_SYMBOL] !== undefined;
 const ensureBridge = () => {
   if (bridgeInstalled()) return true;
   try {
     installIshBridge();
   } catch (error) {
+    bridgeInstallDetail = error?.message ?? String(error);
     if (!bridgeInstallFailed) {
       bridgeInstallFailed = true;
-      console.error(`[ish-adapter] installIshBridge failed, falling back to the virtual shell: ${error?.message ?? error}`);
+      console.error(`[ish-adapter] installIshBridge failed, falling back to the virtual shell: ${bridgeInstallDetail}`);
     }
     return false;
   }
@@ -237,9 +240,11 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
 }
 
 /**
- * Adapt one interactive terminal spawn to the guest PTY, or return
- * undefined to let VirtualSubprocessRuntime.spawnTerminal throw
- * ERR_OHOS_PTY_UNAVAILABLE as in stock 1.1.1.
+ * Adapt one interactive terminal spawn to the guest PTY, or explain why
+ * not: { handle } on success, { declined: 'bridge' | 'argv', detail }
+ * otherwise. 'bridge' means installIshBridge() failed in this thread
+ * (detail is its message); 'argv' means the argv is not a guest shell.
+ * Callers never get a silent undefined to fall back from.
  *
  * Only the guest shell is a PTY terminal. ishPtySpawn ignores the host
  * argv (the service always spawns the guest shell) and ignores cwd/env:
@@ -267,15 +272,15 @@ export function ishSpawnFor(argv, spec, { temporaryRoot, onSpillFailure = () => 
  * a live terminal for inactivity.
  */
 export function ishSpawnTerminalFor(spec, policy) {
-  if (!ensureBridge()) return undefined;
+  if (!ensureBridge()) return { declined: 'bridge', detail: bridgeInstallDetail ?? 'installIshBridge failed in this thread' };
   const argv = spec?.argv;
-  if (!Array.isArray(argv) || !argv.length) return undefined;
+  if (!Array.isArray(argv) || !argv.length) return { declined: 'argv', detail: 'terminal argv is missing or empty' };
   const name = basename(argv[0]);
-  if (name !== 'bash' && name !== 'sh') return undefined;
+  if (name !== 'bash' && name !== 'sh') return { declined: 'argv', detail: `terminal argv[0] is ${name}, not bash/sh` };
   const readOnly = policy?.mode === 'read-only';
   const terminal = ishPtySpawn(argv[0], argv.slice(1),
     { cols: spec.cols, rows: spec.rows, ...(readOnly ? { readOnly: true } : {}) });
-  return adaptIshPtyTerminal(terminal, spec);
+  return { handle: adaptIshPtyTerminal(terminal, spec) };
 }
 function adaptIshPtyTerminal(terminal, spec) {
   const output = new PassThrough();
@@ -356,6 +361,120 @@ function adaptIshPtyTerminal(terminal, spec) {
     resize: async (cols, rows) => {
       if (exited) throw new Error('terminal process has exited');
       terminal.resize(cols, rows);
+    },
+    inspectActivity: async () => ({
+      state: exited ? 'idle' : 'unknown',
+      revision: activityRevision,
+    }),
+  };
+}
+
+/**
+ * Line-buffered pseudo-terminal fallback, used when the bridge cannot
+ * be installed in this thread (ishSpawnTerminalFor declined 'bridge').
+ * Same handle shape as adaptIshPtyTerminal — done is always a real
+ * promise, never undefined — driven by the session worker shell
+ * (ishWorkerExec, which needs only the loopback service file, not the
+ * installed bridge symbols): write() buffers input until a newline,
+ * then runs the line on the worker and streams its output. The
+ * submitted line is echoed first (the worker exec has no tty echo).
+ * resize is a no-op: there is no pty to resize. A command's own
+ * non-zero exit does not end the terminal; a transport failure (bridge
+ * down, service not booted) is written to the output and ends it.
+ */
+export function ishFallbackTerminalFor(spec, policy) {
+  const sessionId = randomUUID();
+  const output = new PassThrough();
+  const completion = Promise.withResolvers();
+  completion.promise.catch(() => {});
+  const abort = new AbortController();
+  let exited = false;
+  let activityRevision = 0;
+  let pending = '';
+  let stopSignal = null;
+  let queue = Promise.resolve();
+  const guestCwd = spec?.cwd ? toGuest(spec.cwd) ?? undefined : undefined;
+  const readOnly = policy?.mode === 'read-only';
+  const settle = (outcome) => {
+    if (exited) return;
+    exited = true;
+    activityRevision++;
+    spec.signal?.removeEventListener('abort', terminate);
+    output.end();
+    completion.resolve({
+      exitCode: outcome.signal == null ? (outcome.exitCode ?? null) : null,
+      signal: outcome.signal ?? null,
+    });
+  };
+  const runLine = async (line) => {
+    if (exited || line === '') return;
+    output.write(line + '\n');
+    try {
+      await ishWorkerExec({
+        sessionId, command: line,
+        ...(guestCwd ? { cwd: guestCwd } : {}),
+        ...(readOnly ? { readOnly: true } : {}),
+        signal: abort.signal,
+        onLine: (frame) => {
+          activityRevision++;
+          output.write(frame.line + '\n');
+        },
+      });
+    } catch (error) {
+      if (exited) return;
+      if (abort.signal.aborted) { settle({ exitCode: null, signal: stopSignal ?? 'SIGTERM' }); return; }
+      output.write(`ish: ${error?.message ?? error}\n`);
+      settle({ exitCode: 1, signal: null });
+    }
+  };
+  let cleanup;
+  const terminate = (signal) => {
+    if (cleanup !== undefined) return cleanup;
+    stopSignal = typeof signal === 'string' ? signal : 'SIGTERM';
+    cleanup = (async () => {
+      abort.abort();
+      settle({ exitCode: null, signal: stopSignal });
+      await completion.promise;
+    })();
+    cleanup.catch(() => {
+      cleanup = undefined;
+    });
+    return cleanup;
+  };
+  spec.signal?.addEventListener('abort', terminate, { once: true });
+  return {
+    pid: nextSyntheticPid(),
+    output,
+    done: completion.promise,
+    started: Promise.resolve(),
+    terminate,
+    waitForExit: async (signal) => {
+      if (exited) return true;
+      if (signal?.aborted) return false;
+      const interrupted = Promise.withResolvers();
+      const abortWait = () => interrupted.resolve(false);
+      signal?.addEventListener('abort', abortWait, { once: true });
+      try {
+        return await Promise.race([completion.promise.then(() => true), interrupted.promise]);
+      } finally {
+        signal?.removeEventListener('abort', abortWait);
+      }
+    },
+    // Nothing to kick: lines run when write() completes them.
+    start: () => {},
+    write: async (data) => {
+      if (exited) throw new Error('terminal process has exited');
+      pending += String(data);
+      let index;
+      while ((index = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, index);
+        pending = pending.slice(index + 1);
+        queue = queue.then(() => runLine(line), () => runLine(line));
+      }
+    },
+    // No pty exists to resize; the size is accepted and ignored.
+    resize: async () => {
+      if (exited) throw new Error('terminal process has exited');
     },
     inspectActivity: async () => ({
       state: exited ? 'idle' : 'unknown',

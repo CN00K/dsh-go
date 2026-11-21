@@ -38,6 +38,8 @@ import {
   getWorkerJobs,
   guestEnv,
   invalidateServiceInfo,
+  isConnectFailedError,
+  isStaleConnectionError,
   ishExec,
   ishPtySpawn,
   ishWebSocket,
@@ -1969,7 +1971,12 @@ test('IshPtyTerminal queues input written before the handshake completes (M-6)',
   }
 });
 
-test('ishWorkerExec surfaces a 409 as worker-busy without retrying (M-10)', async () => {
+// #1 (wave 5): a 409 is usually a stale slot, not another client —
+// the previous run settled JS-side while Swift still held the claim
+// (M-10's old "no retry" rule rested on the wrong reading). The
+// worker retries boundedly (3x, 50/200/800ms) and only surfaces
+// worker-busy when the slot is still held after that.
+test('ishWorkerExec retries a 409 three times, then surfaces worker-busy (#1)', async () => {
   clearWorkerState();
   let hits = 0;
   const {server, port, close} = await startMockServer((_req, res) => {
@@ -1979,14 +1986,149 @@ test('ishWorkerExec surfaces a 409 as worker-busy without retrying (M-10)', asyn
   });
   try {
     invalidateServiceInfo();
+    const start = Date.now();
     await assert.rejects(
       ishWorkerExec({command: 'ls', sessionId: 'sess-worker-busy', serviceFile: writeServiceFile(port)}),
       (error) => error.code === 'ish_worker_busy');
-    assert.equal(hits, 1, `409 must not be retried, server saw ${hits} requests`);
+    assert.equal(hits, 4, `409 must be retried 3 times (1 + 3), server saw ${hits} requests`);
+    assert.ok(Date.now() - start >= 800,
+      `409 backoff took ${Date.now() - start}ms, must wait out 50/200/800ms`);
   } finally {
     clearWorkerState();
     await close();
   }
+});
+
+test('ishWorkerExec succeeds when the slot clears on a 409 retry, running the command once (#1)', async () => {
+  clearWorkerState();
+  let posts = 0;
+  let executions = 0;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    posts += 1;
+    if (posts === 1) {
+      // Stale slot: refused before execution.
+      res.writeHead(409, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({error: 'worker_busy'}));
+      return;
+    }
+    executions += 1;
+    mockWorkerRunResponse(res, {nonce: JSON.parse(body.toString('utf8')).nonce});
+  });
+  try {
+    invalidateServiceInfo();
+    const result = await ishWorkerExec({
+      command: 'echo once', sessionId: 'sess-worker-busy-retry', serviceFile: writeServiceFile(port),
+      onLine: () => {},
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(posts, 2, 'the retry must re-POST exactly once');
+    assert.equal(executions, 1, 'the 409 refusal must not have executed the command');
+  } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+test('spawnIshExec keeps a busy worker distinct from a dead bridge (#1)', async () => {
+  clearExecCwdState();
+  clearWorkerState();
+  const urls = [];
+  const {server, port, close} = await startMockServer((req, res) => {
+    urls.push(req.url);
+    res.writeHead(409, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify({error: 'worker_busy'}));
+  });
+  try {
+    invalidateServiceInfo();
+    writeFileSync(canonicalServiceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    invalidateServiceInfo();
+    const child = spawnIshExec(
+      [ISH_RUNNER_COMMAND, '--', 'bash', '-c', 'echo hi'],
+      {cwd: join(fakeHome, 'workspace'), env: {DSH_SESSION_ID: 'sess-spawn-busy'}});
+    let stderr = '';
+    child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+    const outcome = await new Promise((done) => child.once('exit', (code, signal) => done({code, signal})));
+    assert.deepEqual(outcome, {code: 1, signal: null});
+    assert.match(stderr, /ish_worker_busy/, `busy stderr must name the busy code: ${stderr}`);
+    assert.doesNotMatch(stderr, /ish bridge unavailable/,
+      `busy must not be folded into bridge-unavailable: ${stderr}`);
+    assert.equal(urls.filter((u) => u === '/ish/worker/run').length, 4,
+      'the worker must see 1 + 3 busy retries');
+    assert.ok(!urls.includes('/ish/exec'), 'a busy worker must not fall back to one-shot');
+  } finally {
+    clearExecCwdState();
+    clearWorkerState();
+    await close();
+  }
+});
+
+// #2 (wave 5): ENOTCONN/EPIPE are dead-connection errors (stale set)
+// and pre-execution connect failures (retry set) — same as
+// ECONNREFUSED. A response-phase disconnect (ECONNRESET/HPE_*) stays
+// stale-only: the command may already have run.
+test('ENOTCONN/EPIPE are stale-connection and connect-failed errors (#2)', () => {
+  for (const code of ['ECONNREFUSED', 'ECONNRESET', 'ENOTCONN', 'EPIPE', 'HPE_CLOSED_CONNECTION']) {
+    assert.equal(isStaleConnectionError({code}), true, `${code} must be a stale-connection error`);
+  }
+  assert.equal(isStaleConnectionError({code: 'ENOENT'}), false);
+  for (const code of ['ECONNREFUSED', 'ENOTCONN', 'EPIPE']) {
+    assert.equal(isConnectFailedError({code}), true, `${code} must be a connect-failed error`);
+  }
+  assert.equal(isConnectFailedError({code: 'ECONNRESET'}), false,
+    'a response-phase disconnect must not retry');
+  assert.equal(isConnectFailedError({code: 'HPE_CLOSED_CONNECTION'}), false);
+  assert.equal(isConnectFailedError(null), false);
+});
+
+test('ishExec waits for the service file to change after a connect failure (#2)', async () => {
+  let requests = 0;
+  const {server, port, close} = await startMockServer((_req, res) => {
+    requests++;
+    res.writeHead(200, {'Content-Type': 'application/x-ndjson'});
+    res.end(JSON.stringify({exitCode: 0, durationMs: 1}) + '\n');
+  });
+  try {
+    invalidateServiceInfo();
+    const serviceFile = join(fakeHome, 'ish-service-restart-wait.json');
+    writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port: 1, token: TOKEN}));
+    assert.equal((await getServiceInfo({serviceFile})).port, 1);
+    // The listener "restarts" 120ms in: the retry must wait for the
+    // file change instead of re-hitting the dead port immediately.
+    setTimeout(() => {
+      writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port, token: TOKEN}));
+    }, 120);
+    const start = Date.now();
+    const result = await ishExec({command: 'true', serviceFile, onLine: () => {}});
+    assert.equal(result.exitCode, 0);
+    assert.equal(requests, 1, 'the retry must reach the live server exactly once');
+    assert.ok(Date.now() - start >= 150,
+      `the retry waited ${Date.now() - start}ms for the file change, must not be immediate`);
+  } finally {
+    await close();
+  }
+});
+
+test('ishExec reports an unrecoverable listener death after the 5s restart wait (#2)', async () => {
+  invalidateServiceInfo();
+  const serviceFile = join(fakeHome, 'ish-service-restart-dead.json');
+  writeFileSync(serviceFile, JSON.stringify({host: '127.0.0.1', port: 1, token: TOKEN}));
+  assert.equal((await getServiceInfo({serviceFile})).port, 1);
+  const start = Date.now();
+  let caught = null;
+  try {
+    await ishExec({command: 'true', serviceFile, onLine: () => {}});
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, 'the exec against the dead port must reject');
+  assert.equal(caught.code, 'ECONNREFUSED', 'the code is preserved for classifiers');
+  assert.match(caught.message, /unchanged after \d+ checks/);
+  assert.match(caught.message, /port 1/);
+  assert.ok(caught.message.includes(serviceFile), `message must name the file: ${caught.message}`);
+  assert.match(caught.message, /unrecoverable/);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 4500 && elapsed < 15000,
+    `the restart wait took ${elapsed}ms, must be ~5s`);
 });
 
 test('spawnIshExec one-shot runs of one session serialize (M-16)', async () => {
@@ -2485,6 +2627,50 @@ test('ishWorkerStop queued with a run does not clear the new worker jobs (N-2)',
     // And the stop's finally must not have cleared the new worker's jobs.
     assert.deepEqual(getWorkerJobs(sessionId).map((j) => [j.pid, j.state]), [[1234, 'running']]);
   } finally {
+    clearWorkerState();
+    await close();
+  }
+});
+
+// Q1: a stop with bypassQueue reaches the server while a run is hung —
+// the queued stop (R3-N3) waits behind the run, so without the bypass
+// the timeout kill would never land.
+test('ishWorkerStop with bypassQueue reaches the server while a run is hung (Q1)', async () => {
+  clearWorkerState();
+  const sessionId = 'sess-stop-bypass';
+  let stopArrivals = 0;
+  const {server, port, close} = await startMockServer((req, res, body) => {
+    if (req.url === '/ish/worker/stop') {
+      stopArrivals += 1;
+      res.writeHead(200, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({stopped: true}));
+      return;
+    }
+    // The run: never answer, like a guest command hung on AF_UNIX.
+    assert.equal(req.url, '/ish/worker/run');
+  });
+  const abort = new AbortController();
+  try {
+    invalidateServiceInfo();
+    const serviceFile = writeServiceFile(port);
+    const runP = ishWorkerExec({command: 'sleep 600', sessionId, serviceFile, signal: abort.signal, onLine: () => {}});
+    // Let the run request arrive, then issue a queued stop: it must NOT
+    // reach the server while the run is in flight.
+    await new Promise((done) => setTimeout(done, 150));
+    const queuedStopP = ishWorkerStop(sessionId, {serviceFile});
+    await new Promise((done) => setTimeout(done, 300));
+    assert.equal(stopArrivals, 0, 'queued stop must wait behind the hung run');
+    // The bypass stop goes straight to the server.
+    assert.equal(await ishWorkerStop(sessionId, {bypassQueue: true, serviceFile}), true);
+    assert.equal(stopArrivals, 1);
+    // Release the hung run; the queued stop then proceeds (second arrival).
+    abort.abort();
+    const run = await runP;
+    assert.equal(run.cancelled, true);
+    assert.equal(await queuedStopP, true);
+    assert.equal(stopArrivals, 2);
+  } finally {
+    abort.abort();
     clearWorkerState();
     await close();
   }

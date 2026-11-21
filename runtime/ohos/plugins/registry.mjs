@@ -1,4 +1,6 @@
 import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+import { homedir } from 'node:os';
 
 const semver = createRequire(new URL('../../../package.json', import.meta.url))('semver');
 const packageName = /^(?:@[a-z0-9._~-]+\/)?[a-z0-9_~][a-z0-9._~-]*$/;
@@ -30,11 +32,20 @@ export function secureUrl(value) {
 }
 
 /** A local plugin directory on this device, or null. Registry names are not paths;
- *  the engine only ever passes absolute paths (its parser rejects relative ones). */
-export function localDirectoryPath(spec) {
+ *  the engine only ever passes absolute paths (its parser rejects relative ones),
+ *  unless a base is given: then a relative local path resolves against it, and a
+ *  leading ~ against the home directory (same rule as the engine's dependencySpec). */
+export function localDirectoryPath(spec, base) {
   if (typeof spec !== 'string') return null;
-  const path = spec.trim().replace(/^(?:file|link):/, '');
-  return path.startsWith('/') ? path : null;
+  const trimmed = spec.trim();
+  const local = /^(?:file|link):(.*)$/s.exec(trimmed);
+  if (local === null) return trimmed.startsWith('/') ? trimmed : null;
+  let path = local[1].replace(/^~(?=$|[\\/])/, () => homedir());
+  if (!path.startsWith('/')) {
+    if (base === undefined) return null;
+    path = resolve(base, path);
+  }
+  return path;
 }
 
 const maxRedirects = 5;

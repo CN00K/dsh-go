@@ -1,0 +1,24 @@
+# DSH 0.2.2-rc.1: an image-only MCP result for a model that does not declare image input fails outright (MODEL_NO_IMAGE_INPUT) instead of projecting a "successful" diagnostic string the model may mistake for a screenshot it saw; mixed text+image results keep the old projection so the text survives. (P2)
+--- a/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js
+@@ -305,7 +305,7 @@
+ 	} catch {
+ 		throw new Error("the current model route could not be verified");
+ 	}
+-	if (info.inputModalities === void 0 || !info.inputModalities.includes("image")) throw new Error(`model "${model}" does not declare image input`);
++	if (info.inputModalities === void 0 || !info.inputModalities.includes("image")) throw Object.assign(new Error(`model "${model}" does not declare image input; switch to an image-capable model or set this custom model's Input to Text + image`), { code: "MODEL_NO_IMAGE_INPUT" });
+ 	if (exec.signal.aborted) throw new Error("the tool call was canceled before image storage");
+ 	return attachments;
+ }
+@@ -339,6 +339,11 @@
+ 	try {
+ 		attachments = await resolveImageAdmission(ctx, exec);
+ 	} catch (error) {
++		// dsh-go: a purely visual result has no text worth keeping: fail
++		// outright instead of projecting a "successful" diagnostic string
++		// the model may mistake for a screenshot it actually saw. Mixed
++		// results keep the old projection so the text survives.
++		if (error.code === "MODEL_NO_IMAGE_INPUT" && !content.some((value) => isRecord(value) && value.type === "text")) throw error;
+ 		const reason = error.message;
+ 		return projectContent(content, toolName, (block) => ({
+ 			type: "text",

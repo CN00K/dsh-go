@@ -1,0 +1,57 @@
+# DSH 0.2.2-rc.1: P1 WASM probe + vm-context injection (dsh-go): log typeof WebAssembly at host load, before stripTypes, and at createScriptContext; inject the host WebAssembly into the context only when the context lacks it.
+--- a/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js
+@@ -9,6 +9,10 @@
+ import { SandboxUnavailableError, classifyRunnerFailure, isRunnerSpawnFailure } from "@deepseek-ai/dsh-sandbox";
+ import { Buffer as Buffer$1 } from "node:buffer";
+ import { createBirpc } from "birpc";
++// P1 (dsh-go): probe whether the host thread has WebAssembly. NodeMobile
++// runs --jitless, which removes the WebAssembly global, so amaro-backed
++// stripTypeScriptTypes fails below with ERR_WEBASSEMBLY_NOT_SUPPORTED.
++console.log(`[ptc-wasm-probe] host-load WebAssembly=${typeof WebAssembly}`);
+ //#region lib/types/launch.js
+ /** Select source or built bootstrap assets in the mounted execution world. */
+ /**
+@@ -1020,6 +1024,10 @@
+ 		if (spec.signal?.aborted) onAbort();
+ 		else {
+ 			try {
++				// P1 (dsh-go): stripTypes runs in the host thread before any worker
++				// spawn; reaching here proves the fiber was active, and the mode
++				// tells P3 which execution path failed on WASM.
++				console.log(`[ptc-wasm-probe] stripTypes mode=${this.mode.format} host WebAssembly=${typeof WebAssembly}`);
+ 				evaluation.data.code = this.mode.stripTypes(spec.program);
+ 			} catch (error) {
+ 				evaluation.finish({
+--- a/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js
++++ b/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js
+@@ -6792,6 +6792,13 @@
+ 		if (key === "global" || Object.hasOwn(realm, key)) continue;
+ 		Object.defineProperty(globals, key, Object.getOwnPropertyDescriptor(globalThis, key));
+ 	}
++	// P1 (dsh-go): probe whether this vm context exposes WebAssembly, and
++	// inject the host's when the context lacks it. The copy loop above
++	// already carries host globals over, so on a host with WebAssembly this
++	// only fires when the context itself lacks it; on a --jitless host the
++	// host has none to inject and the probe reports undefined at every level.
++	console.log(`[ptc-wasm-probe] createScriptContext host WebAssembly=${typeof WebAssembly} context WebAssembly=${typeof realm.WebAssembly}`);
++	if (!Object.hasOwn(realm, "WebAssembly") && typeof WebAssembly !== "undefined") Object.defineProperty(globals, "WebAssembly", Object.getOwnPropertyDescriptor(globalThis, "WebAssembly"));
+ 	globals.global = realm;
+ 	return context;
+ }
+--- a/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/persistent-process.js
++++ b/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/persistent-process.js
+@@ -6792,6 +6792,13 @@
+ 		if (key === "global" || Object.hasOwn(realm, key)) continue;
+ 		Object.defineProperty(globals, key, Object.getOwnPropertyDescriptor(globalThis, key));
+ 	}
++	// P1 (dsh-go): probe whether this vm context exposes WebAssembly, and
++	// inject the host's when the context lacks it. The copy loop above
++	// already carries host globals over, so on a host with WebAssembly this
++	// only fires when the context itself lacks it; on a --jitless host the
++	// host has none to inject and the probe reports undefined at every level.
++	console.log(`[ptc-wasm-probe] createScriptContext host WebAssembly=${typeof WebAssembly} context WebAssembly=${typeof realm.WebAssembly}`);
++	if (!Object.hasOwn(realm, "WebAssembly") && typeof WebAssembly !== "undefined") Object.defineProperty(globals, "WebAssembly", Object.getOwnPropertyDescriptor(globalThis, "WebAssembly"));
+ 	globals.global = realm;
+ 	return context;
+ }

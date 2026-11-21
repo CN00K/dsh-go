@@ -1496,6 +1496,15 @@ static NSString *ish_executor_resolve_guest_executable(NSString *name, NSString 
                   record.pid, elapsed, record.timeout,
                   record.finished, record.pipesDone, record.exitCode);
         }
+        // Q1: backstop for a run whose own timeout dispatch never fired
+        // (e.g. the state queue stalled): a run past its own timeout is
+        // killed once. timeoutRecord is a no-op for finished/cancelled/
+        // timedOut records, so a run that already timed out normally is
+        // untouched. The sweeper runs on the state queue, so calling it
+        // directly here is queue-correct.
+        if (elapsed > record.timeout) {
+            [self timeoutRecord:record];
+        }
     }
 }
 

@@ -244,11 +244,10 @@ test('rg零宽UTF-8匹配覆盖每个字节坐标、CRLF及无LF末行', async (
   }
 });
 
-test('rg非JSON新语义和未实现的files复杂glob仍明确拒绝', async () => {
+test('rg非JSON新语义仍明确拒绝', async () => {
   for (const args of [
     ['--regexp=abc', '--glob=*.txt'],
     ['--regexp=\\w+', '--', 'case.txt'],
-    ['--files', '--glob=**/*.txt', '--no-ignore', '--hidden'],
     ['--json', '--regexp=(?i:abc)', '--', 'case.txt'],
   ]) {
     const result = await run(['rg', ...args]);
@@ -289,6 +288,53 @@ test('DSH glob固定argv覆盖隐藏和忽略文件，按mtime排序，排除VCS
   const result = await run(['rg', '--no-config', '--files', '--glob=*.txt', '--sort=modified', '--no-ignore', '--hidden', '--glob=!**/.git', '--glob=!**/.git/**', '--', 'glob-fixture']);
   assert.equal(result.exitCode, 0, result.stderr);
   assert.deepEqual(result.stdout.trim().split('\n'), ['glob-fixture/old.txt', 'glob-fixture/.new.txt']);
+});
+
+test('rg --files 接受 ** 与花括号 glob，负向排除仍生效', async () => {
+  const dir = join(work, 'glob-star');
+  await fs.mkdir(join(dir, 'src', 'nested'), { recursive: true });
+  await fs.mkdir(join(dir, 'src', '.git'), { recursive: true });
+  await fs.mkdir(join(dir, 'node_modules', 'dep'), { recursive: true });
+  await fs.writeFile(join(dir, 'src', 'a.ts'), 'x');
+  await fs.writeFile(join(dir, 'src', 'nested', 'b.js'), 'x');
+  await fs.writeFile(join(dir, 'src', 'c.txt'), 'x');
+  await fs.writeFile(join(dir, 'src', '.git', 'secret.ts'), 'x');
+  await fs.writeFile(join(dir, 'node_modules', 'dep', 'd.ts'), 'x');
+  await fs.writeFile(join(dir, 'top.md'), 'x');
+  const vcs = ['--glob=!**/.git', '--glob=!**/.git/**'];
+  const all = await run(['rg', '--no-config', '--files', '--glob=**/*', '--no-ignore', '--hidden', ...vcs, '--', 'glob-star']);
+  assert.equal(all.exitCode, 0, all.stderr);
+  assert.deepEqual(all.stdout.trim().split('\n').sort(), [
+    'glob-star/node_modules/dep/d.ts', 'glob-star/src/a.ts', 'glob-star/src/c.txt',
+    'glob-star/src/nested/b.js', 'glob-star/top.md',
+  ].sort());
+  const typed = await run(['rg', '--no-config', '--files', '--glob=**/*.ts', '--glob=!**/node_modules/**', '--no-ignore', '--hidden', ...vcs, '--', 'glob-star']);
+  assert.equal(typed.exitCode, 0, typed.stderr);
+  assert.deepEqual(typed.stdout.trim().split('\n').sort(), ['glob-star/src/a.ts']);
+  const none = await run(['rg', '--no-config', '--files', '--glob=**/*.go', '--no-ignore', '--hidden', ...vcs, '--', 'glob-star']);
+  assert.equal(none.exitCode, 1);
+  assert.equal(none.stdout, '');
+});
+
+test('rg --files 的 {a,b} 目录剪枝不多不少，按 mtime 排序', async () => {
+  const dir = join(work, 'src');
+  await fs.mkdir(join(dir, 'nested'), { recursive: true });
+  await fs.mkdir(join(dir, '.git'), { recursive: true });
+  await fs.mkdir(join(work, 'other'), { recursive: true });
+  await fs.writeFile(join(dir, 'a.ts'), 'x');
+  await fs.writeFile(join(dir, 'nested', 'b.js'), 'x');
+  await fs.writeFile(join(dir, 'c.txt'), 'x');
+  await fs.writeFile(join(dir, '.git', 'secret.ts'), 'x');
+  await fs.writeFile(join(work, 'other', 'd.ts'), 'x');
+  await fs.writeFile(join(work, 'top.ts'), 'x');
+  await fs.utimes(join(dir, 'a.ts'), 100, 100);
+  await fs.utimes(join(dir, 'nested', 'b.js'), 300, 300);
+  // 与 buildGlobCommand 对 glob("src/**/*.{ts,js}") 生成的 argv 一致：
+  // --glob=!** 先否掉一切，{src}/ 放行目录，VCS 排除随后。
+  const result = await run(['rg', '--no-config', '--files', '--glob=!**', '--glob={src}/', '--glob=src/**/*.{ts,js}',
+    '--sort=modified', '--no-ignore', '--hidden', '--glob=!**/.git', '--glob=!**/.git/**']);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split('\n'), ['src/a.ts', 'src/nested/b.js']);
 });
 
 test('dispose取消运行与排队任务并等待全部线程退出', async () => {

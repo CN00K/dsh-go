@@ -1,0 +1,180 @@
+# DSH 0.2.2-rc.1: plugin install gates follow the iSH bridge as well as openharmony; bundle platform checks and local-path specs use the guest (linux) and the profile directory. (#5)
+--- a/node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js
+@@ -25,6 +25,14 @@
+ }
+ function ohosPluginPackages() {
+ 	return process.platform === "openharmony" ? globalThis[Symbol.for("dsh.go.ohos.plugins")] : void 0;
++}
++// dsh-go: the iSH bridge is installed into the engine thread before DSH
++// starts (engine-worker.mjs), so its symbol marks this host even when the
++// engine reports a platform other than openharmony. The symbol only says
++// the bridge is installed, never that the guest is alive: a missing
++// backend still refuses through the gates below.
++function isIshHost() {
++	return globalThis[Symbol.for("dsh.ish.pty")] !== void 0;
+ }
+ //#region lib/types/bundle-detail.js
+ /**
+@@ -158,20 +166,24 @@
+ 	return new URL(spec.replace(/^git\+/i, "")).host;
+ }
+ /**
+-* Read a spec into its form. A path must be absolute: the Host's working
+-* directory means nothing to the person typing into a browser, and a
+-* relative path resolved against the profile would point inside it.
++* Read a spec into its form. A path must be absolute unless a base is
++* given: the Host's working directory means nothing to the person typing
++* into a browser, so a relative path resolves against the profile.
+ * @param raw - the spec as typed.
++* @param base - the profile directory a relative local path resolves against.
+ * @returns the parsed spec.
+ * @throws {InvalidInstallSpecError} for an empty spec, a relative path, a name the
+ * registry would refuse, or a URL that is neither a git host nor a tarball.
+ */
+-function parseInstallSpec(raw) {
++function parseInstallSpec(raw, base) {
+ 	const spec = raw.trim();
+ 	if (spec === "") throw invalid(spec, "the package spec must not be empty");
+-	const path = spec.replace(/^(?:file|link):/, "");
++	let path = spec.replace(/^(?:file|link):/, "");
+ 	if (path !== spec || isAbsolute(path)) {
+-		if (!isAbsolute(path)) throw invalid(spec, "a local path must be absolute");
++		if (!isAbsolute(path)) {
++			if (base === void 0) throw invalid(spec, "a local path must be absolute");
++			path = resolve(base, path.replace(/^~(?=$|[\\/])/, () => homedir()));
++		}
+ 		return TARBALL_SPEC.test(path) ? {
+ 			kind: "tarball",
+ 			spec,
+@@ -521,7 +533,7 @@
+ 			continue;
+ 		}
+ 		try {
+-			assertBundlePlatform(metadata.dsh.bundle.platforms, process.platform);
++			assertBundlePlatform(metadata.dsh.bundle.platforms, isIshHost() ? "linux" : process.platform);
+ 		} catch (error) {
+ 			if (!(error instanceof UnsupportedBundlePlatformError)) throw error;
+ 			unsupported.push(`${name}: ${error.message}`);
+@@ -1838,7 +1850,7 @@
+ * @returns The package name, or `undefined` when only the installation tells it.
+ */
+ function specPackageName(spec, dependencies, profileDir) {
+-	const parsed = parsedForRegistry(spec);
++	const parsed = parsedForRegistry(spec, profileDir);
+ 	if (parsed.kind === "registry") return parsed.name;
+ 	if (parsed.kind === "path") return packageName(parsed.path);
+ 	const alternative = parsed.kind === "tarball" && parsed.path !== void 0 ? `file:${parsed.path}` : sshGitSpec(parsed);
+@@ -1854,9 +1866,9 @@
+ 	}
+ }
+ /** The spec's form, for deciding whether a failed attempt was the registry's; a form the parser refuses has no host of its own. */
+-function parsedForRegistry(spec) {
++function parsedForRegistry(spec, base) {
+ 	try {
+-		return parseInstallSpec(spec);
++		return parseInstallSpec(spec, base);
+ 	} catch (error) {
+ 		/* v8 ignore next -- parseInstallSpec throws nothing but its own refusal */
+ 		if (!(error instanceof InvalidInstallSpecError)) throw error;
+@@ -2351,7 +2363,7 @@
+ 				if (offered !== void 0 && !installed && !shipped) {
+ 					let platformError;
+ 					try {
+-						assertBundlePlatform(offered.platforms, process.platform);
++						assertBundlePlatform(offered.platforms, isIshHost() ? "linux" : process.platform);
+ 					} catch (error) {
+ 						platformError = managementError(error);
+ 					}
+@@ -2415,7 +2427,7 @@
+ 					const meta = offered?.meta ?? readPluginMeta(info.name ?? name, pathToFileURL(join(dir, "package.json")).href);
+ 					let platformError;
+ 					try {
+-						assertBundlePlatform(info.dsh?.bundle?.platforms, process.platform);
++						assertBundlePlatform(info.dsh?.bundle?.platforms, isIshHost() ? "linux" : process.platform);
+ 					} catch (error) {
+ 						platformError = managementError(error);
+ 					}
+@@ -2469,7 +2481,7 @@
+ 			return {
+ 				...this.configuredRegistries,
+ 				fallbackRegistries: [...this.configuredRegistries.fallbackRegistries],
+-				resolved: process.platform === "openharmony" && ohosPluginPackages() === void 0 ? null : await readProfileRegistry(this.profile.dir, {
++				resolved: (process.platform === "openharmony" || isIshHost()) && ohosPluginPackages() === void 0 ? null : await readProfileRegistry(this.profile.dir, {
+ 					...this.profile.packageManager ?? { command: this.pnpmCommand },
+ 					timeoutMs: this.inspectTimeoutMs
+ 				})
+@@ -2482,16 +2494,16 @@
+ 		* @returns The package the spec names, or why it is refused.
+ 		*/
+ 		async inspect(spec, options, signal) {
+-			if (process.platform === "openharmony" && ohosPluginPackages() === void 0) return refused("unknown", OHOS_PLUGIN_INSTALL_MESSAGE);
++			if ((process.platform === "openharmony" || isIshHost()) && ohosPluginPackages() === void 0) return refused("unknown", OHOS_PLUGIN_INSTALL_MESSAGE);
+ 			let parsed;
+ 			try {
+-				parsed = parseInstallSpec(spec);
++				parsed = parseInstallSpec(spec, this.profile.dir);
+ 			} catch (error) {
+ 				/* v8 ignore next 2 -- parseInstallSpec throws nothing but its own refusal */
+ 				if (!(error instanceof InvalidInstallSpecError)) throw error;
+ 				return refused("invalid-spec", error.reason);
+ 			}
+-			if (process.platform === "openharmony" && parsed.kind !== "registry" && parsed.kind !== "path") return refused("invalid-spec", "本机仅支持注册表和本地路径的纯 JS 插件；Git 和直接归档请交给已连接的电脑安装。");
++			if ((process.platform === "openharmony" || isIshHost()) && parsed.kind !== "registry" && parsed.kind !== "path") return refused("invalid-spec", "本机仅支持注册表和本地路径的纯 JS 插件；Git 和直接归档请交给已连接的电脑安装。");
+ 			const manifest = readProfileManifest("dsh", this.profile.dir);
+ 			const installation = JSON.parse(readFileSync(this.profile.installAnchor, "utf8"));
+ 			const known = new Set([
+@@ -2794,7 +2806,7 @@
+ 		* @returns The parsed answer and the registry that gave it, or the last refusal, with every registry asked.
+ 		*/
+ 		async askRegistries(spec, fields, plan, parsed, signal) {
+-			if (process.platform === "openharmony" && ohosPluginPackages() === void 0) return {
++			if ((process.platform === "openharmony" || isIshHost()) && ohosPluginPackages() === void 0) return {
+ 				status: "refused", problem: "unknown", reason: OHOS_PLUGIN_INSTALL_MESSAGE, attempts: []
+ 			};
+ 			const attempts = [];
+@@ -2911,7 +2923,7 @@
+ 		// expectedInstalled is an internal update precondition, not a Remote option.
+ 		installBundle(spec, options, expectedInstalled) {
+ 			const backend = ohosPluginPackages();
+-			if (process.platform === "openharmony" && (backend === void 0 || !backend.accepts(spec) || options?.approvedBuilds?.length > 0)) return Promise.resolve({
++			if ((process.platform === "openharmony" || isIshHost()) && (backend === void 0 || !backend.accepts(spec, this.profile.dir) || options?.approvedBuilds?.length > 0)) return Promise.resolve({
+ 				stage: "install", target: spec, enabled: options?.enabled !== false,
+ 				changed: false, application: "failed",
+ 				error: { code: "operation-error", diagnostic: backend === void 0 ? OHOS_PLUGIN_INSTALL_MESSAGE : "[OHOS_PLUGIN_UNSUPPORTED] 本机仅支持注册表和本地路径的纯 JS 包，不运行安装脚本；其他包请交给已连接的电脑安装。" }
+@@ -2951,7 +2963,7 @@
+ 				let version;
+ 				try {
+ 					result.registries = [];
+-					const parsed = parsedForRegistry(spec);
++					const parsed = parsedForRegistry(spec, this.profile.dir);
+ 					const signal = AbortSignal.any([this.abort.signal, control.abort.signal]);
+ 					const env = this.profile.packageManager?.env === void 0 ? {} : { env: this.profile.packageManager.env };
+ 					const connection = checkGithubConnection(parsed, this.profile.dir, {
+@@ -3026,7 +3038,7 @@
+ 						if (run.kind === void 0) break;
+ 						delete result.failedAt;
+ 						if (run.timedOut === true) break;
+-						const failedAt = attributeFailure(run.kind, run.output, parsedForRegistry(installSpec));
++						const failedAt = attributeFailure(run.kind, run.output, parsedForRegistry(installSpec, this.profile.dir));
+ 						if (failedAt !== "other") result.failedAt = failedAt;
+ 						if (failedAt !== "registry" || index === plan.length - 1) break;
+ 					}
+@@ -3140,7 +3152,7 @@
+ 		*/
+ 		// selection is owned by this update only; capture it before HMR deselects.
+ 		removeBundle(name, selection) {
+-			if (process.platform === "openharmony" && ohosPluginPackages() === void 0) return Promise.resolve({
++			if ((process.platform === "openharmony" || isIshHost()) && ohosPluginPackages() === void 0) return Promise.resolve({
+ 				stage: "remove", target: name, changed: false, application: "failed",
+ 				error: { code: "operation-error", diagnostic: OHOS_PLUGIN_INSTALL_MESSAGE }
+ 			});
+@@ -3301,7 +3313,7 @@
+ 				const metadata = bundleManifest(name, this.profile.dir, this.profile.installAnchor);
+ 				if (metadata === void 0) throw new ManagementFailure("not-bundle");
+ 				if (enabled) {
+-					assertBundlePlatform(metadata.dsh?.bundle?.platforms, process.platform);
++					assertBundlePlatform(metadata.dsh?.bundle?.platforms, isIshHost() ? "linux" : process.platform);
+ 					const compatibility = evaluatePluginCompatibility(metadata, readProfileVersionExemptions(this.profile.dir));
+ 					if (compatibility !== void 0 && !compatibility.exempted) throw new ManagementFailure("incompatible-version", [incompatiblePlugin(compatibility)]);
+ 					this.bundleRows(name);

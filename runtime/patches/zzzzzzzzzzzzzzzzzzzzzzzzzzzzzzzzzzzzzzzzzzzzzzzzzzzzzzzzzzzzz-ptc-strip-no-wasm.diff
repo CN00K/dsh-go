@@ -1,0 +1,76 @@
+# DSH 0.2.2-rc.1: P1 pure-JS strip fallback (dsh-go): when the host Node runs --jitless with no WebAssembly, stripTypeScriptTypes throws ERR_WEBASSEMBLY_NOT_SUPPORTED; the single strip call site then passes a program that compiles as plain JavaScript through unchanged (warn [ptc-strip-no-wasm]) and fails a program with type annotations with PTC_TYPESCRIPT_REQUIRES_WASM instead of a misleading worker SyntaxError. WASM-available behaviour is unchanged.
+--- a/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js
+@@ -1,4 +1,5 @@
+ import { stripTypeScriptTypes } from "node:module";
++import { Script } from "node:vm";
+ import { DUNDER_MEMBER, PORTABLE_RESERVED_WORDS, PtcRuntime, RESERVED_BINDING_GLOBALS, RESERVED_ERROR_MEMBERS } from "@deepseek-ai/dsh-ptc-runtime";
+ import { dirname, isAbsolute, resolve } from "node:path";
+ import { fileURLToPath, pathToFileURL } from "node:url";
+@@ -1028,7 +1029,7 @@
+ 				// spawn; reaching here proves the fiber was active, and the mode
+ 				// tells P3 which execution path failed on WASM.
+ 				console.log(`[ptc-wasm-probe] stripTypes mode=${this.mode.format} host WebAssembly=${typeof WebAssembly}`);
+-				evaluation.data.code = this.mode.stripTypes(spec.program);
++				evaluation.data.code = stripTypesWithFallback(this.mode, spec.program);
+ 			} catch (error) {
+ 				evaluation.finish({
+ 					kind: "exception",
+@@ -1328,6 +1329,57 @@
+ }
+ const STRIP_PREFIX = "async function __dsh_program__() {\n";
+ const STRIP_SUFFIX = "\n}";
++/**
++ * Strip TypeScript types, falling back to plain JavaScript when the host
++ * has no WebAssembly. NodeMobile runs --jitless, which removes the
++ * WebAssembly global, so amaro-backed stripTypeScriptTypes throws
++ * ERR_WEBASSEMBLY_NOT_SUPPORTED before any worker spawns. A program that
++ * is already plain JavaScript needs no stripping, so it passes through
++ * unchanged; a program with type annotations fails here with an actionable
++ * error instead of a misleading worker SyntaxError downstream.
++ * @param mode - evaluator syntax and TypeScript erasure (resolveMode entry).
++ * @param program - the program text as submitted, before any wrapping.
++ * @returns the stripped program, or the program unchanged when it is
++ * already plain JavaScript and the host cannot strip.
++ */
++function stripTypesWithFallback(mode, program) {
++	try {
++		return mode.stripTypes(program);
++	} catch (error) {
++		if (error?.code !== "ERR_WEBASSEMBLY_NOT_SUPPORTED") throw error;
++		if (isPlainJavaScript(program)) {
++			console.warn(`[ptc-strip-no-wasm] host has no WebAssembly (--jitless); using program as plain JavaScript mode=${mode.format}`);
++			return program;
++		}
++		const failure = new Error("TypeScript type annotations cannot be stripped on this host: the host Node runs with --jitless and has no WebAssembly, so stripTypeScriptTypes is unavailable. Remove the type annotations and retry with plain JavaScript.");
++		failure.code = "PTC_TYPESCRIPT_REQUIRES_WASM";
++		throw failure;
++	}
++}
++/**
++ * Compile-only check for plain JavaScript: nothing executes. A script, a
++ * function body (per-call programs are async function bodies, so top-level
++ * return is legal there), and an async function body (top-level await is
++ * legal in every mode) are tried in turn.
++ * @param program - the program text as submitted.
++ * @returns whether any of the three forms compiles.
++ */
++function isPlainJavaScript(program) {
++	const attempts = [
++		() => new Script(program),
++		() => new Function(program),
++		() => new Function(`return (async () => {\n${program}\n})`)
++	];
++	for (const attempt of attempts) {
++		try {
++			attempt();
++			return true;
++		} catch {
++			// Not this form; try the next one.
++		}
++	}
++	return false;
++}
+ function resolveMode(config) {
+ 	switch (config.executionMode) {
+ 		case "per-call": return {

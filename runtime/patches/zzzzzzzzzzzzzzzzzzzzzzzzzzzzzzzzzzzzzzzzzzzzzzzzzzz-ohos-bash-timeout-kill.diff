@@ -1,0 +1,41 @@
+# DSH 0.2.2-rc.1: bash timeout kills the foreground job instead of promoting it (Q1: a promoted job keeps its worker slot while the guest command runs on).
+--- a/node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js
+@@ -483,13 +483,34 @@
+ 				};
+ 			}
+ 			if (view.status === "running" || view.status === "stopping") {
++				// Q1 (dsh-go): a foreground call that times out is killed,
++				// not promoted. A promoted job keeps its worker slot while
++				// the guest command runs on, so one hung run starves the
++				// session. Read the partial output first: stop() removes
++				// the record once it settles, and read() throws after that.
+ 				const read = registry.read(attached.id, owner);
++				const sandbox = attached.process()?.sandbox;
++				await stop("timed out");
+ 				return {
+-					kind: "promoted",
++					kind: "foreground",
+ 					cwd: spec.workdir,
+-					jobId: attached.id,
++					exitCode: null,
++					signal: null,
++					timedOut: true,
++					aborted: false,
+ 					timeoutMs,
+-					output: renderJobRead(ringDelta(read.chunks), read.lossy, read.job.output.spillPaths ?? [], attached.process()?.sandbox, escalationModes)
++					stdout: {
++						text: renderJobRead(ringDelta(read.chunks), read.lossy, read.job.output.spillPaths ?? [], sandbox, escalationModes),
++						truncated: false
++					},
++					stderr: {
++						text: "",
++						truncated: false
++					},
++					...spec.sandboxPolicy !== void 0 ? { sandbox: {
++						mode: spec.sandboxPolicy.mode,
++						denied: false
++					} } : {}
+ 				};
+ 			}
+ 			registry.remove(attached.id, owner);

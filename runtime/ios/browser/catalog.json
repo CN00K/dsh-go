@@ -198,7 +198,7 @@
   },
   {
     "name": "screenshot",
-    "description": "请求Host当前独立浏览器截图；返回和隐私/字节限制由Host执行，本页面脚本不截图。",
+    "description": "请求Host当前独立浏览器截图；返回和隐私/字节限制由Host执行，本页面脚本不截图。当前模型不支持图片输入时会直接报错，请换支持图片的模型或改模型 Input 为 Text + image。",
     "inputSchema": {
       "type": "object",
       "properties": {},

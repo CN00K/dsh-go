@@ -54,7 +54,6 @@ async function executeRgBody(args, ctx) {
   } catch (error) { return unsupported(error.message); }
   if (modified && !files) return unsupported('在 --files 以外按修改时间排序');
   if (!files && !json && globs.some(value => !value.startsWith('!'))) return unsupported('非 JSON 输出的正向 include glob');
-  if (files && globs.some(value => !value.startsWith('!') && (value.includes('**') || /[{}]/.test(value)))) return unsupported('包含 ** 或花括号的正向 glob');
   normalized.push(...globs.map(value => `--glob=${value}`));
   for (const path of paths) {
     if (path.includes('\n')) return unsupported('含换行符的搜索路径');
@@ -67,9 +66,15 @@ async function executeRgBody(args, ctx) {
       if ((await ctx.fs.stat(absolute)).isFile && (await ctx.fs.readFileBuffer(absolute)).includes(0)) return unsupported('默认二进制文件搜索；可明确使用 --text');
     }
   }
+  // --files + 含 ** 或花括号的正向 glob 不走真 rg：selectRgFiles 已支持
+  // 这套语义，且 grep --json 路径早就在用它。--glob=!** 这类负向剪枝
+  // 与 {dir}/ 目录剪枝同样经它生效；其余 pattern 仍走原命令。
+  const needsSelection = files && globs.some(value => !value.startsWith('!') && (value.includes('**') || /[{}]/.test(value)));
   const result = json
     ? await searchJson({ ctx, normalized, options, rawPatterns, fixed, globs, paths })
-    : await ctx.origCommand(normalized);
+    : needsSelection
+      ? await filesViaSelection(ctx, options, globs, paths)
+      : await ctx.origCommand(normalized);
   if (result.stderr.includes('invalid regex:')) result.stderr = result.stderr.replace('invalid regex:', 'regex parse error:');
   if (result.exitCode !== 0 && result.stderr) result.exitCode = 2;
   if (modified && result.exitCode === 0) {
@@ -82,6 +87,15 @@ async function executeRgBody(args, ctx) {
 // 仅本 OHOS rg 使用的私有源码构建；不改原 npm 包或其他使用者，见 M4-1.md。
 import { RE2JS } from './build/re2js-unicode.mjs';
 
+
+// --files 经 selectRgFiles 选出文件：NUL 连接的 stdout 转回 \n 连接，
+// 与 --files 原路的按行约定一致；exitCode 照搬（0 有结果 / 1 无结果 /
+// 2 有诊断），非法 glob 由 globRule 抛错、外层包成 rg: … exit 2。
+async function filesViaSelection(ctx, options, globs, paths) {
+  const selected = await selectRgFiles(ctx, options, globs, paths.length ? paths : ['.']);
+  const files = selected.stdout.split('\0').filter(Boolean);
+  return { stdout: files.join('\n') + (files.length ? '\n' : ''), stderr: selected.stderr, exitCode: selected.exitCode };
+}
 
 async function searchJson({ ctx, options, rawPatterns, fixed, globs, paths }) {
   let ignoreCase = false;

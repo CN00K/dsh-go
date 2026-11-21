@@ -1,0 +1,57 @@
+# DSH 0.2.2-rc.1: wait_agent distinguishes "no teammate exists" (no-active-peer) from "teammates exist but all are inactive" (all-peers-inactive): a teammate that just finished no longer reads as no teammate at all, and the message says its result may already be in the inbox. (P4)
+--- a/node_modules/@deepseek-ai/dsh-experimental-tool-agent-team/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-experimental-tool-agent-team/lib/index.js
+@@ -26,10 +26,11 @@
+ 
+ Prefer read/edit/write for file changes. If a file operation returns FS_STALE_VERSION, read the current file, rebase your intended change onto the new content, and retry. Bash, formatters, code generators, and scripts are not fully protected by the filesystem version guard; coordinate them explicitly and have the Lead review the final diff and run tests.
+ 
+-Use the target returned by spawn_teammate or list_agents for send_message${interrupt ? " and interrupt_agent" : ""}, or as owner when assigning or filtering shared tasks. send_message steers a running target at its nearest step boundary and starts or resumes an inactive target. inactive means no turn is executing; it does not describe task completion, success, failure, or waiting for other agents. provisioning means member creation is in progress; failed means member creation failed. A peer message starts with its sender name. A successful send does not mean the recipient has processed it. Shared-task workflow is list, get, claim with the current revision, perform the work, then complete. Task readiness never starts an owner. Before wait_agent, use list_agents and make sure another required member is running or provisioning; use send_message first when the required member is inactive. wait_agent observes only changes after that call starts, never wakes a member, and returns noProgress immediately when no other member can produce a change. Re-list after wakeup or timeout. The Lead must wait for required teammates before giving the final answer.`;
++Use the target returned by spawn_teammate or list_agents for send_message${interrupt ? " and interrupt_agent" : ""}, or as owner when assigning or filtering shared tasks. send_message steers a running target at its nearest step boundary and starts or resumes an inactive target. inactive means no turn is executing; it does not describe task completion, success, failure, or waiting for other agents. provisioning means member creation is in progress; failed means member creation failed. A peer message starts with its sender name. A successful send does not mean the recipient has processed it. Shared-task workflow is list, get, claim with the current revision, perform the work, then complete. Task readiness never starts an owner. Before wait_agent, use list_agents and make sure another required member is running or provisioning; use send_message first when the required member is inactive. wait_agent observes only changes after that call starts, never wakes a member, and returns noProgress immediately when no other member can produce a change: no-active-peer when no teammate exists, all-peers-inactive when teammates exist but all are inactive (one may just have finished, so check your inbox first). Re-list after wakeup or timeout. The Lead must wait for required teammates before giving the final answer.`;
+ }
+ const ACTIVE_WAIT_STATUSES = new Set(["running", "provisioning"]);
+ const NO_ACTIVE_PEER_MESSAGE = "No other Team member is running or provisioning. wait_agent cannot make progress or wake inactive teammates. Re-list with list_agents and team_task_list, then use send_message to wake each required inactive teammate before waiting again.";
++const ALL_PEERS_INACTIVE_MESSAGE = "Teammates exist but none is running or provisioning right now. A teammate may just have finished: its result may already be in your inbox or notifications. Re-list with list_agents and check for results first; only use send_message to wake a teammate you still need, then wait again.";
+ /**
+ * One model-facing roster row. The Lead pseudo-row omits the
+ * teammate-only provisioning fields, so only identity, role, status, and
+@@ -170,7 +171,7 @@
+ 				reason: {
+ 					type: "string",
+ 					required: true,
+-					const: "no-active-peer"
++					enum: ["no-active-peer", "all-peers-inactive"]
+ 				},
+ 				message: {
+ 					type: "string",
+@@ -328,7 +329,7 @@
+ 		})));
+ 		register(scoped.tools.register(defineTool({
+ 			name: "wait_agent",
+-			description: "Wait for the next teammate status, message, or shared-task change after this call starts. This never wakes inactive members and returns noProgress immediately when no other member is running or provisioning. Re-list after wakeup or timeout instead of polling.",
++			description: "Wait for the next teammate status, message, or shared-task change after this call starts. This never wakes inactive members and returns noProgress immediately when no other member is running or provisioning: reason no-active-peer when no teammate exists, all-peers-inactive when teammates exist but all are inactive (one may just have finished; check your inbox first). Re-list after wakeup or timeout instead of polling.",
+ 			parameters: { timeout_ms: {
+ 				type: "integer",
+ 				description: "Wait duration in milliseconds, from 10000 through 3600000. Defaults to 30000."
+@@ -338,11 +339,20 @@
+ 				const caller = callingAgent(exec.agent, "wait_agent");
+ 				const timeoutMs = args.timeout_ms ?? 3e4;
+ 				if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1e4 || timeoutMs > 36e5) return await ctx.agentTeams.waitForChange(caller, timeoutMs, exec.signal);
+-				if (!ctx.agentTeams.listMembers(caller).some((member) => member.id !== caller.id && ACTIVE_WAIT_STATUSES.has(member.status))) return {
++				// dsh-go: sample the roster once and reuse it. A teammate that
++				// finished between list and wait is "all peers inactive", not
++				// "no peer exists": the message says the result may already be
++				// in the inbox, so the Lead re-lists and reads it instead of
++				// waking nobody - or everybody.
++				const others = ctx.agentTeams.listMembers(caller).filter((member) => member.id !== caller.id);
++				if (!others.some((member) => ACTIVE_WAIT_STATUSES.has(member.status))) return {
+ 					timedOut: false,
+-					noProgress: {
++					noProgress: others.length === 0 ? {
+ 						reason: "no-active-peer",
+ 						message: NO_ACTIVE_PEER_MESSAGE
++					} : {
++						reason: "all-peers-inactive",
++						message: ALL_PEERS_INACTIVE_MESSAGE
+ 					}
+ 				};
+ 				return await ctx.agentTeams.waitForChange(caller, timeoutMs, exec.signal);

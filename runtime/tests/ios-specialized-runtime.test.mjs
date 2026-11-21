@@ -323,6 +323,15 @@ test('N-1: resolveExecutable returns the bare guest CLI name instead of asking d
   assert.equal(await router.resolveExecutable('git'), '/dsh-go/ohos/bin/git', 'git keeps its virtual resolution');
 });
 
+test('#3: a non-shell terminal argv fails through the specialized runtime with the decline as cause', { timeout: 15000 }, async (t) => {
+  const { runtime } = await fixture(t);
+  await assert.rejects(runtime.spawnTerminal({ argv: ['node'], cols: 80, rows: 24 }), (error) => {
+    assert.equal(error.code, 'ERR_OHOS_PTY_UNAVAILABLE');
+    assert.equal(error.cause, 'terminal argv[0] is node, not bash/sh');
+    return true;
+  });
+});
+
 test('N-2: a read-only policy marks the terminal upgrade readOnly; no policy leaves it unmarked', { timeout: 15000 }, async (t) => {
   const { runtime, server } = await fixture(t);
   const terminalSpec = (policy) => ({ argv: ['bash'], cols: 80, rows: 24, ...(policy ? { policy } : {}) });

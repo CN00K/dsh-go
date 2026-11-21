@@ -1,0 +1,50 @@
+# DSH 0.2.2-rc.1: declaredRows projects each row's live fiber phase (and the failure diagnostic when it failed) so list_plugins rows line up with the inventory's enabled state. (P3)
+--- a/node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js
+@@ -34,6 +34,18 @@
+ function isIshHost() {
+ 	return globalThis[Symbol.for("dsh.ish.pty")] !== void 0;
+ }
++// dsh-go: Cordis fiber states, worded as dsh-host-plugin-inventory's
++// FIBER_PHASE (that table is not exported): 0 pending, 1 loading,
++// 2 active, 3 failed, 4 disposed, 5 unloading. Disposed maps to null:
++// the entry is gone, not in a phase the model can act on.
++const FIBER_PHASE = {
++	0: "pending",
++	1: "loading",
++	2: "active",
++	3: "failed",
++	4: null,
++	5: "unloading"
++};
+ //#region lib/types/bundle-detail.js
+ /**
+ * Detail documents of profile bundles: an installed bundle's `meta.detail` file or README from its directory, and an
+@@ -3206,7 +3218,8 @@
+  /* v8 ignore next -- the Loader gives every entry an id before it is listed */
+ 			if (typeof entry.options.id === "string") live.set(entry.options.id, {
+ 				entryId: pluginEntryId(entry.id),
+-				baseUrl: entry.parent.tree.ctx.baseUrl
++				baseUrl: entry.parent.tree.ctx.baseUrl,
++				fiber: entry.fiber
+ 			});
+ 			const rows = [];
+ 			const packages = this.ctx.get("pluginPackages");
+@@ -3216,11 +3229,16 @@
+ 				const entryId = active?.entryId;
+ 				const base = active?.baseUrl ?? pathToFileURL(join(dir, "package.json")).href;
+ 				const meta = readMeta === void 0 ? packages?.metaOf(row.name, base) : readMeta(row.name, base);
++				const fiber = active?.fiber;
++				const fiberPhase = fiber === void 0 ? null : FIBER_PHASE[fiber.state];
++				const diagnostic = fiberPhase === "failed" && fiber._error !== void 0 ? fiber._error instanceof Error ? fiber._error.message : String(fiber._error) : void 0;
+ 				rows.push({
+ 					rowId: row.id,
+ 					moduleName: row.name,
+ 					...entryId === void 0 ? {} : { entryId },
+-					...meta === void 0 ? {} : { meta }
++					...meta === void 0 ? {} : { meta },
++					fiberPhase,
++					...diagnostic === void 0 ? {} : { diagnostic }
+ 				});
+ 			}
+ 			const declared = new Set(rows.map((row) => row.rowId));

@@ -2,8 +2,8 @@
   "sourceProvidersSha256": "24269ddf75dbf6fdbbe2fb4b4a8ee6bf27af649be6ad0a1399a420aa383cbdb8",
   "sourceCatalogSha256": "c3482a44a85471824680d05ba6b993f0abff02026b44acc8e4ec64eeb5f0533a",
   "contract": {
-    "manifests": "1a854660400ca4879e6b48e9d373b94ded746c6edd84a838e17f618964a58c49",
-    "tools": "0f75d08819a3f07d50414c4da5993b8dbd0480b82a1bd4d3e7f8fe0ed925031a",
+    "manifests": "5f8ef6c4f5bd17e914c31b7dea16c869c1deeb22ab6b4602098e14e7d9655655",
+    "tools": "d23683fb134aa073c77c300ddb3a9e843ed4354e4514e5f84fd6755444e2cc30",
     "serviceDirectory": "4e3f80ff3e1b109d4d97c5048e22dc85bc084b67ca20c621d659956535c0d543",
     "eventDirectory": "1632d6508a1bd8a9f4e86dcde0e75c80a9ac252174a589f32b84d81eb8b940e1",
     "serviceCount": 107,

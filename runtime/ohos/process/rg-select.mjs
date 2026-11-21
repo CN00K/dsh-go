@@ -66,7 +66,28 @@ function globRule(pattern, ignoreFile = false) {
     return out;
   }
   const regex = RE2JS.compile('^(?:' + sequence() + ')$', RE2JS.DOTALL);
-  return { negative, matches(path, directory) { return (!directoryOnly || directory) && regex.matches(byteString(basenameOnly ? basename(path) : path.replace(/^\.\//, ''))); } };
+  // Static literal prefix before the first glob magic, for directory
+  // traversal: a directory a negative override matched may still hold
+  // files this positive rule matches (rg descends in that case).
+  // A brace opens alternatives, so a leading '{' leaves no prefix.
+  let prefix = '';
+  for (let j = 0; j < pattern.length; j++) {
+    const char = pattern[j];
+    if (char === '\\' && j + 1 < pattern.length) { prefix += pattern[++j]; continue; }
+    if (char === '*' || char === '?' || char === '[' || char === '{') break;
+    prefix += char;
+  }
+  return { negative, matches(path, directory) { return (!directoryOnly || directory) && regex.matches(byteString(basenameOnly ? basename(path) : path.replace(/^\.\//, ''))); },
+    // True when a file below `path` could match this rule: basename-only
+    // rules can match in any directory, and a pattern with no static
+    // prefix (e.g. {src}/ or **/*.ts) cannot rule any directory out.
+    // A static prefix only rules a directory out when neither contains
+    // the other (e.g. src/*.ts rules out other/, not src/nested/).
+    mayMatchBelow(path) {
+      if (negative || basenameOnly || !prefix) return !negative;
+      const dir = path.replace(/^\.\//, '');
+      return dir === '' || prefix.startsWith(dir + '/') || dir.startsWith(prefix);
+    } };
 }
 
 function lastMatch(rules, absolute, directory) {
@@ -129,7 +150,15 @@ export async function selectRgFiles(ctx, options, globs, roots) {
     let override;
     const fromCwd = relative(ctx.cwd, path);
     for (const rule of overrides) if (rule.matches(fromCwd, directory)) override = !rule.negative;
-    if (override !== undefined) return override;
+    if (override !== undefined) {
+      // A directory the last matching glob excludes may still hold files
+      // a positive rule matches (--glob=!** plus --glob={src}/ plus
+      // --glob=src/**/*.{ts,js}: src/nested matches only !**, but its
+      // files match the positive glob). rg descends in that case; only
+      // files are decided by the last matching glob.
+      if (!override && directory && overrides.some(rule => rule.mayMatchBelow(fromCwd))) return true;
+      return override;
+    }
     if (!directory && hasPositive) return false;
     let ignored;
     for (const list of [rules.rg, rules.ignore, rules.git]) {

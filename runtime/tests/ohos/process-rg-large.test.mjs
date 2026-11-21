@@ -166,6 +166,33 @@ test('超过 4 MiB 的整个文件仍可搜索，只限制单行而非文件或�
   assert.ok(records.every(item => item.lines.text === line));
 });
 
+test('--files 的 ** 与花括号 glob 改道 selectRgFiles，不走 origCommand', async () => {
+  const dir = join(work, 'glob-direct');
+  await mkdir(join(dir, 'src', 'nested'), { recursive: true });
+  await mkdir(join(dir, 'src', '.git'), { recursive: true });
+  await mkdir(join(dir, 'node_modules', 'dep'), { recursive: true });
+  await writeFile(join(dir, 'src', 'a.ts'), 'x');
+  await writeFile(join(dir, 'src', 'nested', 'b.js'), 'x');
+  await writeFile(join(dir, 'src', 'c.txt'), 'x');
+  await writeFile(join(dir, 'src', '.git', 'secret.ts'), 'x');
+  await writeFile(join(dir, 'node_modules', 'dep', 'd.ts'), 'x');
+  await writeFile(join(dir, 'top.md'), 'x');
+  const vcs = ['--glob=!**/.git', '--glob=!**/.git/**'];
+  // direct() 的 origCommand 是抛错哨兵：能返回结果即证明改道未走原命令。
+  const all = await direct(['--files', '--glob=**/*', '--no-ignore', '--hidden', ...vcs, '--', 'glob-direct']);
+  assert.equal(all.exitCode, 0, all.stderr);
+  assert.deepEqual(all.stdout.trim().split('\n').sort(), [
+    'glob-direct/node_modules/dep/d.ts', 'glob-direct/src/a.ts', 'glob-direct/src/c.txt',
+    'glob-direct/src/nested/b.js', 'glob-direct/top.md',
+  ].sort());
+  const typed = await direct(['--files', '--glob=**/*.ts', '--glob=!**/node_modules/**', '--no-ignore', '--hidden', ...vcs, '--', 'glob-direct']);
+  assert.equal(typed.exitCode, 0, typed.stderr);
+  assert.deepEqual(typed.stdout.trim().split('\n'), ['glob-direct/src/a.ts']);
+  const none = await direct(['--files', '--glob=**/*.go', '--no-ignore', '--hidden', ...vcs, '--', 'glob-direct']);
+  assert.equal(none.exitCode, 1);
+  assert.equal(none.stdout, '');
+});
+
 test('真实 DSH 把超行预算传播为 SEARCH_FAILED', async () => {
   const context = { subprocess: runtime, workingDirectory: { ensure: async () => work } };
   const id = 'm4-4a-large-file-session';

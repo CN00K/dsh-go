@@ -139,7 +139,7 @@ export const GUEST_EXEC_SHELL = '/bin/bash';
  */
 const SYNTHETIC_PID_BASE = 2_147_482_000;
 let syntheticPidCounter = 0;
-function nextSyntheticPid() {
+export function nextSyntheticPid() {
   syntheticPidCounter += 1;
   return SYNTHETIC_PID_BASE + syntheticPidCounter;
 }
@@ -185,6 +185,26 @@ const SERVICE_FILE_RETRY_MIN_MS = 5_000;
 const WS_HANDSHAKE_TIMEOUT_MS = 10_000;
 /** Cap for input queued before the WS handshake completes (M-6). */
 const PTY_PENDING_MAX_BYTES = 64 * 1024;
+/**
+ * Bounded retry for a 409 worker-busy refusal (#1, wave 5): the slot
+ * is usually stale (the previous run settled JS-side while Swift
+ * still held the claim), so a short backoff lets it clear. 3 retries
+ * at 50/200/800ms; a 409 is a pre-execution refusal, so re-POSTing
+ * cannot run the command twice.
+ */
+const WORKER_BUSY_MAX_RETRIES = 3;
+const WORKER_BUSY_RETRY_DELAYS_MS = [50, 200, 800];
+/**
+ * Cap for waiting on ish-service.json to change after a connect
+ * failure (#2, wave 5): the Swift listener restarts itself with a new
+ * port/token, and the file change is the signal it is back. Poll
+ * 50/200/800ms then 1s, up to 5s total — then fail with the wait
+ * summary instead of retrying forever.
+ */
+const SERVICE_RESTART_WAIT_MS = 5_000;
+const SERVICE_RESTART_POLL_DELAYS_MS = [50, 200, 800, 1000];
+/** Tiny sleep helper (409 backoff + restart-wait polling). */
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /**
  * The loopback service is down: ish-service.json is missing (iSH not
@@ -404,9 +424,14 @@ const loopbackAgent = new HttpAgent({keepAlive: false});
  * once with freshly-read service info and drop the cache on these,
  * exactly as they already do for ECONNREFUSED/ECONNRESET.
  */
-function isStaleConnectionError(error) {
+export function isStaleConnectionError(error) {
   if (!error) return false;
-  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') return true;
+  // #2 (wave 5): ENOTCONN (socket never connected — the listener died)
+  // and EPIPE (the peer closed before the request body went out) are
+  // dead-connection errors too: drop the cached port/token so the next
+  // call re-reads ish-service.json instead of dialling the dead port.
+  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET'
+    || error.code === 'ENOTCONN' || error.code === 'EPIPE') return true;
   return typeof error.code === 'string' && error.code.startsWith('HPE_');
 }
 
@@ -420,9 +445,18 @@ function isStaleConnectionError(error) {
  * connections for cache invalidation (isStaleConnectionError above),
  * but they must not trigger a retry — the guest command may already
  * have run. Pure predicate on error.code; nothing sets or clears it.
+ * #2 (wave 5): ENOTCONN and EPIPE join it — same pre-execution
+ * guarantee. ENOTCONN means the socket never connected, so nothing
+ * was sent; EPIPE means the write failed before the server could
+ * hold a complete JSON body, so the server never had a request to
+ * execute (a crash after a full read surfaces as ECONNRESET/HPE_*,
+ * not EPIPE). Both therefore retry exactly like ECONNREFUSED, and
+ * both wait on the service-file change first (see
+ * waitForServiceFileChange).
  */
-function isConnectFailedError(error) {
-  return !!error && error.code === 'ECONNREFUSED';
+export function isConnectFailedError(error) {
+  return !!error && (error.code === 'ECONNREFUSED'
+    || error.code === 'ENOTCONN' || error.code === 'EPIPE');
 }
 /**
  * True once a worker request has proven this service predates the
@@ -499,6 +533,73 @@ export function invalidateServiceInfo() {
   // A restart may bring a newer loopback build; re-probe the worker
   // endpoints instead of trusting the old 404 forever.
   workerUnsupported = false;
+}
+
+/**
+ * Wait for ish-service.json to change after a connect failure (#2,
+ * wave 5). The Swift listener restarts itself with a new port/token
+ * and rewrites the file; the change — not a fixed sleep — is the
+ * signal it is back. Polls immediately, then 50/200/800ms, then 1s,
+ * up to SERVICE_RESTART_WAIT_MS total. A change means the listener
+ * restarted (the retry that follows dials the new port); no change in
+ * 5s means it did not come back on its own. Reads the file directly
+ * (not via getServiceInfo) so the 30s first-boot wait and the 5s
+ * fail-fast window never apply here.
+ * @param opts.serviceFile override for tests.
+ * @param previous the service info of the failed attempt ({port, token}).
+ * @returns {changed, info, attempts, serviceFile, previousPort}.
+ */
+async function waitForServiceFileChange(opts, previous) {
+  const roots = hostRoots();
+  const serviceFile = opts.serviceFile ?? roots?.serviceFile ?? null;
+  const result = {
+    changed: false,
+    info: null,
+    attempts: 0,
+    serviceFile,
+    previousPort: previous?.port ?? null,
+  };
+  if (!serviceFile) return result;
+  const deadline = Date.now() + SERVICE_RESTART_WAIT_MS;
+  let delayIndex = 0;
+  for (;;) {
+    const info = readServiceFile(serviceFile);
+    result.attempts += 1;
+    result.info = info;
+    if (info && (info.port !== previous?.port || info.token !== previous?.token)) {
+      result.changed = true;
+      return result;
+    }
+    if (Date.now() >= deadline) return result;
+    const delay = SERVICE_RESTART_POLL_DELAYS_MS[
+      Math.min(delayIndex, SERVICE_RESTART_POLL_DELAYS_MS.length - 1)];
+    delayIndex += 1;
+    await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/**
+ * Annotate a final connect failure with the restart-wait summary (#2,
+ * wave 5): the port that died, the service file that was watched, how
+ * many polls ran, whether the file changed, and whether a later retry
+ * could succeed. The error code is preserved (classifiers key on it).
+ * changed = recoverable (the listener restarted; retry later). No
+ * change in 5s = unrecoverable from JS (the listener is dead and did
+ * not restart itself — reopening the terminal / restarting iSH is the
+ * way back, not another retry).
+ */
+function withRestartWaitDetail(error, wait) {
+  const where = wait.serviceFile ? `file ${wait.serviceFile}` : 'service file (HOME unset)';
+  const change = wait.changed
+    ? `changed after ${wait.attempts} checks (port ${wait.previousPort ?? '?'} -> ${wait.info?.port ?? '?'})`
+    : `unchanged after ${wait.attempts} checks in ${SERVICE_RESTART_WAIT_MS / 1000}s (port ${wait.previousPort ?? '?'})`;
+  const verdict = wait.changed
+    ? 'recoverable: the listener restarted, retry later'
+    : 'unrecoverable without reopening the terminal / restarting iSH: the listener did not restart within 5s';
+  const annotated = new Error(`${error.message} (loopback restart wait: ${where}, ${change}; ${verdict})`);
+  annotated.code = error.code;
+  if (error.statusCode !== undefined) annotated.statusCode = error.statusCode;
+  return annotated;
 }
 
 // ---------------------------------------------------------------------------
@@ -685,10 +786,16 @@ export async function ishExec(opts) {
   // where the cached one failed.
   // ISH_NOT_BOOTED is a real state, not a stale cache — do not retry it.
   let lastError = null;
+  // #2 (wave 5): the restart wait of the connect-failure retry, if
+  // one ran — the final error is annotated with it below.
+  let restartWait = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) invalidateServiceInfo();
     const service = await getServiceInfo(opts);
-    if (!service) throw bridgeUnavailableError(opts);
+    if (!service) {
+      if (restartWait) throw withRestartWaitDetail(bridgeUnavailableError(opts), restartWait);
+      throw bridgeUnavailableError(opts);
+    }
     try {
       return await postNdjson(service, '/ish/exec', body, execOpts);
     } catch (error) {
@@ -707,9 +814,18 @@ export async function ishExec(opts) {
       // (Swift work, build round). HTTP errors stay retryable: the
       // server answers every non-200 before running anything, so a
       // retry there never re-executes a command.
+      // #2 (wave 5): ENOTCONN/EPIPE are connect failures too (see
+      // isConnectFailedError). Before the retry, wait for
+      // ish-service.json to change — the listener restarts itself
+      // with a new port/token, and an immediate retry would just hit
+      // the same dead port again.
       const retryable = isConnectFailedError(error)
         || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
-      if (retryable && attempt === 0 && !sawOutput) continue;
+      if (retryable && attempt === 0 && !sawOutput) {
+        if (isConnectFailedError(error)) restartWait = await waitForServiceFileChange(opts, service);
+        continue;
+      }
+      if (restartWait && isConnectFailedError(lastError)) throw withRestartWaitDetail(lastError, restartWait);
       throw lastError;
     }
   }
@@ -1015,6 +1131,18 @@ export function getWorkerJobs(sessionId) {
   return [...state.jobs.values()].sort((a, b) => a.pid - b.pid);
 }
 
+/**
+ * Pids a worker stop is about to kill, from the local job table (no
+ * network): the jobs still marked running when the stop fires. Used to
+ * name the victims in the run's error text — a stop kills the session's
+ * whole process tree, so no background job survives it (Q1).
+ */
+function liveWorkerJobPids(sessionId) {
+  return getWorkerJobs(sessionId)
+    .filter((job) => job.state !== 'done')
+    .map((job) => job.pid);
+}
+
 /** Merge a fresh jobs snapshot into the session's job table. */
 function updateWorkerJobs(sessionId, jobs) {
   const state = workerSessionState(sessionId);
@@ -1217,10 +1345,22 @@ export async function ishWorkerExec(opts) {
       opts.onLine?.(frame);
     }};
     let lastError = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (attempt > 0) invalidateServiceInfo();
+    // #1 (wave 5): bounded 409 retries used so far. #2 (wave 5): at
+    // most one connect-failure retry, preceded by the restart wait.
+    // Every `continue` consumes one of the two budgets, so the loop
+    // always terminates (max 1 + 3 + 1 iterations).
+    let busyRetries = 0;
+    let connectRetried = false;
+    let restartWait = null;
+    let attempts = 0;
+    for (;;) {
+      if (attempts > 0) invalidateServiceInfo();
+      attempts += 1;
       const service = await getServiceInfo(opts);
-      if (!service) throw bridgeUnavailableError(opts);
+      if (!service) {
+        if (restartWait) throw withRestartWaitDetail(bridgeUnavailableError(opts), restartWait);
+        throw bridgeUnavailableError(opts);
+      }
       try {
         const result = await postNdjson(service, '/ish/worker/run', body, execOpts);
         // The run resolved: record the worker state (unless a stop
@@ -1252,16 +1392,22 @@ export async function ishWorkerExec(opts) {
             {code: ISH_WORKER_UNSUPPORTED});
         }
         if (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode === 409) {
-          // M-10: the server already has a run in flight for this
-          // session (worker_busy). Do not retry: an immediate retry
-          // would hit the same run, and the per-session queue in this
-          // bridge already serialises our own runs — a 409 can only
-          // come from another client, so surface it and let the
-          // caller decide when to retry. (Deliberately not a
-          // one-shot fallback: that would run the command concurrently
-          // with the in-flight run and break per-session ordering.)
+          // #1 (wave 5): the slot is usually stale, not another
+          // client — the previous run settled JS-side while Swift
+          // still held the claim (M-10's "another client" reading was
+          // wrong: the per-session queue already serialises our own
+          // runs). Retry boundedly with backoff. A 409 is a
+          // pre-execution refusal — postNdjson rejects before any
+          // frame streams, so no output can have been seen and the
+          // re-POST cannot run the command twice.
+          if (busyRetries < WORKER_BUSY_MAX_RETRIES) {
+            await sleep(WORKER_BUSY_RETRY_DELAYS_MS[busyRetries]);
+            busyRetries += 1;
+            if (opts.signal?.aborted) return {exitCode: null, durationMs: 0, cancelled: true};
+            continue;
+          }
           throw Object.assign(
-            new Error(`ish worker busy: session ${sessionId} already has a run in flight`),
+            new Error(`ish worker busy: session ${sessionId} already has a run in flight (still busy after ${busyRetries} retries)`),
             {code: ISH_WORKER_BUSY});
         }
         // N-1 (round 2): same rule as ishExec — only a failed connect
@@ -1271,13 +1417,22 @@ export async function ishWorkerExec(opts) {
         // (the server answers non-200 before running anything) except
         // 429: a throttle is not a pre-run rejection a retry can fix,
         // and re-hitting it immediately just extends the throttle.
+        // #2 (wave 5): ENOTCONN/EPIPE are connect failures too (see
+        // isConnectFailedError). Before the retry, wait for
+        // ish-service.json to change — the listener restarts itself
+        // with a new port/token, and an immediate retry would just hit
+        // the same dead port again.
         const retryable = isConnectFailedError(error)
           || (error?.code === 'ISH_HTTP_ERROR' && error?.statusCode !== 429);
-        if (retryable && attempt === 0 && !sawOutput) continue;
+        if (retryable && !connectRetried && !sawOutput) {
+          connectRetried = true;
+          if (isConnectFailedError(error)) restartWait = await waitForServiceFileChange(opts, service);
+          continue;
+        }
+        if (restartWait && isConnectFailedError(lastError)) throw withRestartWaitDetail(lastError, restartWait);
         throw lastError;
       }
     }
-    throw lastError;
   });
 }
 
@@ -1370,19 +1525,15 @@ export async function ishWorkerKillJob(sessionId, pid, opts = {}) {
  * generation guard alone would not close this: a normal new run does
  * not bump `generation` — only a workerDied result does — so the
  * `finally` would still see an unchanged generation and clear anyway.)
+ * @param opts.bypassQueue - skip the per-session run queue (Q1): a hung
+ *   run would starve a queued stop, so the stop goes straight to the
+ *   server. The stop is idempotent and the generation bump in the
+ *   finally block still protects a worker rebuilt after this stop.
  * @returns true when the request was answered.
  */
 export async function ishWorkerStop(sessionId, opts = {}) {
   const state = workerSessions.get(sessionId);
-  // R3-N3: stop waits behind an in-flight run — enqueueWorkerOp chains
-  // onto the previous op with no timeout and no abort signal of its own,
-  // so a hung run starves the stop. Deliberately not fixed by pre-clearing
-  // state: clearing knownAlive/jobs before the run finishes would
-  // reintroduce the round-2 N-2 ordering break (a later run reusing the
-  // session while the old one is still in flight). The wait is bounded in
-  // practice by the run's own abort signal and server timeout, not by the
-  // queue — so this stays a documented trade-off, not a fix.
-  return enqueueWorkerOp(sessionId, async () => {
+  const doStop = async () => {
   try {
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1418,7 +1569,20 @@ export async function ishWorkerStop(sessionId, opts = {}) {
     }
   }
   return true;
-  });
+  };
+  // Q1: bypass the per-session queue — the queued path below would wait
+  // behind a hung run for it to finish, which is exactly the run the
+  // stop is meant to kill.
+  if (opts.bypassQueue === true) return doStop();
+  // R3-N3: stop waits behind an in-flight run — enqueueWorkerOp chains
+  // onto the previous op with no timeout and no abort signal of its own,
+  // so a hung run starves the stop. Deliberately not fixed by pre-clearing
+  // state: clearing knownAlive/jobs before the run finishes would
+  // reintroduce the round-2 N-2 ordering break (a later run reusing the
+  // session while the old one is still in flight). The wait is bounded in
+  // practice by the run's own abort signal and server timeout, not by the
+  // queue — so this stays a documented trade-off, not a fix.
+  return enqueueWorkerOp(sessionId, doStop);
 }
 
 /** Whether this service is known to predate the worker endpoints (HTTP 404). */
@@ -2169,6 +2333,18 @@ export function spawnIshExec(argv, options = {}) {
             || error?.code === 'ISH_NOT_BOOTED' || error?.code === 'ISH_HTTP_ERROR'
             || isConnectFailedError(error));
           if (!fallBack) throw error;
+          // Q1: the DSH deadline aborted this run, so the worker may be
+          // holding a hung command — stop it directly, bypassing the
+          // per-session queue the hung run is blocking. Fire and forget:
+          // the one-shot fallback below must not wait for it. A stop
+          // kills the session's background jobs too; name them first.
+          if (abortController.signal.aborted) {
+            const victims = liveWorkerJobPids(sessionId);
+            if (victims.length > 0) {
+              err.write(`ish worker stopped after abort; background jobs killed: ${victims.join(', ')}\n`);
+            }
+            void ishWorkerStop(sessionId, {bypassQueue: true}).catch(() => {});
+          }
           // Worker unavailable (old service, start failure, or a
           // request the server rejected before running it): one-shot.
           result = null;
@@ -2188,6 +2364,19 @@ export function spawnIshExec(argv, options = {}) {
       }
       if (settled) return;
       if (result.cancelled) {
+        // Q1: the run was aborted (DSH deadline / user Stop) while the
+        // worker served it, so the worker may still hold the hung
+        // command — stop it directly instead of leaving the slot to the
+        // server timeout. Fire and forget; finish() must not wait for
+        // it. (A cancelled one-shot never touched the worker, so no
+        // stop: child.ishWorker is false for it.)
+        if (child.ishWorker) {
+          const victims = liveWorkerJobPids(sessionId);
+          if (victims.length > 0) {
+            err.write(`ish worker stopped after abort; background jobs killed: ${victims.join(', ')}\n`);
+          }
+          void ishWorkerStop(sessionId, {bypassQueue: true}).catch(() => {});
+        }
         finish(null, 'SIGTERM');
         return;
       }
@@ -2202,8 +2391,13 @@ export function spawnIshExec(argv, options = {}) {
       // R7-1-1: preserve ISH_INVALID_ARGV like ISH_NOT_BOOTED, so a
       // throwing env getter is reported as an argument error instead of
       // being rewritten as ISH_BRIDGE_UNAVAILABLE.
+      // #1 (wave 5): preserve ISH_WORKER_BUSY too — a busy worker is
+      // not a dead bridge. The model must be able to tell them apart:
+      // busy means a later retry can succeed; bridge-unavailable
+      // means it should switch paths instead of retrying blindly.
       const detail = error?.code === 'ISH_NOT_BOOTED' ? ISH_NOT_BOOTED
         : error?.code === 'ISH_INVALID_ARGV' ? 'ISH_INVALID_ARGV'
+        : error?.code === ISH_WORKER_BUSY ? ISH_WORKER_BUSY
         : ISH_BRIDGE_UNAVAILABLE;
       err.write(`${detail}: ${error?.message ?? error}\n`);
       finish(1, null);

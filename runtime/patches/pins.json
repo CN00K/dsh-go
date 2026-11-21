@@ -2365,6 +2365,106 @@
           "before": "a1ad048cbbb7caefe5471c583f076aa8e393f534efbc5b11b625308096efdace"
         }
       }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-bash-timeout-kill.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js": {
+          "after": "31352856d9f6b5ba75f58d73ae68556365d00cd7a6d4a1697a3670e3b826bb62",
+          "before": "df45f6872063c557755f47b448eb9b637fef4eb3879c10ccbbb1612b3b75104b"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ptc-wasm-probe.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js": {
+          "after": "1093e985c2caa56a3597a8cf6f021e071939536ff366710b6eb97885278324b7",
+          "before": "952ffdd55654ccaedce2a9c004b68028fdcb31085987cc969d02438076260738"
+        },
+        "node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js": {
+          "after": "67de0ab96bb2e5376c98852e6eccdf8f40d0587e790e0e7e91903305a11d0e67",
+          "before": "e2ceaddf4afea8f11ed3202cfe77b4606e3d03a2efc55f7239fe5d330ab1dec9"
+        },
+        "node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/persistent-process.js": {
+          "after": "09bae6a831b8454eb33f5193a64c7ecdcbc2b3fbcd0f43bc7ad92ede0bc34043",
+          "before": "676abe5aaf47548f19802e82bb090019de25d777940e5d99b21efab7575582b3"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-hmr-polling-fallback.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-hmr/lib/index.js": {
+          "after": "61d9c3c6415b710ff0a390af678d02413ad295495efef292e7374300c8f50fcb",
+          "before": "d4990a34a9874f94fa1e045563e016526e4fefe5a72a4945532043188a65dfde"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-ish-host.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
+          "after": "07821d352abfade87cc2989a6a08d8c50c75512eb7f573a420c0651506512684",
+          "before": "20566c2420a37ac9612cd84ab02685d129adf83b5816e410081a504d9a896eef"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-app-boot-ish-guest-platform.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-app-boot/lib/index.js": {
+          "after": "19328257e251c7a8239eed9af68fd838aad51fdd563859ba373cf42d029dac51",
+          "before": "4fe63479a0bfa026c578b3e3acc2b775aa3d027b6502a9d72a9135513b3e2cad"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-list-include-rows.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
+          "after": "bb65fc998445048ca5555b1e44444fa7e3f240a60e25f8e5ce87c86dca4f8ed5",
+          "before": "07821d352abfade87cc2989a6a08d8c50c75512eb7f573a420c0651506512684"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-declared-rows-fiber.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-plugin-manager/lib/index.js": {
+          "after": "b11979bce7fc0db3393ffea1505f759f0a6fea3e107e7cab7674f5f091ca21d2",
+          "before": "bb65fc998445048ca5555b1e44444fa7e3f240a60e25f8e5ce87c86dca4f8ed5"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-mcp-image-admission-reject.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js": {
+          "after": "c468339c1fcd81dbefa1ed0e1d7b88169f561090466e2bd2bcdc0ca200f4aabd",
+          "before": "04fb41ee85ceabc11948fade57eb70f66c6dd9182102cd188da0b92d78df1fff"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-tool-listtools-active.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-tool-cordis/lib/types/providers.js": {
+          "after": "f8722ef6633ce1c1277e7cfd017fbb557c78e1121a9918923537b1d6744af60c",
+          "before": "d03cb1f3c28eca98d500d51467ed2491510a0d18cf5c0caf8fe576a8ecb7a428"
+        },
+        "node_modules/@deepseek-ai/dsh-tools/lib/index.js": {
+          "after": "97596ee174250336cb040f5a6fb61adaccd552d0e24364a96487908018f10ce3",
+          "before": "8ae46512081dde3af5a12b7c3d37c2d7a89f48e344c15e2fdc2887f4176c8bf0"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-wait-agent-all-peers-inactive.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-experimental-tool-agent-team/lib/index.js": {
+          "after": "4c56c7cf05a135f432262f6374298da5bee8aca5fe2ab63598ea0384cae3cfec",
+          "before": "cac22fe5f83a179056469cf329def58393c7620eae23b018c66f42c37d849f63"
+        }
+      }
+    },
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ptc-strip-no-wasm.diff": {
+      "0.2.2-rc.1": {
+        "node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js": {
+          "after": "1df7489ad960e2968a150694188fde25302027b08676e88f540b6a469547ed2c",
+          "before": "1093e985c2caa56a3597a8cf6f021e071939536ff366710b6eb97885278324b7"
+        }
+      }
     }
   },
   "schema": 2,
@@ -2716,7 +2816,18 @@
       "ohos-piai-text-preabort.diff",
       "ish-sandbox-backend.diff",
       "zzzzzzzz-sandbox-source-boundary.diff",
-      "zzzzzzzz-time-zone-fallback.diff"
+      "zzzzzzzz-time-zone-fallback.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-bash-timeout-kill.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ptc-wasm-probe.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-hmr-polling-fallback.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-ish-host.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-app-boot-ish-guest-platform.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-list-include-rows.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ohos-plugin-declared-rows-fiber.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-mcp-image-admission-reject.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-tool-listtools-active.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-wait-agent-all-peers-inactive.diff",
+      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ptc-strip-no-wasm.diff"
     ]
   }
 }

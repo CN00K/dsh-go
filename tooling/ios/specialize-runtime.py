@@ -77,7 +77,7 @@ DIAGNOSTIC_EDITS = {
         ('候选文件数超过本机上限', '候选文件数超过 iOS 本机上限'),
     ),
     'runtime/ohos/process/runtime.mjs': (
-        ("import { randomUUID } from 'node:crypto';", "import { randomUUID } from 'node:crypto';\nimport { workerEnvironment } from '../../ios/process/worker-env.mjs';\nimport { ishSpawnFor, ishSpawnTerminalFor } from '../../ios/process/ish-adapter.mjs';"),
+        ("import { randomUUID } from 'node:crypto';", "import { randomUUID } from 'node:crypto';\nimport { workerEnvironment } from '../../ios/process/worker-env.mjs';\nimport { ishSpawnFor, ishSpawnTerminalFor, ishFallbackTerminalFor } from '../../ios/process/ish-adapter.mjs';"),
         ("          const workerEnv = { ...env };", "          const workerEnv = workerEnvironment(env);"),
         ("prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('虚拟进程服务已关闭')", "prepare(argv, policy, signal) {\n    if (this.closed) throw new Error('iOS 虚拟进程服务已关闭')"),
         # dsh-go iSH guest: delegate PTY terminals to the guest. Replaces
@@ -87,7 +87,7 @@ DIAGNOSTIC_EDITS = {
         # Without one the terminal is the user's own keystrokes and is
         # not policy-constrained.
         ("  async spawnTerminal() {\n    throw Object.assign(new Error('本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }",
-         "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec, spec?.policy);\n    if (ish) return ish;\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE' });\n  }"),
+         "  async spawnTerminal(spec) {\n    const ish = ishSpawnTerminalFor(spec, spec?.policy);\n    if (ish.handle) return ish.handle;\n    if (ish.declined === 'bridge') return ishFallbackTerminalFor(spec, spec?.policy);\n    throw Object.assign(new Error('iOS 本机没有 PTY，可以连接电脑执行'), { code: 'ERR_OHOS_PTY_UNAVAILABLE', cause: ish.detail });\n  }"),
         # dsh-go iSH guest: delegate agent bash to the guest. The ticket
         # unwrap above has already run; ishSpawnFor returns undefined
         # when the bridge is not installed or the argv is not bash -c,

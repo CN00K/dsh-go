@@ -16,9 +16,9 @@ export function createPluginBackend({ fetchImpl = globalThis.fetch } = {}) {
     begin(profile) { return beginTransaction(profile.dir); },
     restore(dir) { transactionFor(dir).rollbackAttempt(); },
     registry() { return 'https://registry.npmjs.org/'; },
-    accepts(spec) {
+    accepts(spec, base) {
       try { parseRegistrySpec(spec); return true; } catch { /* fall through to local */ }
-      const path = localDirectoryPath(spec);
+      const path = localDirectoryPath(spec, base);
       if (path === null || !isAbsolute(path)) return false;
       try { return statSync(path).isDirectory(); } catch { return false; }
     },

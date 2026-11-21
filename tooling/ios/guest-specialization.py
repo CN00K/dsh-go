@@ -92,13 +92,15 @@ EDITS = {'runtime/ohos/process/index.mjs': (('  get temporaryRoot() { return thi
                                       '  parentPort.postMessage({ exitCode: result.exitCode });\n  }'),
                                      ('const filesystem = createFilesystem(roots, policy);',
                                       'let executionFilesystem = createFilesystem;\n'
+                                      'let profileReadOnlyAliases = () => [];\n'
                                       'if (workerData.iosGuestTemporaryRoot) {\n'
-                                      '  ({ createFilesystem: executionFilesystem } = await '
+                                      '  ({ createFilesystem: executionFilesystem, profileReadOnlyAliases } = await '
                                       'import("../../ios/guest/virtual-filesystem.mjs"));\n'
                                       '}\n'
                                       'const filesystem = executionFilesystem(roots, policy, '
                                       'workerData.iosGuestTemporaryRoot ? [{ mountPoint: "/tmp", root: '
-                                      'workerData.iosGuestTemporaryRoot }] : []);')),
+                                      'workerData.iosGuestTemporaryRoot }, '
+                                      '...profileReadOnlyAliases(workerData.iosGuestProfilesRoot)] : []);')),
  'runtime/ohos/process/runtime.mjs': (# 2026-11-21: the old pair 0 that rewrote prepare()'s policy check
                                        # (danger-full-access only when this.#guest) is removed on purpose.
                                        # The base prepare() now accepts danger-full-access outright
@@ -184,7 +186,7 @@ EDITS = {'runtime/ohos/process/index.mjs': (('  get temporaryRoot() { return thi
                                        # scripts back to the virtual shell, as if it were not installed.
                                        '                roots, linuxCommands: linux?.commands ?? [], iosGuestRouting: !!this.#guest && '
                                        'this.#guest.metadata?.suspended !== true, iosGuestTemporaryRoot: '
-                                       'this.#guestTemporaryRoot,\n'
+                                       "this.#guestTemporaryRoot, iosGuestProfilesRoot: process.env.DSH_HOME ? join(process.env.DSH_HOME, 'profiles') : undefined,\n"
                                        '                env, stdin:'),
                                       (': distinctRoots([policy?.workspaceRoot ?? cwd, '
                                        'this.temporaryRoot]);',
