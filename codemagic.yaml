@@ -6,7 +6,7 @@
 #
 # What it does (1.2.0 engine assembly, D1c step 1: loopback HTTP bridge kept):
 #   1. flutter pub get + analyze (+ l10n check)
-#   2. Verifies the hash-pinned patch registration (195, see step note).
+#   2. Verifies the hash-pinned patch registration (206, see step note).
 #      The patches themselves are applied INSIDE prepare-engine.sh:
 #      runtime/ohos/package/prepare-inputs.py runs
 #      `rtbuild.py patch-dsh --target ohos` on a fresh npm prefix.
@@ -110,7 +110,7 @@ workflows:
           flutter analyze 2>&1 | tee ../build-logs/02-flutter-analyze.log \
             || echo "flutter analyze reported issues (non-blocking)"
 
-      - name: Verify patch registration (195, hash-pinned)
+      - name: Verify patch registration (206, hash-pinned)
         script: |
           set -euo pipefail
           # The patch set is APPLIED inside prepare-engine.sh
@@ -123,9 +123,9 @@ workflows:
           #
           # Count settled (2026-11-17): upstream series is 194 LINES but
           # 192 ENTRIES (2 comment lines); pins.json targetSets.ohos =
-          # 192, android = 150. 192 + our 3 diffs = 195. Verified by a
+          # 192, android = 150. 192 + our 3 diffs + 11 new (51z-61z, 2026-11-21) = 206. Verified by a
           # full `rtbuild.py patch-dsh --target ohos --record` run
-          # (195/195 applied) and a non---record verification run.
+          # (206/206 applied) and a non---record verification run.
           # Do NOT "fix" the series file to match a different number.
           python3 - <<'PYEOF' 2>&1 | tee build-logs/03-patch-count.log
           import json, sys
@@ -133,10 +133,10 @@ workflows:
           import rtbuild
           pins = json.load(open('runtime/patches/pins.json'))
           names, all_names = rtbuild.select_dsh_patches(pins, 'runtime/patches', 'ohos')
-          expected = 195
+          expected = 206
           print('ohos target set:', len(names), '| declared total:', len(all_names), '| expected:', expected)
           print('our 3 diffs present:', [n for n in ('ish-sandbox-backend.diff', 'zzzzzzzz-sandbox-source-boundary.diff', 'zzzzzzzz-time-zone-fallback.diff') if n in names])
-          assert len(names) == expected, 'patch count %d != expected %d (see step comment: measured upstream entries are 192, 192+3=195)' % (len(names), expected)
+          assert len(names) == expected, 'patch count %d != expected %d (see step comment: measured upstream entries are 192, 192+3+11=206)' % (len(names), expected)
           print('patch registration OK:', len(names))
           PYEOF
 
@@ -155,7 +155,7 @@ workflows:
           #     feat build's digidem 24.20.0-0), the require-builtin
           #     addon tarball (a58d3599...), node-addon-api 8.9.2
           #   - prepare-inputs.py: npm ci dsh 0.2.2-rc.1 + process tree,
-          #     patch-dsh --target ohos (the 195 patches), target report
+          #     patch-dsh --target ohos (the 206 patches), target report
           #   - compose-runtime.py + specialize-runtime.py: compose and
           #     iOS-specialize the runtime -> runtime.zip
           #   - stages app/ios/Engine/: runtime.zip,
@@ -488,10 +488,10 @@ workflows:
           flutter analyze 2>&1 | tee ../build-logs/02-flutter-analyze.log \
             || echo "flutter analyze reported issues (non-blocking)"
 
-      - name: Verify patch registration (195, hash-pinned)
+      - name: Verify patch registration (206, hash-pinned)
         script: |
           set -euo pipefail
-          # Same check as ios-stage2-verify (settled count: 195, see its
+          # Same check as ios-stage2-verify (settled count: 206, see its
           # step comment for the reconciliation note).
           python3 - <<'PYEOF' 2>&1 | tee build-logs/03-patch-count.log
           import json, sys
@@ -499,7 +499,7 @@ workflows:
           import rtbuild
           pins = json.load(open('runtime/patches/pins.json'))
           names, all_names = rtbuild.select_dsh_patches(pins, 'runtime/patches', 'ohos')
-          expected = 195
+          expected = 206
           print('ohos target set:', len(names), '| declared total:', len(all_names), '| expected:', expected)
           print('our 3 diffs present:', [n for n in ('ish-sandbox-backend.diff', 'zzzzzzzz-sandbox-source-boundary.diff', 'zzzzzzzz-time-zone-fallback.diff') if n in names])
           assert len(names) == expected, 'patch count %d != expected %d (see ios-stage2-verify step comment)' % (len(names), expected)
